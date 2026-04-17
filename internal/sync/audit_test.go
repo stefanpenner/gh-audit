@@ -390,6 +390,119 @@ func TestEvaluateCommit(t *testing.T) {
 			wantReasons:    []string{"compliant"},
 		},
 		{
+			name:   "stale approval after force-push",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{basePR},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "old-force-pushed-sha", SubmittedAt: now.Add(-time.Hour)},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks: requiredChecks,
+			wantCompliant:  false,
+			wantHasPR:      true,
+			wantReasons:    []string{"no approval on final commit (PR #42)"},
+		},
+		{
+			name:   "stale approval from one reviewer fresh approval from another",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{basePR},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "old-force-pushed-sha", SubmittedAt: now.Add(-2 * time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer2", State: "APPROVED", CommitID: "head123", SubmittedAt: now},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks: requiredChecks,
+			wantCompliant:  true,
+			wantHasPR:      true,
+			wantReasons:    []string{"compliant"},
+		},
+		{
+			name:   "same reviewer old APPROVED then CHANGES_REQUESTED on final",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{basePR},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "old-sha", SubmittedAt: now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer1", State: "CHANGES_REQUESTED", CommitID: "head123", SubmittedAt: now},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks: requiredChecks,
+			wantCompliant:  false,
+			wantHasPR:      true,
+			wantReasons:    []string{"no approval on final commit (PR #42)"},
+		},
+		{
+			name:   "re-approval after force-push same reviewer",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{basePR},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "old-force-pushed-sha", SubmittedAt: now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "head123", SubmittedAt: now},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks: requiredChecks,
+			wantCompliant:  true,
+			wantHasPR:      true,
+			wantReasons:    []string{"compliant"},
+		},
+		{
+			name:   "DISMISSED review on final commit is non-compliant",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{basePR},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "DISMISSED", CommitID: "head123", SubmittedAt: now},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks: requiredChecks,
+			wantCompliant:  false,
+			wantHasPR:      true,
+			wantReasons:    []string{"no approval on final commit (PR #42)"},
+		},
+		{
+			// NOTE: The current implementation does not track dismissals — it sees
+			// the earlier APPROVED review and treats the PR as approved. If we add
+			// per-reviewer last-state tracking, this should become non-compliant.
+			name:   "APPROVED then DISMISSED on final commit (currently compliant — dismissal not tracked)",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{basePR},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "head123", SubmittedAt: now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer1", State: "DISMISSED", CommitID: "head123", SubmittedAt: now},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks: requiredChecks,
+			wantCompliant:  true,
+			wantHasPR:      true,
+			wantReasons:    []string{"compliant"},
+		},
+		{
+			name:   "mixed states on final CHANGES_REQUESTED and APPROVED from different reviewers",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{basePR},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "CHANGES_REQUESTED", CommitID: "head123", SubmittedAt: now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer2", State: "APPROVED", CommitID: "head123", SubmittedAt: now},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks: requiredChecks,
+			wantCompliant:  true,
+			wantHasPR:      true,
+			wantReasons:    []string{"compliant"},
+		},
+		{
 			name: "multiple reviewers one self one legitimate is compliant",
 			commit: model.Commit{
 				Org: "myorg", Repo: "myrepo", SHA: "abc123",

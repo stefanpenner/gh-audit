@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -113,7 +114,22 @@ func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until stri
 	}
 
 	// Override orgs from flags
-	if len(orgs) > 0 {
+	if len(repos) > 0 {
+		// --repo flag: group by org extracted from "org/repo" format
+		orgRepos := make(map[string][]string)
+		for _, r := range repos {
+			parts := strings.SplitN(r, "/", 2)
+			if len(parts) == 2 {
+				orgRepos[parts[0]] = append(orgRepos[parts[0]], parts[1])
+			}
+		}
+		for orgName, repoNames := range orgRepos {
+			syncCfg.Orgs = append(syncCfg.Orgs, sync.OrgConfig{
+				Name:  orgName,
+				Repos: repoNames,
+			})
+		}
+	} else if len(orgs) > 0 {
 		syncCfg.Orgs = make([]sync.OrgConfig, len(orgs))
 		for i, o := range orgs {
 			syncCfg.Orgs[i] = sync.OrgConfig{Name: o}

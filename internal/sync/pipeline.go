@@ -93,6 +93,23 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	var allRepos []repoWithOrg
 
 	for _, orgCfg := range p.config.Orgs {
+		if len(orgCfg.Repos) > 0 {
+			// Explicit repos: skip API discovery, construct directly.
+			for _, repoName := range orgCfg.Repos {
+				allRepos = append(allRepos, repoWithOrg{
+					repo: model.RepoInfo{
+						Org:           orgCfg.Name,
+						Name:          repoName,
+						FullName:      orgCfg.Name + "/" + repoName,
+						DefaultBranch: "main",
+					},
+					orgCfg: orgCfg,
+				})
+			}
+			p.logger.Info("using explicit repos", "org", orgCfg.Name, "count", len(orgCfg.Repos))
+			continue
+		}
+
 		repos, err := p.source.ListOrgRepos(ctx, orgCfg.Name)
 		if err != nil {
 			return fmt.Errorf("listing repos for org %s: %w", orgCfg.Name, err)
@@ -208,9 +225,23 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 	}
 	var allLinks []commitPRLink
 
+	seenPRs := make(map[string]bool)
+	seenReviews := make(map[string]bool)
 	for _, e := range allEnrichments {
-		allPRs = append(allPRs, e.PRs...)
-		allReviews = append(allReviews, e.Reviews...)
+		for _, pr := range e.PRs {
+			key := fmt.Sprintf("%s/%s/%d", pr.Org, pr.Repo, pr.Number)
+			if !seenPRs[key] {
+				seenPRs[key] = true
+				allPRs = append(allPRs, pr)
+			}
+		}
+		for _, r := range e.Reviews {
+			key := fmt.Sprintf("%s/%s/%d/%d", r.Org, r.Repo, r.PRNumber, r.ReviewID)
+			if !seenReviews[key] {
+				seenReviews[key] = true
+				allReviews = append(allReviews, r)
+			}
+		}
 		allCheckRuns = append(allCheckRuns, e.CheckRuns...)
 		prNums := make([]int, len(e.PRs))
 		for j, pr := range e.PRs {
