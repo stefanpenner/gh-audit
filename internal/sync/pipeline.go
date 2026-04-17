@@ -247,8 +247,9 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 
 	p.logger.Info("unaudited commits", "org", repo.Org, "repo", repo.Name, "branch", branch, "count", len(unaudited))
 
-	// Enrich batches in parallel — these are pure API reads
-	allEnrichments, err := p.enrichInParallel(ctx, repo, branch, unaudited)
+	// Enrich batches in parallel, writing each batch's data to DB immediately
+	// so partial progress survives failures and populates the DB cache for retry.
+	allEnrichments, err := p.enrichInParallel(ctx, repo, branch, unaudited, writer)
 	if err != nil {
 		prog.Phase = PhaseFailed
 		prog.Error = err
@@ -259,122 +260,6 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 	prog.Enriched = len(allEnrichments)
 	prog.Phase = PhaseAuditing
 	p.reportProgress(prog)
-
-	// Collect enrichment data for a single batched write
-	var allPRs []model.PullRequest
-	var allReviews []model.Review
-	var allCheckRuns []model.CheckRun
-	var allBranchCommits []model.Commit
-	type branchCommitLink struct {
-		prNumber int
-		shas     []string
-		branch   string
-	}
-	type commitPRLink struct {
-		sha       string
-		prNumbers []int
-	}
-	var allLinks []commitPRLink
-	var allBranchLinks []branchCommitLink
-
-	seenPRs := make(map[string]bool)
-	seenReviews := make(map[string]bool)
-	seenCheckRuns := make(map[string]bool)
-	seenBranchCommits := make(map[string]bool)
-	for _, e := range allEnrichments {
-		for _, pr := range e.PRs {
-			key := fmt.Sprintf("%s/%s/%d", pr.Org, pr.Repo, pr.Number)
-			if !seenPRs[key] {
-				seenPRs[key] = true
-				allPRs = append(allPRs, pr)
-			}
-
-			if commits, ok := e.PRBranchCommits[pr.Number]; ok {
-				var branchSHAs []string
-				for _, c := range commits {
-					cKey := fmt.Sprintf("%s/%s/%s", c.Org, c.Repo, c.SHA)
-					if !seenBranchCommits[cKey] {
-						seenBranchCommits[cKey] = true
-						allBranchCommits = append(allBranchCommits, c)
-					}
-					branchSHAs = append(branchSHAs, c.SHA)
-				}
-				if len(branchSHAs) > 0 {
-					allBranchLinks = append(allBranchLinks, branchCommitLink{
-						prNumber: pr.Number,
-						shas:     branchSHAs,
-						branch:   pr.HeadBranch,
-					})
-				}
-			}
-		}
-		for _, r := range e.Reviews {
-			key := fmt.Sprintf("%s/%s/%d/%d", r.Org, r.Repo, r.PRNumber, r.ReviewID)
-			if !seenReviews[key] {
-				seenReviews[key] = true
-				allReviews = append(allReviews, r)
-			}
-		}
-		for _, cr := range e.CheckRuns {
-			key := fmt.Sprintf("%s/%s/%s/%d", cr.Org, cr.Repo, cr.CommitSHA, cr.CheckRunID)
-			if !seenCheckRuns[key] {
-				seenCheckRuns[key] = true
-				allCheckRuns = append(allCheckRuns, cr)
-			}
-		}
-		prNums := make([]int, len(e.PRs))
-		for j, pr := range e.PRs {
-			prNums[j] = pr.Number
-		}
-		if len(prNums) > 0 {
-			allLinks = append(allLinks, commitPRLink{sha: e.Commit.SHA, prNumbers: prNums})
-		}
-	}
-
-	// Write all enrichment data through single writer
-	if err := writer.Write(ctx, func() error {
-		for _, e := range allEnrichments {
-			if e.Commit.Additions > 0 || e.Commit.Deletions > 0 {
-				if err := p.store.UpdateCommitStats(ctx, e.Commit.Org, e.Commit.Repo, e.Commit.SHA, e.Commit.Additions, e.Commit.Deletions); err != nil {
-					return err
-				}
-			}
-		}
-		if err := p.store.UpsertPullRequests(ctx, allPRs); err != nil {
-			return fmt.Errorf("upserting PRs: %w", err)
-		}
-		if err := p.store.UpsertReviews(ctx, allReviews); err != nil {
-			return fmt.Errorf("upserting reviews: %w", err)
-		}
-		if err := p.store.UpsertCheckRuns(ctx, allCheckRuns); err != nil {
-			return fmt.Errorf("upserting check runs: %w", err)
-		}
-		if len(allBranchCommits) > 0 {
-			if err := p.store.UpsertCommits(ctx, allBranchCommits); err != nil {
-				return fmt.Errorf("upserting PR branch commits: %w", err)
-			}
-		}
-		for _, bl := range allBranchLinks {
-			if bl.branch != "" {
-				if err := p.store.UpsertCommitBranches(ctx, repo.Org, repo.Name, bl.shas, bl.branch); err != nil {
-					return fmt.Errorf("upserting PR branch commit branches: %w", err)
-				}
-			}
-			for _, sha := range bl.shas {
-				if err := p.store.UpsertCommitPRs(ctx, repo.Org, repo.Name, sha, []int{bl.prNumber}); err != nil {
-					return fmt.Errorf("upserting PR branch commit-PR links: %w", err)
-				}
-			}
-		}
-		for _, link := range allLinks {
-			if err := p.store.UpsertCommitPRs(ctx, repo.Org, repo.Name, link.sha, link.prNumbers); err != nil {
-				return fmt.Errorf("upserting commit-PR links: %w", err)
-			}
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
 
 	// Build enrichment map for audit evaluation
 	enrichmentMap := make(map[string]model.EnrichmentResult)
@@ -434,9 +319,9 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 }
 
 // enrichInParallel runs enrichment batches concurrently using an errgroup.
-// Each batch is an independent API call; results are collected by index
-// to preserve ordering without a mutex.
-func (p *Pipeline) enrichInParallel(ctx context.Context, repo model.RepoInfo, branch string, unaudited []model.Commit) ([]model.EnrichmentResult, error) {
+// Each batch's enrichment data is written to DB immediately after enrichment,
+// so partial progress survives failures and populates the DB cache for retry.
+func (p *Pipeline) enrichInParallel(ctx context.Context, repo model.RepoInfo, branch string, unaudited []model.Commit, writer *DBWriter) ([]model.EnrichmentResult, error) {
 	if len(unaudited) == 0 {
 		return nil, nil
 	}
@@ -469,6 +354,11 @@ func (p *Pipeline) enrichInParallel(ctx context.Context, repo model.RepoInfo, br
 			if err != nil {
 				return err
 			}
+
+			if err := p.writeEnrichmentBatch(ectx, repo.Org, repo.Name, enrichments, writer); err != nil {
+				return fmt.Errorf("writing enrichment batch %d: %w", batchIdx+1, err)
+			}
+
 			batchResults[batchIdx] = enrichments
 			return nil
 		})
@@ -483,6 +373,100 @@ func (p *Pipeline) enrichInParallel(ctx context.Context, repo model.RepoInfo, br
 		all = append(all, r...)
 	}
 	return all, nil
+}
+
+// writeEnrichmentBatch persists a batch of enrichment results to the database.
+// All upserts are idempotent, so duplicate writes across batches are safe.
+func (p *Pipeline) writeEnrichmentBatch(ctx context.Context, org, repo string, enrichments []model.EnrichmentResult, writer *DBWriter) error {
+	var allPRs []model.PullRequest
+	var allReviews []model.Review
+	var allCheckRuns []model.CheckRun
+	var allBranchCommits []model.Commit
+
+	type branchCommitLink struct {
+		prNumber int
+		shas     []string
+		branch   string
+	}
+	type commitPRLink struct {
+		sha       string
+		prNumbers []int
+	}
+	var allLinks []commitPRLink
+	var allBranchLinks []branchCommitLink
+
+	for _, e := range enrichments {
+		for _, pr := range e.PRs {
+			allPRs = append(allPRs, pr)
+
+			if commits, ok := e.PRBranchCommits[pr.Number]; ok {
+				var branchSHAs []string
+				for _, c := range commits {
+					allBranchCommits = append(allBranchCommits, c)
+					branchSHAs = append(branchSHAs, c.SHA)
+				}
+				if len(branchSHAs) > 0 {
+					allBranchLinks = append(allBranchLinks, branchCommitLink{
+						prNumber: pr.Number,
+						shas:     branchSHAs,
+						branch:   pr.HeadBranch,
+					})
+				}
+			}
+		}
+		allReviews = append(allReviews, e.Reviews...)
+		allCheckRuns = append(allCheckRuns, e.CheckRuns...)
+
+		prNums := make([]int, len(e.PRs))
+		for j, pr := range e.PRs {
+			prNums[j] = pr.Number
+		}
+		if len(prNums) > 0 {
+			allLinks = append(allLinks, commitPRLink{sha: e.Commit.SHA, prNumbers: prNums})
+		}
+	}
+
+	return writer.Write(ctx, func() error {
+		for _, e := range enrichments {
+			if e.Commit.Additions > 0 || e.Commit.Deletions > 0 {
+				if err := p.store.UpdateCommitStats(ctx, e.Commit.Org, e.Commit.Repo, e.Commit.SHA, e.Commit.Additions, e.Commit.Deletions); err != nil {
+					return err
+				}
+			}
+		}
+		if err := p.store.UpsertPullRequests(ctx, allPRs); err != nil {
+			return fmt.Errorf("upserting PRs: %w", err)
+		}
+		if err := p.store.UpsertReviews(ctx, allReviews); err != nil {
+			return fmt.Errorf("upserting reviews: %w", err)
+		}
+		if err := p.store.UpsertCheckRuns(ctx, allCheckRuns); err != nil {
+			return fmt.Errorf("upserting check runs: %w", err)
+		}
+		if len(allBranchCommits) > 0 {
+			if err := p.store.UpsertCommits(ctx, allBranchCommits); err != nil {
+				return fmt.Errorf("upserting PR branch commits: %w", err)
+			}
+		}
+		for _, bl := range allBranchLinks {
+			if bl.branch != "" {
+				if err := p.store.UpsertCommitBranches(ctx, org, repo, bl.shas, bl.branch); err != nil {
+					return fmt.Errorf("upserting PR branch commit branches: %w", err)
+				}
+			}
+			for _, sha := range bl.shas {
+				if err := p.store.UpsertCommitPRs(ctx, org, repo, sha, []int{bl.prNumber}); err != nil {
+					return fmt.Errorf("upserting PR branch commit-PR links: %w", err)
+				}
+			}
+		}
+		for _, link := range allLinks {
+			if err := p.store.UpsertCommitPRs(ctx, org, repo, link.sha, link.prNumbers); err != nil {
+				return fmt.Errorf("upserting commit-PR links: %w", err)
+			}
+		}
+		return nil
+	})
 }
 
 func (p *Pipeline) determineSince(ctx context.Context, org, repo, branch string) (time.Time, error) {

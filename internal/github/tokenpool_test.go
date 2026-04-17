@@ -188,9 +188,13 @@ func TestRateLimitTransport_UpdatesHeaders(t *testing.T) {
 	token := &ManagedToken{ID: "test"}
 	token.rateRemaining.Store(5000)
 
+	pool := NewTokenPool(testLogger())
+
 	transport := &rateLimitTransport{
-		base:  http.DefaultTransport,
-		token: token,
+		base:   http.DefaultTransport,
+		token:  token,
+		pool:   pool,
+		logger: testLogger(),
 	}
 
 	client := &http.Client{Transport: transport}
@@ -223,8 +227,9 @@ func TestRateLimitTransport_Handles429(t *testing.T) {
 	token.rateRemaining.Store(100)
 
 	transport := &rateLimitTransport{
-		base:  http.DefaultTransport,
-		token: token,
+		base:   http.DefaultTransport,
+		token:  token,
+		logger: testLogger(),
 	}
 
 	client := &http.Client{Transport: transport}
@@ -253,7 +258,7 @@ func TestAddPATToken(t *testing.T) {
 
 func TestRateLimitTransport_Handles403Abuse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Retry-After", "30")
+		w.Header().Set("Retry-After", "1")
 		w.WriteHeader(403)
 		fmt.Fprint(w, `{"message": "You have triggered an abuse detection mechanism"}`)
 	}))
@@ -263,8 +268,9 @@ func TestRateLimitTransport_Handles403Abuse(t *testing.T) {
 	token.rateRemaining.Store(100)
 
 	transport := &rateLimitTransport{
-		base:  http.DefaultTransport,
-		token: token,
+		base:   http.DefaultTransport,
+		token:  token,
+		logger: testLogger(),
 	}
 
 	client := &http.Client{Transport: transport}
@@ -291,6 +297,102 @@ func TestParseRetryAfter(t *testing.T) {
 	for _, tt := range tests {
 		assert.Equal(t, tt.want, parseRetryAfter(tt.input), "parseRetryAfter(%q)", tt.input)
 	}
+}
+
+func TestGlobalLimiterPacesRequests(t *testing.T) {
+	pool := NewTokenPool(testLogger())
+	pool.AddPATToken("t1", "token1", nil)
+	pool.AddPATToken("t2", "token2", nil)
+
+	// Each token defaults to 5000 rate limit, so total = 10000
+	// Expected sustainable rate = 10000 / 3600 * 0.9 ≈ 2.5 req/s
+	expectedRate := 10000.0 / 3600.0 * 0.9
+	actualRate := float64(pool.limiter.Limit())
+	assert.InDelta(t, expectedRate, actualRate, 0.01, "limiter rate should be 90%% of sustainable hourly rate")
+
+	burst := pool.limiter.Burst()
+	assert.GreaterOrEqual(t, burst, 5, "burst should be at least 5")
+}
+
+func TestLimiterRecalcOnHeaderUpdate(t *testing.T) {
+	pool := NewTokenPool(testLogger())
+	pool.AddPATToken("t1", "token1", nil)
+
+	// Initial rate based on assumed 5000 limit
+	initialRate := float64(pool.limiter.Limit())
+
+	// Simulate a response with higher rate limit
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("x-ratelimit-remaining", "14000")
+		w.Header().Set("x-ratelimit-limit", "15000")
+		w.Header().Set("x-ratelimit-reset", "1700000000")
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	client, err := pool.Pick(context.Background(), "", "")
+	require.NoError(t, err)
+	resp, err := client.Get(srv.URL)
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	newRate := float64(pool.limiter.Limit())
+	assert.Greater(t, newRate, initialRate, "rate should increase after seeing higher limit header")
+
+	expectedRate := 15000.0 / 3600.0 * 0.9
+	assert.InDelta(t, expectedRate, newRate, 0.01)
+}
+
+func TestSecondaryRateLimitRetry(t *testing.T) {
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount <= 2 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(403)
+			fmt.Fprint(w, `{"message": "You have triggered an abuse detection mechanism"}`)
+			return
+		}
+		w.Header().Set("x-ratelimit-remaining", "4999")
+		w.WriteHeader(200)
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	pool := NewTokenPool(testLogger())
+	pool.AddPATToken("t1", "token1", nil)
+
+	client, err := pool.Pick(context.Background(), "", "")
+	require.NoError(t, err)
+
+	start := time.Now()
+	resp, err := client.Get(srv.URL)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(t, 3, callCount, "should have retried twice then succeeded")
+	assert.GreaterOrEqual(t, elapsed, 2*time.Second, "should have waited for backoff")
+}
+
+func TestSecondaryRateLimitExhausted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(403)
+		fmt.Fprint(w, `{"message": "secondary rate limit"}`)
+	}))
+	defer srv.Close()
+
+	pool := NewTokenPool(testLogger())
+	pool.AddPATToken("t1", "token1", nil)
+
+	client, err := pool.Pick(context.Background(), "", "")
+	require.NoError(t, err)
+
+	_, err = client.Get(srv.URL)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "secondary rate limit")
 }
 
 func TestScopeMatches(t *testing.T) {

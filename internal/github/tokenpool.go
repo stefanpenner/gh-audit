@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
+	"golang.org/x/time/rate"
 )
 
 // TokenKind distinguishes personal access tokens from GitHub App installation tokens.
@@ -46,17 +47,41 @@ type OrgScope struct {
 }
 
 // TokenPool manages multiple GitHub API tokens with rate-limit-aware selection.
+//
+// A global rate.Limiter paces all outgoing requests to stay within the
+// sustainable hourly quota (90% of sum of all tokens' rate limits).
+// The limiter auto-adjusts as rate limit headers arrive from GitHub.
 type TokenPool struct {
-	tokens []*ManagedToken
-	mu     sync.RWMutex
-	logger *slog.Logger
+	tokens  []*ManagedToken
+	mu      sync.RWMutex
+	logger  *slog.Logger
+	limiter *rate.Limiter
 }
 
 // NewTokenPool creates a new empty token pool.
 func NewTokenPool(logger *slog.Logger) *TokenPool {
 	return &TokenPool{
-		logger: logger,
+		logger:  logger,
+		limiter: rate.NewLimiter(rate.Limit(1), 5), // conservative default until headers arrive
 	}
+}
+
+// recalcLimiter updates the global rate limiter based on the sum of all tokens' rate limits.
+func (p *TokenPool) recalcLimiter() {
+	var totalQuota int64
+	for _, t := range p.tokens {
+		totalQuota += t.rateLimit.Load()
+	}
+	if totalQuota <= 0 {
+		return
+	}
+	sustainableRate := float64(totalQuota) / 3600.0 * 0.9
+	burst := int(sustainableRate * 2)
+	if burst < 10 {
+		burst = 10
+	}
+	p.limiter.SetLimit(rate.Limit(sustainableRate))
+	p.limiter.SetBurst(burst)
 }
 
 // Len returns the number of tokens in the pool.
@@ -98,8 +123,9 @@ func (p *TokenPool) AddPATToken(id, token string, scopes []OrgScope) {
 	mt.rateLimit.Store(5000)
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.tokens = append(p.tokens, mt)
+	p.recalcLimiter()
+	p.mu.Unlock()
 }
 
 // AddAppToken registers a GitHub App installation token.
@@ -120,8 +146,9 @@ func (p *TokenPool) AddAppToken(id string, appID, installationID int64, privateK
 	mt.rateLimit.Store(5000)
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.tokens = append(p.tokens, mt)
+	p.recalcLimiter()
+	p.mu.Unlock()
 	return nil
 }
 
@@ -149,7 +176,12 @@ func scopeMatches(scopes []OrgScope, org, repo string) bool {
 
 // Pick selects the best available token for the given org/repo.
 // It blocks if all tokens are exhausted, waiting until the earliest reset time.
+// The global rate limiter is consulted first to pace requests across all goroutines.
 func (p *TokenPool) Pick(ctx context.Context, org, repo string) (*http.Client, error) {
+	if err := p.limiter.Wait(ctx); err != nil {
+		return nil, fmt.Errorf("rate limiter: %w", err)
+	}
+
 	for {
 		client, waitUntil, err := p.tryPick(org, repo)
 		if err != nil {
@@ -234,8 +266,10 @@ func (p *TokenPool) tryPick(org, repo string) (*http.Client, time.Time, error) {
 
 	client := &http.Client{
 		Transport: &rateLimitTransport{
-			base:  best.transport,
-			token: best,
+			base:   best.transport,
+			token:  best,
+			pool:   p,
+			logger: p.logger,
 		},
 	}
 	return client, time.Time{}, nil
@@ -257,8 +291,10 @@ func (p *TokenPool) MarkDisabled(id string) {
 // rateLimitTransport wraps a base transport to update rate limit fields from response headers
 // and handle 429/403 abuse detection responses.
 type rateLimitTransport struct {
-	base  http.RoundTripper
-	token *ManagedToken
+	base   http.RoundTripper
+	token  *ManagedToken
+	pool   *TokenPool
+	logger *slog.Logger
 }
 
 func (t *rateLimitTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -267,22 +303,7 @@ func (t *rateLimitTransport) RoundTrip(req *http.Request) (*http.Response, error
 		return nil, err
 	}
 
-	// Update rate limit fields from headers.
-	if v := resp.Header.Get("x-ratelimit-remaining"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			t.token.rateRemaining.Store(n)
-		}
-	}
-	if v := resp.Header.Get("x-ratelimit-limit"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			t.token.rateLimit.Store(n)
-		}
-	}
-	if v := resp.Header.Get("x-ratelimit-reset"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			t.token.rateResetAt.Store(n)
-		}
-	}
+	t.updateRateLimitHeaders(resp)
 
 	switch resp.StatusCode {
 	case 403:
@@ -294,11 +315,7 @@ func (t *rateLimitTransport) RoundTrip(req *http.Request) (*http.Response, error
 		}
 		bodyStr := strings.ToLower(string(body))
 		if strings.Contains(bodyStr, "abuse") || strings.Contains(bodyStr, "secondary rate limit") {
-			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
-			return nil, &SecondaryRateLimitError{
-				RetryAfter: retryAfter,
-				Message:    string(body),
-			}
+			return t.retrySecondaryRateLimit(req, resp.Header.Get("Retry-After"), string(body))
 		}
 		// Re-wrap body for non-abuse 403s.
 		resp.Body = io.NopCloser(strings.NewReader(string(body)))
@@ -346,6 +363,90 @@ func (t *rateLimitTransport) RoundTrip(req *http.Request) (*http.Response, error
 	}
 
 	return resp, nil
+}
+
+// updateRateLimitHeaders reads GitHub rate limit headers and updates the token + global limiter.
+func (t *rateLimitTransport) updateRateLimitHeaders(resp *http.Response) {
+	if v := resp.Header.Get("x-ratelimit-remaining"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			t.token.rateRemaining.Store(n)
+		}
+	}
+	limitChanged := false
+	if v := resp.Header.Get("x-ratelimit-limit"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			old := t.token.rateLimit.Load()
+			t.token.rateLimit.Store(n)
+			if n != old {
+				limitChanged = true
+			}
+		}
+	}
+	if v := resp.Header.Get("x-ratelimit-reset"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			t.token.rateResetAt.Store(n)
+		}
+	}
+	if limitChanged && t.pool != nil {
+		t.pool.mu.Lock()
+		t.pool.recalcLimiter()
+		t.pool.mu.Unlock()
+	}
+}
+
+// retrySecondaryRateLimit retries a request up to 3 times with exponential backoff
+// when GitHub's secondary (abuse) rate limit is triggered.
+func (t *rateLimitTransport) retrySecondaryRateLimit(req *http.Request, retryAfterHeader, body string) (*http.Response, error) {
+	baseDelay := parseRetryAfter(retryAfterHeader)
+	if baseDelay > 10*time.Second {
+		baseDelay = 10 * time.Second
+	}
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		delay := baseDelay * time.Duration(1<<(attempt-1)) // 1x, 2x, 4x
+		if t.logger != nil {
+			t.logger.Warn("secondary rate limit, retrying",
+				"attempt", attempt,
+				"delay", delay,
+				"token", t.token.ID,
+			)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-req.Context().Done():
+			timer.Stop()
+			return nil, req.Context().Err()
+		case <-timer.C:
+		}
+
+		resp, err := t.base.RoundTrip(req)
+		if err != nil {
+			if attempt == 3 {
+				return nil, err
+			}
+			continue
+		}
+		t.updateRateLimitHeaders(resp)
+		if resp.StatusCode != 403 {
+			return resp, nil
+		}
+		// Still 403 — check if it's still abuse-related
+		respBody, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("reading 403 response body on retry: %w", readErr)
+		}
+		bodyStr := strings.ToLower(string(respBody))
+		if !strings.Contains(bodyStr, "abuse") && !strings.Contains(bodyStr, "secondary rate limit") {
+			resp.Body = io.NopCloser(strings.NewReader(string(respBody)))
+			return resp, nil
+		}
+		body = string(respBody)
+	}
+	return nil, &SecondaryRateLimitError{
+		RetryAfter: baseDelay,
+		Message:    body,
+	}
 }
 
 // SecondaryRateLimitError is returned when GitHub's abuse detection triggers.
