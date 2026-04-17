@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -145,7 +146,7 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 			return nil, fmt.Errorf("scan summary: %w", err)
 		}
 		if s.TotalCommits > 0 {
-			s.CompliancePct = float64(s.CompliantCount) / float64(s.TotalCommits) * 100.0
+			s.CompliancePct = math.Round(float64(s.CompliantCount)/float64(s.TotalCommits)*1000.0) / 10.0
 		}
 		result = append(result, s)
 	}
@@ -271,6 +272,7 @@ func (r *Reporter) FormatCSV(w io.Writer, details []DetailRow) error {
 		"Is Bot", "Is Empty", "Has PR", "PR #", "PR Link",
 		"Approved", "Approvers", "Owner Approval",
 		"Compliant", "Reasons", "Commit Link",
+		"No PR", "Stale Approval", "Self-Approved", "No Approval",
 	}
 	if err := cw.Write(header); err != nil {
 		return err
@@ -292,6 +294,10 @@ func (r *Reporter) FormatCSV(w io.Writer, details []DetailRow) error {
 			fmt.Sprintf("%v", d.IsCompliant),
 			d.Reasons,
 			d.CommitHref,
+			fmt.Sprintf("%v", !d.HasPR),
+			fmt.Sprintf("%v", d.HasStaleApproval),
+			fmt.Sprintf("%v", d.IsSelfApproved),
+			fmt.Sprintf("%v", !d.HasFinalApproval && !d.IsSelfApproved),
 		}
 		if err := cw.Write(record); err != nil {
 			return err

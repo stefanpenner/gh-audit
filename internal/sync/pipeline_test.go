@@ -187,6 +187,10 @@ func (m *mockStore) UpsertAuditResults(_ context.Context, results []model.AuditR
 	return nil
 }
 
+func (m *mockStore) UpdateCommitStats(_ context.Context, org, repo, sha string, additions, deletions int) error {
+	return nil
+}
+
 func (m *mockStore) GetUnauditedCommits(_ context.Context, org, repo string) ([]model.Commit, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

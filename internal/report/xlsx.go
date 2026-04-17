@@ -171,17 +171,21 @@ func writeSummarySheet(f *excelize.File, sheet string, summary []SummaryRow, opt
 	}
 
 	// Conditional formatting styles
+	pctFmt := "0.0"
 	greenStyle, _ := f.NewStyle(&excelize.Style{
-		Fill: excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"C6EFCE"}},
-		Font: &excelize.Font{Color: "006100"},
+		Fill:         excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"C6EFCE"}},
+		Font:         &excelize.Font{Color: "006100"},
+		CustomNumFmt: &pctFmt,
 	})
 	yellowStyle, _ := f.NewStyle(&excelize.Style{
-		Fill: excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"FFEB9C"}},
-		Font: &excelize.Font{Color: "9C5700"},
+		Fill:         excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"FFEB9C"}},
+		Font:         &excelize.Font{Color: "9C5700"},
+		CustomNumFmt: &pctFmt,
 	})
 	redStyle, _ := f.NewStyle(&excelize.Style{
-		Fill: excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"FFC7CE"}},
-		Font: &excelize.Font{Color: "9C0006"},
+		Fill:         excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"FFC7CE"}},
+		Font:         &excelize.Font{Color: "9C0006"},
+		CustomNumFmt: &pctFmt,
 	})
 
 	// Write data rows (starting at row 3)
@@ -234,12 +238,20 @@ func writeSummarySheet(f *excelize.File, sheet string, summary []SummaryRow, opt
 		// Compliance % in column 6: Compliant / Total * 100
 		colD, _ := excelize.ColumnNumberToName(4) // Compliant
 		colC, _ := excelize.ColumnNumberToName(3) // Total
-		pctFormula := fmt.Sprintf("IF(%s%d>0,%s%d/%s%d*100,0)", colC, totalsRow, colD, totalsRow, colC, totalsRow)
+		pctFormula := fmt.Sprintf("IF(%s%d>0,ROUND(%s%d/%s%d*100,1),0)", colC, totalsRow, colD, totalsRow, colC, totalsRow)
 		f.SetCellFormula(sheet, cellName(6, totalsRow), pctFormula)
 
+		totalPctStyle, _ := f.NewStyle(&excelize.Style{
+			Font:         &excelize.Font{Bold: true},
+			CustomNumFmt: &pctFmt,
+		})
 		for col := 1; col <= len(headers); col++ {
 			c := cellName(col, totalsRow)
-			f.SetCellStyle(sheet, c, c, totalStyle)
+			if col == 6 {
+				f.SetCellStyle(sheet, c, c, totalPctStyle)
+			} else {
+				f.SetCellStyle(sheet, c, c, totalStyle)
+			}
 		}
 	}
 
@@ -269,6 +281,7 @@ func detailHeaders() []string {
 		"Org", "Repo", "SHA", "Author", "Committer", "Date", "Message",
 		"Branch", "PR #", "Merged By", "Approved?", "Approver", "Self-Approved?",
 		"Owner Approval", "Compliant?", "Reasons",
+		"No PR", "Stale Approval", "Self-Approved", "No Approval",
 	}
 }
 
@@ -560,6 +573,12 @@ func writeDetailRowWithHyperlinks(f *excelize.File, sheet string, row int, d Det
 	f.SetCellValue(sheet, cellName(14, row), d.OwnerApprovalCheck)
 	f.SetCellValue(sheet, cellName(15, row), compliantStr)
 	f.SetCellValue(sheet, cellName(16, row), d.Reasons)
+
+	// Binary reason columns for filtering/sorting
+	f.SetCellValue(sheet, cellName(17, row), boolToYesNo(!d.HasPR))
+	f.SetCellValue(sheet, cellName(18, row), boolToYesNo(d.HasStaleApproval))
+	f.SetCellValue(sheet, cellName(19, row), boolToYesNo(d.IsSelfApproved))
+	f.SetCellValue(sheet, cellName(20, row), boolToYesNo(!d.HasFinalApproval && !d.IsSelfApproved))
 }
 
 // writeStaleApprovalsSheet writes commits where approval existed but was stale (pre-force-push).
@@ -717,7 +736,7 @@ func writeMultiplePRsSheet(f *excelize.File, sheet string, rows []MultiplePRRow,
 }
 
 func setDetailColumnWidths(f *excelize.File, sheet string, numCols int) {
-	widths := []float64{12, 25, 12, 15, 15, 18, 40, 20, 8, 15, 10, 20, 14, 15, 10, 40}
+	widths := []float64{12, 25, 12, 15, 15, 18, 40, 20, 8, 15, 10, 20, 14, 15, 10, 40, 8, 14, 14, 13}
 	for i := 0; i < numCols && i < len(widths); i++ {
 		colName, _ := excelize.ColumnNumberToName(i + 1)
 		f.SetColWidth(sheet, colName, colName, widths[i])
@@ -727,4 +746,11 @@ func setDetailColumnWidths(f *excelize.File, sheet string, numCols int) {
 func cellName(col, row int) string {
 	name, _ := excelize.CoordinatesToCellName(col, row)
 	return name
+}
+
+func boolToYesNo(b bool) string {
+	if b {
+		return "Yes"
+	}
+	return "No"
 }

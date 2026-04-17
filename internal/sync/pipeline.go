@@ -37,6 +37,7 @@ type Store interface {
 	UpsertCheckRuns(ctx context.Context, runs []model.CheckRun) error
 	UpsertCommitPRs(ctx context.Context, org, repo, sha string, prNumbers []int) error
 	UpsertAuditResults(ctx context.Context, results []model.AuditResult) error
+	UpdateCommitStats(ctx context.Context, org, repo, sha string, additions, deletions int) error
 	GetUnauditedCommits(ctx context.Context, org, repo string) ([]model.Commit, error)
 }
 
@@ -305,6 +306,13 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 
 	// Write all enrichment data through single writer
 	if err := writer.Write(ctx, func() error {
+		for _, e := range allEnrichments {
+			if e.Commit.Additions > 0 || e.Commit.Deletions > 0 {
+				if err := p.store.UpdateCommitStats(ctx, e.Commit.Org, e.Commit.Repo, e.Commit.SHA, e.Commit.Additions, e.Commit.Deletions); err != nil {
+					return err
+				}
+			}
+		}
 		if err := p.store.UpsertPullRequests(ctx, allPRs); err != nil {
 			return fmt.Errorf("upserting PRs: %w", err)
 		}

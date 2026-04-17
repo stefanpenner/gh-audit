@@ -120,6 +120,15 @@ func scanDuckDBTextArray(v any) []string {
 	}
 }
 
+// DeleteAuditResults removes all audit results for an org/repo so they can be re-inserted.
+func (d *DB) DeleteAuditResults(ctx context.Context, org, repo string) error {
+	_, err := d.DB.ExecContext(ctx, "DELETE FROM audit_results WHERE org = ? AND repo = ?", org, repo)
+	if err != nil {
+		return fmt.Errorf("delete audit results for %s/%s: %w", org, repo, err)
+	}
+	return nil
+}
+
 // GetAuditResults retrieves audit results with optional filters, joined with commit data.
 func (d *DB) GetAuditResults(ctx context.Context, opts AuditQueryOpts) ([]AuditRow, error) {
 	var conditions []string

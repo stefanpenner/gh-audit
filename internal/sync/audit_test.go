@@ -577,6 +577,51 @@ func TestEvaluateCommit(t *testing.T) {
 			wantReasons:    []string{"no approval on final commit (PR #42)"},
 		},
 		{
+			name: "merge commit author is merger not code author — not self-approval",
+			commit: model.Commit{
+				Org: "myorg", Repo: "myrepo", SHA: "mergeabc",
+				AuthorLogin: "merger", CommitterLogin: "web-flow",
+				Additions: 10, Deletions: 5, ParentCount: 2,
+				Href: "https://github.com/myorg/myrepo/commit/mergeabc",
+			},
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{
+					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "mergeabc", AuthorLogin: "codeauthor", Href: "https://github.com/myorg/myrepo/pull/42"},
+				},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "merger", State: "APPROVED", CommitID: "head123", SubmittedAt: now},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks: requiredChecks,
+			wantCompliant:  true,
+			wantHasPR:      true,
+			wantReasons:    []string{"compliant"},
+		},
+		{
+			name: "non-merge commit author == reviewer is still self-approval",
+			commit: model.Commit{
+				Org: "myorg", Repo: "myrepo", SHA: "abc123",
+				AuthorLogin: "coder", CommitterLogin: "web-flow",
+				Additions: 10, Deletions: 5, ParentCount: 1,
+				Href: "https://github.com/myorg/myrepo/commit/abc123",
+			},
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{
+					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "abc123", AuthorLogin: "prauthor", Href: "https://github.com/myorg/myrepo/pull/42"},
+				},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "coder", State: "APPROVED", CommitID: "head123", SubmittedAt: now},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks:   requiredChecks,
+			wantCompliant:    false,
+			wantHasPR:        true,
+			wantSelfApproved: true,
+			wantReasons:      []string{"self-approved (reviewer is code author) (PR #42)"},
+		},
+		{
 			name: "multiple reviewers one self one legitimate is compliant",
 			commit: model.Commit{
 				Org: "myorg", Repo: "myrepo", SHA: "abc123",

@@ -67,6 +67,33 @@ func (d *DB) GetUnauditedCommits(ctx context.Context, org, repo string) ([]model
 	return scanCommits(rows)
 }
 
+// GetAllCommits returns all commits for an org/repo.
+func (d *DB) GetAllCommits(ctx context.Context, org, repo string) ([]model.Commit, error) {
+	rows, err := d.DB.QueryContext(ctx, `
+		SELECT org, repo, sha, author_login, author_email, committer_login,
+		       committed_at, message, parent_count, additions, deletions, href
+		FROM commits
+		WHERE org = ? AND repo = ?
+		ORDER BY committed_at`, org, repo)
+	if err != nil {
+		return nil, fmt.Errorf("query all commits: %w", err)
+	}
+	defer rows.Close()
+
+	return scanCommits(rows)
+}
+
+// UpdateCommitStats updates the additions and deletions for a commit.
+func (d *DB) UpdateCommitStats(ctx context.Context, org, repo, sha string, additions, deletions int) error {
+	_, err := d.DB.ExecContext(ctx,
+		"UPDATE commits SET additions = ?, deletions = ? WHERE org = ? AND repo = ? AND sha = ?",
+		additions, deletions, org, repo, sha)
+	if err != nil {
+		return fmt.Errorf("update commit stats %s/%s@%s: %w", org, repo, sha[:12], err)
+	}
+	return nil
+}
+
 // GetCommitsBySHA retrieves specific commits by their SHAs.
 func (d *DB) GetCommitsBySHA(ctx context.Context, org, repo string, shas []string) ([]model.Commit, error) {
 	if len(shas) == 0 {

@@ -37,6 +37,7 @@ func NewRootCmd() *cobra.Command {
 
 	rootCmd.AddCommand(newSyncCmd())
 	rootCmd.AddCommand(newReportCmd())
+	rootCmd.AddCommand(newReAuditCmd())
 	rootCmd.AddCommand(newConfigCmd())
 
 	return rootCmd

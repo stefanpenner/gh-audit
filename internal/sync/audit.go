@@ -232,15 +232,18 @@ func isSelfApproval(review model.Review, commit model.Commit, pr model.PullReque
 		return true
 	}
 
-	// Check against commit author
-	if strings.EqualFold(commit.AuthorLogin, reviewer) {
-		return true
-	}
+	// Check against commit author and committer, but skip merge commits —
+	// the commit author of a merge commit is the person who clicked merge,
+	// not a code contributor.
+	if commit.ParentCount <= 1 {
+		if strings.EqualFold(commit.AuthorLogin, reviewer) {
+			return true
+		}
 
-	// Check against committer (but skip GitHub's merge bot)
-	committer := strings.ToLower(commit.CommitterLogin)
-	if committer != "" && committer != "web-flow" && committer != "github" && committer == reviewer {
-		return true
+		committer := strings.ToLower(commit.CommitterLogin)
+		if committer != "" && committer != "web-flow" && committer != "github" && committer == reviewer {
+			return true
+		}
 	}
 
 	// Check against co-authors

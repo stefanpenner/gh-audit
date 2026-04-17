@@ -85,9 +85,11 @@ Any APPROVED (non-self)?     yes → HasStaleApproval=true
 
 A review is self-approval if the reviewer matches any of:
 - PR author
-- Commit author
-- Committer (excluding GitHub merge bots: `web-flow`, `github`)
+- Commit author (non-merge commits only — `parent_count ≤ 1`)
+- Committer (non-merge commits only, excluding GitHub merge bots: `web-flow`, `github`)
 - Any co-author (from `Co-authored-by:` trailers)
+
+**Merge commit exclusion**: For merge commits (`parent_count > 1`), the commit author is the person who clicked "Merge" — not a code contributor. Checking the commit author or committer of a merge commit against the reviewer would incorrectly flag the merger's approval as self-approval. The PR author check is sufficient for merge commits.
 
 If the only approvals are self-approvals, the commit is **non-compliant**.
 
@@ -98,8 +100,8 @@ review.reviewer_login               ← SOT: GitHub REST API (reviews)
 isSelfApproval (audit.go) checks against four identities:
       │
       ├── pr.author_login            ← SOT: GET /commits/{sha}/pulls
-      ├── commit.author_login        ← SOT: GET /commits/{sha}
-      ├── commit.committer_login     ← SOT: GET /commits/{sha} (skip "web-flow", "github")
+      ├── commit.author_login        ← SOT: GET /commits/{sha} (skip if parent_count > 1)
+      ├── commit.committer_login     ← SOT: GET /commits/{sha} (skip "web-flow", "github", skip if parent_count > 1)
       └── commit.co_authors[].login  ← SOT: parsed from "Co-authored-by:" trailers
       │
       ▼
