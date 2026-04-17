@@ -99,6 +99,7 @@ func resolveDBPath(cfg *config.Config) string {
 func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until string, concurrency int) *sync.SyncConfig {
 	syncCfg := &sync.SyncConfig{
 		Concurrency:         cfg.Sync.Concurrency,
+		EnrichConcurrency:   cfg.Sync.EnrichConcurrency,
 		InitialLookbackDays: cfg.Sync.InitialLookbackDays,
 		ExemptAuthors:       cfg.Exemptions.Authors,
 	}

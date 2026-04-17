@@ -42,6 +42,7 @@ type Store interface {
 type SyncConfig struct {
 	Orgs                []OrgConfig
 	Concurrency         int
+	EnrichConcurrency   int
 	Since               time.Time // override, zero means use cursor
 	Until               time.Time // override, zero means now
 	InitialLookbackDays int
@@ -109,14 +110,16 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		concurrency = 10
 	}
 
+	writer := NewDBWriter(concurrency * 2)
+	defer writer.Close()
+
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(concurrency)
 
 	for _, rwo := range allRepos {
 		g.Go(func() error {
-			if err := p.syncRepo(gctx, rwo.repo, rwo.orgCfg); err != nil {
+			if err := p.syncRepo(gctx, rwo.repo, rwo.orgCfg, writer); err != nil {
 				p.logger.Error("sync repo failed", "org", rwo.repo.Org, "repo", rwo.repo.Name, "error", err)
-				// Continue with other repos; don't fail the whole pipeline
 				return nil
 			}
 			return nil
@@ -126,22 +129,21 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	return g.Wait()
 }
 
-func (p *Pipeline) syncRepo(ctx context.Context, repo model.RepoInfo, orgCfg OrgConfig) error {
+func (p *Pipeline) syncRepo(ctx context.Context, repo model.RepoInfo, orgCfg OrgConfig, writer *DBWriter) error {
 	branches := orgCfg.Branches
 	if len(branches) == 0 {
 		branches = []string{repo.DefaultBranch}
 	}
 
 	for _, branch := range branches {
-		if err := p.syncRepoBranch(ctx, repo, branch); err != nil {
+		if err := p.syncRepoBranch(ctx, repo, branch, writer); err != nil {
 			p.logger.Error("sync branch failed", "org", repo.Org, "repo", repo.Name, "branch", branch, "error", err)
-			// Continue with other branches
 		}
 	}
 	return nil
 }
 
-func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, branch string) error {
+func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, branch string, writer *DBWriter) error {
 	p.logger.Info("sync repo branch start", "org", repo.Org, "repo", repo.Name, "branch", branch)
 
 	since, err := p.determineSince(ctx, repo.Org, repo.Name, branch)
@@ -154,7 +156,6 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 		until = time.Now()
 	}
 
-	// Fetch commits
 	commits, err := p.source.ListCommits(ctx, repo.Org, repo.Name, branch, since, until)
 	if err != nil {
 		return fmt.Errorf("listing commits: %w", err)
@@ -166,21 +167,24 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 		return nil
 	}
 
-	// Store commits
-	if err := p.store.UpsertCommits(ctx, commits); err != nil {
+	// Write commits through single writer
+	if err := writer.Write(ctx, func() error {
+		return p.store.UpsertCommits(ctx, commits)
+	}); err != nil {
 		return fmt.Errorf("upserting commits: %w", err)
 	}
 
-	// Record which branch these commits belong to
 	shas := make([]string, len(commits))
 	for i, c := range commits {
 		shas[i] = c.SHA
 	}
-	if err := p.store.UpsertCommitBranches(ctx, repo.Org, repo.Name, shas, branch); err != nil {
+	if err := writer.Write(ctx, func() error {
+		return p.store.UpsertCommitBranches(ctx, repo.Org, repo.Name, shas, branch)
+	}); err != nil {
 		return fmt.Errorf("upserting commit branches: %w", err)
 	}
 
-	// Get unaudited commits
+	// Reads are safe concurrent with the writer — DuckDB MVCC
 	unaudited, err := p.store.GetUnauditedCommits(ctx, repo.Org, repo.Name)
 	if err != nil {
 		return fmt.Errorf("getting unaudited commits: %w", err)
@@ -188,47 +192,54 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 
 	p.logger.Info("unaudited commits", "org", repo.Org, "repo", repo.Name, "branch", branch, "count", len(unaudited))
 
-	// Enrich in batches
-	var allEnrichments []model.EnrichmentResult
-	for i := 0; i < len(unaudited); i += enrichBatchSize {
-		end := min(i+enrichBatchSize, len(unaudited))
-		batch := unaudited[i:end]
+	// Enrich batches in parallel — these are pure API reads
+	allEnrichments, err := p.enrichInParallel(ctx, repo, branch, unaudited)
+	if err != nil {
+		return fmt.Errorf("enriching commits: %w", err)
+	}
 
-		batchSHAs := make([]string, len(batch))
-		for j, c := range batch {
-			batchSHAs[j] = c.SHA
+	// Collect enrichment data for a single batched write
+	var allPRs []model.PullRequest
+	var allReviews []model.Review
+	var allCheckRuns []model.CheckRun
+	type commitPRLink struct {
+		sha       string
+		prNumbers []int
+	}
+	var allLinks []commitPRLink
+
+	for _, e := range allEnrichments {
+		allPRs = append(allPRs, e.PRs...)
+		allReviews = append(allReviews, e.Reviews...)
+		allCheckRuns = append(allCheckRuns, e.CheckRuns...)
+		prNums := make([]int, len(e.PRs))
+		for j, pr := range e.PRs {
+			prNums[j] = pr.Number
 		}
-
-		p.logger.Info("enriching batch", "org", repo.Org, "repo", repo.Name, "branch", branch, "batch", i/enrichBatchSize+1, "size", len(batchSHAs))
-
-		enrichments, err := p.enricher.EnrichCommits(ctx, repo.Org, repo.Name, batchSHAs)
-		if err != nil {
-			return fmt.Errorf("enriching commits: %w", err)
+		if len(prNums) > 0 {
+			allLinks = append(allLinks, commitPRLink{sha: e.Commit.SHA, prNumbers: prNums})
 		}
+	}
 
-		// Store enrichment data
-		for _, e := range enrichments {
-			if err := p.store.UpsertPullRequests(ctx, e.PRs); err != nil {
-				return fmt.Errorf("upserting PRs: %w", err)
-			}
-			if err := p.store.UpsertReviews(ctx, e.Reviews); err != nil {
-				return fmt.Errorf("upserting reviews: %w", err)
-			}
-			if err := p.store.UpsertCheckRuns(ctx, e.CheckRuns); err != nil {
-				return fmt.Errorf("upserting check runs: %w", err)
-			}
-
-			// Link commit to PRs
-			prNumbers := make([]int, len(e.PRs))
-			for j, pr := range e.PRs {
-				prNumbers[j] = pr.Number
-			}
-			if err := p.store.UpsertCommitPRs(ctx, repo.Org, repo.Name, e.Commit.SHA, prNumbers); err != nil {
+	// Write all enrichment data through single writer
+	if err := writer.Write(ctx, func() error {
+		if err := p.store.UpsertPullRequests(ctx, allPRs); err != nil {
+			return fmt.Errorf("upserting PRs: %w", err)
+		}
+		if err := p.store.UpsertReviews(ctx, allReviews); err != nil {
+			return fmt.Errorf("upserting reviews: %w", err)
+		}
+		if err := p.store.UpsertCheckRuns(ctx, allCheckRuns); err != nil {
+			return fmt.Errorf("upserting check runs: %w", err)
+		}
+		for _, link := range allLinks {
+			if err := p.store.UpsertCommitPRs(ctx, repo.Org, repo.Name, link.sha, link.prNumbers); err != nil {
 				return fmt.Errorf("upserting commit-PR links: %w", err)
 			}
 		}
-
-		allEnrichments = append(allEnrichments, enrichments...)
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	// Build enrichment map for audit evaluation
@@ -237,7 +248,6 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 		enrichmentMap[e.Commit.SHA] = e
 	}
 
-	// Evaluate audit rules
 	var auditResults []model.AuditResult
 	for _, c := range unaudited {
 		enrichment := enrichmentMap[c.SHA]
@@ -246,11 +256,13 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 		auditResults = append(auditResults, result)
 	}
 
-	if err := p.store.UpsertAuditResults(ctx, auditResults); err != nil {
+	if err := writer.Write(ctx, func() error {
+		return p.store.UpsertAuditResults(ctx, auditResults)
+	}); err != nil {
 		return fmt.Errorf("upserting audit results: %w", err)
 	}
 
-	// Update sync cursor to latest commit date (per branch)
+	// Update sync cursor to latest commit date
 	var latestDate time.Time
 	for _, c := range commits {
 		if c.CommittedAt.After(latestDate) {
@@ -266,7 +278,9 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 			LastDate:  latestDate,
 			UpdatedAt: time.Now(),
 		}
-		if err := p.store.UpsertSyncCursor(ctx, cursor); err != nil {
+		if err := writer.Write(ctx, func() error {
+			return p.store.UpsertSyncCursor(ctx, cursor)
+		}); err != nil {
 			return fmt.Errorf("upserting sync cursor: %w", err)
 		}
 	}
@@ -275,13 +289,63 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 	return nil
 }
 
+// enrichInParallel runs enrichment batches concurrently using an errgroup.
+// Each batch is an independent API call; results are collected by index
+// to preserve ordering without a mutex.
+func (p *Pipeline) enrichInParallel(ctx context.Context, repo model.RepoInfo, branch string, unaudited []model.Commit) ([]model.EnrichmentResult, error) {
+	if len(unaudited) == 0 {
+		return nil, nil
+	}
+
+	numBatches := (len(unaudited) + enrichBatchSize - 1) / enrichBatchSize
+	batchResults := make([][]model.EnrichmentResult, numBatches)
+
+	enrichConc := p.config.EnrichConcurrency
+	if enrichConc <= 0 {
+		enrichConc = 4
+	}
+
+	eg, ectx := errgroup.WithContext(ctx)
+	eg.SetLimit(enrichConc)
+
+	for i := 0; i < len(unaudited); i += enrichBatchSize {
+		batchIdx := i / enrichBatchSize
+		end := min(i+enrichBatchSize, len(unaudited))
+		batch := unaudited[i:end]
+
+		eg.Go(func() error {
+			batchSHAs := make([]string, len(batch))
+			for j, c := range batch {
+				batchSHAs[j] = c.SHA
+			}
+
+			p.logger.Info("enriching batch", "org", repo.Org, "repo", repo.Name, "branch", branch, "batch", batchIdx+1, "size", len(batchSHAs))
+
+			enrichments, err := p.enricher.EnrichCommits(ectx, repo.Org, repo.Name, batchSHAs)
+			if err != nil {
+				return err
+			}
+			batchResults[batchIdx] = enrichments
+			return nil
+		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+
+	var all []model.EnrichmentResult
+	for _, r := range batchResults {
+		all = append(all, r...)
+	}
+	return all, nil
+}
+
 func (p *Pipeline) determineSince(ctx context.Context, org, repo, branch string) (time.Time, error) {
-	// Explicit override takes priority
 	if !p.config.Since.IsZero() {
 		return p.config.Since, nil
 	}
 
-	// Check cursor
 	cursor, err := p.store.GetSyncCursor(ctx, org, repo, branch)
 	if err != nil {
 		return time.Time{}, err
@@ -290,7 +354,6 @@ func (p *Pipeline) determineSince(ctx context.Context, org, repo, branch string)
 		return cursor.LastDate, nil
 	}
 
-	// Fall back to initial lookback
 	days := p.config.InitialLookbackDays
 	if days <= 0 {
 		days = 90

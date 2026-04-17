@@ -59,7 +59,8 @@ type CheckConfig struct {
 
 // SyncConfig controls syncing behaviour.
 type SyncConfig struct {
-	Concurrency        int `yaml:"concurrency"`
+	Concurrency         int `yaml:"concurrency"`
+	EnrichConcurrency   int `yaml:"enrich_concurrency"`
 	InitialLookbackDays int `yaml:"initial_lookback_days"`
 }
 
@@ -113,6 +114,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Sync.Concurrency <= 0 {
 		c.Sync.Concurrency = 10
+	}
+	if c.Sync.EnrichConcurrency <= 0 {
+		c.Sync.EnrichConcurrency = 4
 	}
 	if c.Sync.InitialLookbackDays <= 0 {
 		c.Sync.InitialLookbackDays = 90
