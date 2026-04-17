@@ -572,4 +572,36 @@ func TestRateLimitTransport_5xxExhaustsRetries(t *testing.T) {
 }
 
 // Ensure go-github is used (compile check).
+func TestGetPullRequest(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pr := map[string]any{
+			"number":           42,
+			"title":            "Fix the thing",
+			"merged":           true,
+			"html_url":         "https://github.com/testorg/testrepo/pull/42",
+			"merge_commit_sha": "mergeabc123",
+			"head":             map[string]any{"sha": "headsha123"},
+			"user":             map[string]any{"login": "author1"},
+			"merged_by":        map[string]any{"login": "merger1"},
+			"merged_at":        "2024-06-01T12:00:00Z",
+		}
+		json.NewEncoder(w).Encode(pr)
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	pool := mockTokenPool(t, server.URL)
+	client := NewClient(pool, testLogger())
+
+	pr, err := client.GetPullRequest(context.Background(), "testorg", "testrepo", 42)
+	require.NoError(t, err)
+	assert.Equal(t, 42, pr.Number)
+	assert.Equal(t, "Fix the thing", pr.Title)
+	assert.True(t, pr.Merged)
+	assert.Equal(t, "headsha123", pr.HeadSHA)
+	assert.Equal(t, "author1", pr.AuthorLogin)
+	assert.Equal(t, "merger1", pr.MergedByLogin)
+	assert.Equal(t, "mergeabc123", pr.MergeCommitSHA)
+}
+
 var _ = (*gogithub.Client)(nil)

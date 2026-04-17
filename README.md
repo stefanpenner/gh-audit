@@ -222,7 +222,7 @@ Multiple tokens (PAT, App, or a mix) can be configured. The token pool:
 - Retries on 429 (respecting `Retry-After` header)
 - Disables tokens permanently on 401 (invalid credentials)
 
-GitHub REST API: 5,000 requests/hour per token. Typical cost per commit: ~4 requests (detail + PRs + reviews + check runs). One token audits ~1,200 commits/hour. Multiple tokens multiply throughput linearly.
+GitHub REST API: 5,000 requests/hour per token. Typical cost per commit: ~5 requests (detail + PRs list + PR detail + reviews + check runs). One token audits ~1,000 commits/hour. Multiple tokens multiply throughput linearly.
 
 ## Global flags
 

@@ -210,7 +210,7 @@ The `since` date comes from (in priority order):
 
 ### Phase 2: Enrich
 
-For each unaudited commit (no row in `audit_results`), the enricher calls four REST endpoints:
+For each unaudited commit (no row in `audit_results`), the enricher calls five REST endpoints:
 
 ```
 commit SHA
@@ -219,9 +219,12 @@ commit SHA
   │      → additions, deletions, co-authors
   │
   ├──▶ GET /repos/{o}/{r}/commits/{sha}/pulls
-  │      → merged PRs (number, head_sha, author, merged_by)
+  │      → merged PRs (number, head_sha, author)
   │
-  ├──▶ GET /repos/{o}/{r}/pulls/{n}/reviews     (per PR)
+  ├──▶ GET /repos/{o}/{r}/pulls/{n}             (per PR)
+  │      → merged_by, full head_sha (backfills fields missing from /commits/{sha}/pulls)
+  │
+  ├──�� GET /repos/{o}/{r}/pulls/{n}/reviews     (per PR)
   │      → reviewer, state, commit_id, submitted_at
   │
   └──▶ GET /repos/{o}/{r}/commits/{head}/check-runs  (per PR head SHA)
@@ -348,4 +351,4 @@ internal/
 
 ## Rate limits
 
-GitHub REST API: 5,000 requests/hour per token (PAT or App). Cost per commit: ~4 requests (detail + PRs + reviews + check runs). One token audits ~1,250 commits/hour. Multiple tokens multiply throughput linearly — the token pool routes requests to the least-loaded scoped token automatically. See [Token pool](#token-pool) for details.
+GitHub REST API: 5,000 requests/hour per token (PAT or App). Cost per commit: ~5 requests (detail + PRs list + PR detail + reviews + check runs). One token audits ~1,000 commits/hour. Multiple tokens multiply throughput linearly — the token pool routes requests to the least-loaded scoped token automatically. See [Token pool](#token-pool) for details.

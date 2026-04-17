@@ -348,8 +348,46 @@ func (c *Client) ListCheckRunsForRef(ctx context.Context, org, repo, ref string)
 	return allRuns, nil
 }
 
+// GetPullRequest fetches a single pull request with full details (including merged_by).
+func (c *Client) GetPullRequest(ctx context.Context, org, repo string, number int) (*model.PullRequest, error) {
+	gh, err := c.ghClient(ctx, org, repo)
+	if err != nil {
+		return nil, err
+	}
+
+	pr, _, err := gh.PullRequests.Get(ctx, org, repo, number)
+	if err != nil {
+		return nil, fmt.Errorf("getting PR %s/%s#%d: %w", org, repo, number, err)
+	}
+
+	p := &model.PullRequest{
+		Org:    org,
+		Repo:   repo,
+		Number: pr.GetNumber(),
+		Title:  pr.GetTitle(),
+		Merged: pr.GetMerged(),
+		Href:   pr.GetHTMLURL(),
+	}
+	if pr.GetHead() != nil {
+		p.HeadSHA = pr.GetHead().GetSHA()
+	}
+	if pr.GetMergeCommitSHA() != "" {
+		p.MergeCommitSHA = pr.GetMergeCommitSHA()
+	}
+	if pr.GetUser() != nil {
+		p.AuthorLogin = pr.GetUser().GetLogin()
+	}
+	if pr.GetMergedBy() != nil {
+		p.MergedByLogin = pr.GetMergedBy().GetLogin()
+	}
+	if pr.MergedAt != nil {
+		p.MergedAt = pr.MergedAt.Time
+	}
+	return p, nil
+}
+
 // EnrichCommits fetches PRs, reviews, and check runs for a batch of commits via REST.
-// Each commit triggers: GET commit (stats), GET commit PRs, GET reviews per PR, GET check runs per PR head.
+// Each commit triggers: GET commit (stats), GET commit PRs, GET PR detail, GET reviews per PR, GET check runs per PR head.
 func (c *Client) EnrichCommits(ctx context.Context, org, repo string, shas []string) ([]model.EnrichmentResult, error) {
 	results := make([]model.EnrichmentResult, len(shas))
 
@@ -368,16 +406,26 @@ func (c *Client) EnrichCommits(ctx context.Context, org, repo string, shas []str
 		var allCheckRuns []model.CheckRun
 		seenCheckRef := make(map[string]bool)
 
-		for _, pr := range prs {
+		for j, pr := range prs {
+			// The /commits/{sha}/pulls endpoint omits merged_by — fetch full PR detail.
+			fullPR, err := c.GetPullRequest(ctx, org, repo, pr.Number)
+			if err != nil {
+				return nil, fmt.Errorf("commit %s PR #%d detail: %w", sha[:12], pr.Number, err)
+			}
+			prs[j].MergedByLogin = fullPR.MergedByLogin
+			if fullPR.HeadSHA != "" {
+				prs[j].HeadSHA = fullPR.HeadSHA
+			}
+
 			reviews, err := c.ListReviews(ctx, org, repo, pr.Number)
 			if err != nil {
 				return nil, fmt.Errorf("commit %s PR #%d reviews: %w", sha[:12], pr.Number, err)
 			}
 			allReviews = append(allReviews, reviews...)
 
-			if pr.HeadSHA != "" && !seenCheckRef[pr.HeadSHA] {
-				seenCheckRef[pr.HeadSHA] = true
-				runs, err := c.ListCheckRunsForRef(ctx, org, repo, pr.HeadSHA)
+			if prs[j].HeadSHA != "" && !seenCheckRef[prs[j].HeadSHA] {
+				seenCheckRef[prs[j].HeadSHA] = true
+				runs, err := c.ListCheckRunsForRef(ctx, org, repo, prs[j].HeadSHA)
 				if err != nil {
 					return nil, fmt.Errorf("commit %s PR #%d check runs: %w", sha[:12], pr.Number, err)
 				}

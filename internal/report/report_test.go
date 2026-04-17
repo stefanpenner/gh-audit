@@ -685,6 +685,141 @@ func TestDetailRowMergedByLoginEmpty(t *testing.T) {
 	assert.Empty(t, details[0].MergedByLogin)
 }
 
+func TestSummaryStaleApprovalCount(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	insertCommit(t, db, "org1", "repo1", "aaa111aaa", "dev1", now, 10, 5)
+	insertCommit(t, db, "org1", "repo1", "bbb222bbb", "dev2", now, 10, 5)
+	insertCommit(t, db, "org1", "repo1", "ccc333ccc", "dev3", now, 10, 5)
+
+	insertAuditResultFull(t, db, "org1", "repo1", "aaa111aaa", auditResultOpts{hasPR: true, hasApproval: false, hasStaleApproval: true, prNumber: 1, reasons: []string{"approval is stale — not on final commit"}})
+	insertAuditResultFull(t, db, "org1", "repo1", "bbb222bbb", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: true, prNumber: 2, approvers: []string{"reviewer1"}, reasons: []string{"compliant"}})
+	insertAuditResultFull(t, db, "org1", "repo1", "ccc333ccc", auditResultOpts{hasPR: true, hasApproval: false, hasStaleApproval: true, prNumber: 3, reasons: []string{"approval is stale — not on final commit"}})
+
+	r := New(db)
+	summary, err := r.GetSummary(context.Background(), ReportOpts{})
+	require.NoError(t, err, "GetSummary")
+	require.Len(t, summary, 1)
+	assert.Equal(t, 2, summary[0].StaleApprovalCount, "stale approval count")
+}
+
+func TestSummaryMultiplePRCount(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	insertCommit(t, db, "org1", "repo1", "aaa111aaa", "dev1", now, 10, 5)
+	insertCommit(t, db, "org1", "repo1", "bbb222bbb", "dev2", now, 10, 5)
+
+	insertAuditResultFull(t, db, "org1", "repo1", "aaa111aaa", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: true, prNumber: 1, prCount: 3, approvers: []string{"reviewer1"}, reasons: []string{"compliant"}})
+	insertAuditResultFull(t, db, "org1", "repo1", "bbb222bbb", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: true, prNumber: 2, prCount: 1, approvers: []string{"reviewer1"}, reasons: []string{"compliant"}})
+
+	r := New(db)
+	summary, err := r.GetSummary(context.Background(), ReportOpts{})
+	require.NoError(t, err, "GetSummary")
+	require.Len(t, summary, 1)
+	assert.Equal(t, 1, summary[0].MultiplePRCount, "multiple PR count")
+}
+
+func TestGetMultiplePRDetails(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	insertCommit(t, db, "org1", "repo1", "multipr111", "dev1", now, 10, 5)
+	insertCommit(t, db, "org1", "repo1", "singlepr22", "dev2", now, 10, 5)
+
+	// Commit with 2 PRs
+	insertAuditResultFull(t, db, "org1", "repo1", "multipr111", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: true, prNumber: 10, prCount: 2, approvers: []string{"reviewer1"}, reasons: []string{"compliant"}})
+	// Commit with 1 PR
+	insertAuditResultFull(t, db, "org1", "repo1", "singlepr22", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: true, prNumber: 20, prCount: 1, approvers: []string{"reviewer1"}, reasons: []string{"compliant"}})
+
+	// Insert commit_prs associations
+	_, err := db.Exec(`INSERT INTO commit_prs (org, repo, sha, pr_number) VALUES (?, ?, ?, ?), (?, ?, ?, ?)`,
+		"org1", "repo1", "multipr111", 10, "org1", "repo1", "multipr111", 11)
+	require.NoError(t, err, "insert commit_prs")
+
+	_, err = db.Exec(`INSERT INTO commit_prs (org, repo, sha, pr_number) VALUES (?, ?, ?, ?)`,
+		"org1", "repo1", "singlepr22", 20)
+	require.NoError(t, err, "insert commit_prs single")
+
+	// Insert pull_requests
+	_, err = db.Exec(`INSERT INTO pull_requests (org, repo, number, title, merged, head_sha, author_login, merged_by_login, merged_at, href)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"org1", "repo1", 10, "PR ten", true, "multipr111", "dev1", "merger1", now, "https://github.com/org1/repo1/pull/10",
+		"org1", "repo1", 11, "PR eleven", true, "multipr111", "dev1", "merger2", now, "https://github.com/org1/repo1/pull/11")
+	require.NoError(t, err, "insert PRs")
+
+	r := New(db)
+	rows, err := r.GetMultiplePRDetails(context.Background(), ReportOpts{})
+	require.NoError(t, err, "GetMultiplePRDetails")
+
+	// Should return 2 rows (one per PR for the multi-PR commit), not the single-PR commit
+	require.Len(t, rows, 2, "expected 2 rows for multi-PR commit")
+	assert.Equal(t, "multipr111", rows[0].SHA)
+	assert.Equal(t, 2, rows[0].PRCount)
+
+	// One row should be the audited PR (10), the other not (11)
+	auditedCount := 0
+	for _, row := range rows {
+		if row.IsAuditedPR {
+			auditedCount++
+			assert.Equal(t, 10, row.PRNumber)
+		}
+	}
+	assert.Equal(t, 1, auditedCount, "exactly one row should be the audited PR")
+}
+
+func TestStaleApprovalsSheetContent(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	insertCommit(t, db, "org1", "repo1", "staleaaa11", "dev1", now, 10, 5)
+	insertCommit(t, db, "org1", "repo1", "normalbbb2", "dev2", now, 10, 5)
+	insertCommitBranch(t, db, "org1", "repo1", "staleaaa11", "main")
+
+	insertAuditResultFull(t, db, "org1", "repo1", "staleaaa11", auditResultOpts{hasPR: true, hasApproval: false, hasStaleApproval: true, prNumber: 1, approvers: []string{"old-reviewer"}, reasons: []string{"approval is stale — not on final commit"}})
+	insertAuditResultFull(t, db, "org1", "repo1", "normalbbb2", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: true, prNumber: 2, approvers: []string{"reviewer1"}, reasons: []string{"compliant"}})
+
+	r := New(db)
+
+	tmpFile := t.TempDir() + "/test-stale.xlsx"
+	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
+	require.NoError(t, err, "GenerateXLSX")
+
+	xf, err := excelize.OpenFile(tmpFile)
+	require.NoError(t, err, "opening xlsx")
+	defer xf.Close()
+
+	rows, err := xf.GetRows("Stale Approvals")
+	require.NoError(t, err, "getting Stale Approvals rows")
+	require.Len(t, rows, 2, "expected 1 header + 1 data row")
+
+	found := false
+	for _, cell := range rows[1] {
+		if cell == "staleaaa" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected stale SHA prefix in row, got: %v", rows[1])
+}
+
+func TestDetailRowHasStaleApprovalAndPRCount(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	insertCommit(t, db, "org1", "repo1", "aaa111aaa", "dev1", now, 10, 5)
+	insertAuditResultFull(t, db, "org1", "repo1", "aaa111aaa", auditResultOpts{hasPR: true, hasStaleApproval: true, prNumber: 1, prCount: 2, reasons: []string{"approval is stale — not on final commit"}})
+
+	r := New(db)
+	details, err := r.GetDetails(context.Background(), ReportOpts{})
+	require.NoError(t, err, "GetDetails")
+	require.Len(t, details, 1)
+
+	assert.True(t, details[0].HasStaleApproval, "HasStaleApproval")
+	assert.Equal(t, 2, details[0].PRCount, "PRCount")
+}
+
 func TestDetailRowBranchName(t *testing.T) {
 	db := setupTestDB(t)
 	now := time.Now().Truncate(time.Second)
