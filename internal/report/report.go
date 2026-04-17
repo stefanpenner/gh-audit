@@ -1,0 +1,294 @@
+package report
+
+import (
+	"context"
+	"database/sql"
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"io"
+	"strings"
+	"text/tabwriter"
+	"time"
+)
+
+// Reporter generates audit reports from the database.
+type Reporter struct {
+	db *sql.DB
+}
+
+// ReportOpts controls report filtering.
+type ReportOpts struct {
+	Org          string
+	Repo         string
+	Since        time.Time
+	Until        time.Time
+	OnlyFailures bool
+}
+
+// SummaryRow is a per-repo compliance summary.
+type SummaryRow struct {
+	Org               string  `json:"org"`
+	Repo              string  `json:"repo"`
+	TotalCommits      int     `json:"total_commits"`
+	CompliantCount    int     `json:"compliant_count"`
+	NonCompliantCount int     `json:"non_compliant_count"`
+	BotCount          int     `json:"bot_count"`
+	EmptyCount        int     `json:"empty_count"`
+	CompliancePct     float64 `json:"compliance_pct"`
+}
+
+// DetailRow is a single commit's audit detail.
+type DetailRow struct {
+	Org                string    `json:"org"`
+	Repo               string    `json:"repo"`
+	SHA                string    `json:"sha"`
+	AuthorLogin        string    `json:"author_login"`
+	CommittedAt        time.Time `json:"committed_at"`
+	Message            string    `json:"message"`
+	IsBot              bool      `json:"is_bot"`
+	IsEmptyCommit      bool      `json:"is_empty_commit"`
+	HasPR              bool      `json:"has_pr"`
+	PRNumber           int       `json:"pr_number"`
+	PRHref             string    `json:"pr_href"`
+	HasFinalApproval   bool      `json:"has_final_approval"`
+	ApproverLogins     string    `json:"approver_logins"`
+	OwnerApprovalCheck string    `json:"owner_approval_check"`
+	IsCompliant        bool      `json:"is_compliant"`
+	Reasons            string    `json:"reasons"`
+	CommitHref         string    `json:"commit_href"`
+}
+
+// New creates a new Reporter.
+func New(db *sql.DB) *Reporter {
+	return &Reporter{db: db}
+}
+
+// GetSummary returns per-repo compliance summary rows.
+func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRow, error) {
+	query := `
+		SELECT
+			a.org,
+			a.repo,
+			COUNT(*) AS total_commits,
+			COUNT(*) FILTER (WHERE a.is_compliant = true) AS compliant_count,
+			COUNT(*) FILTER (WHERE a.is_compliant = false) AS non_compliant_count,
+			COUNT(*) FILTER (WHERE a.is_bot = true) AS bot_count,
+			COUNT(*) FILTER (WHERE a.is_empty_commit = true) AS empty_count
+		FROM audit_results a
+		JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
+		WHERE 1=1
+	`
+
+	args := []interface{}{}
+	if opts.Org != "" {
+		query += " AND a.org = ?"
+		args = append(args, opts.Org)
+	}
+	if opts.Repo != "" {
+		query += " AND a.repo = ?"
+		args = append(args, opts.Repo)
+	}
+	if !opts.Since.IsZero() {
+		query += " AND c.committed_at >= ?"
+		args = append(args, opts.Since)
+	}
+	if !opts.Until.IsZero() {
+		query += " AND c.committed_at <= ?"
+		args = append(args, opts.Until)
+	}
+
+	query += " GROUP BY a.org, a.repo ORDER BY a.org, a.repo"
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query summary: %w", err)
+	}
+	defer rows.Close()
+
+	var result []SummaryRow
+	for rows.Next() {
+		var s SummaryRow
+		if err := rows.Scan(&s.Org, &s.Repo, &s.TotalCommits,
+			&s.CompliantCount, &s.NonCompliantCount, &s.BotCount, &s.EmptyCount); err != nil {
+			return nil, fmt.Errorf("scan summary: %w", err)
+		}
+		if s.TotalCommits > 0 {
+			s.CompliancePct = float64(s.CompliantCount) / float64(s.TotalCommits) * 100.0
+		}
+		result = append(result, s)
+	}
+	return result, rows.Err()
+}
+
+// GetDetails returns per-commit audit detail rows.
+func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow, error) {
+	query := `
+		SELECT
+			a.org,
+			a.repo,
+			a.sha,
+			COALESCE(c.author_login, ''),
+			COALESCE(c.committed_at, '1970-01-01'::TIMESTAMP),
+			COALESCE(c.message, ''),
+			a.is_bot,
+			a.is_empty_commit,
+			a.has_pr,
+			COALESCE(a.pr_number, 0),
+			COALESCE(a.pr_href, ''),
+			a.has_final_approval,
+			COALESCE(array_to_string(a.approver_logins, ', '), ''),
+			COALESCE(a.owner_approval_check, ''),
+			a.is_compliant,
+			COALESCE(array_to_string(a.reasons, ', '), ''),
+			COALESCE(a.commit_href, '')
+		FROM audit_results a
+		JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
+		WHERE 1=1
+	`
+
+	args := []interface{}{}
+	if opts.Org != "" {
+		query += " AND a.org = ?"
+		args = append(args, opts.Org)
+	}
+	if opts.Repo != "" {
+		query += " AND a.repo = ?"
+		args = append(args, opts.Repo)
+	}
+	if !opts.Since.IsZero() {
+		query += " AND c.committed_at >= ?"
+		args = append(args, opts.Since)
+	}
+	if !opts.Until.IsZero() {
+		query += " AND c.committed_at <= ?"
+		args = append(args, opts.Until)
+	}
+	if opts.OnlyFailures {
+		query += " AND a.is_compliant = false"
+	}
+
+	query += " ORDER BY c.committed_at DESC"
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query details: %w", err)
+	}
+	defer rows.Close()
+
+	var result []DetailRow
+	for rows.Next() {
+		var d DetailRow
+		if err := rows.Scan(
+			&d.Org, &d.Repo, &d.SHA, &d.AuthorLogin, &d.CommittedAt,
+			&d.Message, &d.IsBot, &d.IsEmptyCommit, &d.HasPR, &d.PRNumber,
+			&d.PRHref, &d.HasFinalApproval, &d.ApproverLogins,
+			&d.OwnerApprovalCheck, &d.IsCompliant, &d.Reasons, &d.CommitHref,
+		); err != nil {
+			return nil, fmt.Errorf("scan detail: %w", err)
+		}
+		result = append(result, d)
+	}
+	return result, rows.Err()
+}
+
+// FormatTable writes an ASCII table of summary and details.
+func (r *Reporter) FormatTable(w io.Writer, summary []SummaryRow, details []DetailRow) error {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+
+	// Summary section
+	fmt.Fprintln(tw, "=== SUMMARY ===")
+	fmt.Fprintln(tw, "Org\tRepo\tTotal\tCompliant\tNon-Compliant\tBots\tEmpty\tCompliance %")
+	for _, s := range summary {
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%.1f%%\n",
+			s.Org, s.Repo, s.TotalCommits, s.CompliantCount, s.NonCompliantCount,
+			s.BotCount, s.EmptyCount, s.CompliancePct)
+	}
+	fmt.Fprintln(tw)
+
+	// Details section
+	fmt.Fprintln(tw, "=== DETAILS ===")
+	fmt.Fprintln(tw, "Org\tRepo\tSHA\tAuthor\tDate\tCompliant\tReasons")
+	for _, d := range details {
+		sha := d.SHA
+		if len(sha) > 7 {
+			sha = sha[:7]
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%v\t%s\n",
+			d.Org, d.Repo, sha, d.AuthorLogin,
+			d.CommittedAt.Format("2006-01-02 15:04"), d.IsCompliant, d.Reasons)
+	}
+
+	return tw.Flush()
+}
+
+// FormatCSV writes details as CSV.
+func (r *Reporter) FormatCSV(w io.Writer, details []DetailRow) error {
+	cw := csv.NewWriter(w)
+
+	header := []string{
+		"Org", "Repo", "SHA", "Author", "Date", "Message",
+		"Is Bot", "Is Empty", "Has PR", "PR #", "PR Link",
+		"Approved", "Approvers", "Owner Approval",
+		"Compliant", "Reasons", "Commit Link",
+	}
+	if err := cw.Write(header); err != nil {
+		return err
+	}
+
+	for _, d := range details {
+		record := []string{
+			d.Org, d.Repo, d.SHA, d.AuthorLogin,
+			d.CommittedAt.Format("2006-01-02 15:04:05"),
+			d.Message,
+			fmt.Sprintf("%v", d.IsBot),
+			fmt.Sprintf("%v", d.IsEmptyCommit),
+			fmt.Sprintf("%v", d.HasPR),
+			fmt.Sprintf("%d", d.PRNumber),
+			d.PRHref,
+			fmt.Sprintf("%v", d.HasFinalApproval),
+			d.ApproverLogins,
+			d.OwnerApprovalCheck,
+			fmt.Sprintf("%v", d.IsCompliant),
+			d.Reasons,
+			d.CommitHref,
+		}
+		if err := cw.Write(record); err != nil {
+			return err
+		}
+	}
+
+	cw.Flush()
+	return cw.Error()
+}
+
+// FormatJSON writes summary and details as JSON.
+func (r *Reporter) FormatJSON(w io.Writer, summary []SummaryRow, details []DetailRow) error {
+	output := struct {
+		Summary []SummaryRow `json:"summary"`
+		Details []DetailRow `json:"details"`
+	}{
+		Summary: summary,
+		Details: details,
+	}
+	if output.Summary == nil {
+		output.Summary = []SummaryRow{}
+	}
+	if output.Details == nil {
+		output.Details = []DetailRow{}
+	}
+
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(output)
+}
+
+// truncate shortens a string to maxLen, adding "..." if truncated.
+func truncate(s string, maxLen int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", "")
+	if len(s) > maxLen {
+		return s[:maxLen-3] + "..."
+	}
+	return s
+}
