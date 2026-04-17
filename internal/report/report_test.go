@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS audit_results (
 	sha                  TEXT NOT NULL,
 	is_empty_commit      BOOLEAN,
 	is_bot               BOOLEAN,
+	is_exempt_author     BOOLEAN,
 	has_pr               BOOLEAN,
 	pr_number            INTEGER,
 	has_final_approval   BOOLEAN,
@@ -178,11 +179,11 @@ func insertAuditResultFull(t *testing.T, db *sql.DB, org, repo, sha string, isBo
 		reasonExpr = fmt.Sprintf("list_value(%s)", strings.Join(quoted, ", "))
 	}
 
-	q := fmt.Sprintf(`INSERT INTO audit_results (org, repo, sha, is_empty_commit, is_bot, has_pr, pr_number, has_final_approval, approver_logins, owner_approval_check, is_compliant, reasons, commit_href, pr_href, is_self_approved)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, %s, ?, ?, %s, ?, ?, ?)`, approverExpr, reasonExpr)
+	q := fmt.Sprintf(`INSERT INTO audit_results (org, repo, sha, is_empty_commit, is_bot, is_exempt_author, has_pr, pr_number, has_final_approval, approver_logins, owner_approval_check, is_compliant, reasons, commit_href, pr_href, is_self_approved)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, %s, ?, ?, %s, ?, ?, ?)`, approverExpr, reasonExpr)
 
 	_, err := db.Exec(q,
-		org, repo, sha, isEmpty, isBot, hasPR, prNumber, hasApproval,
+		org, repo, sha, isEmpty, isBot, isBot, hasPR, prNumber, hasApproval,
 		"success", isCompliant,
 		fmt.Sprintf("https://github.com/%s/%s/commit/%s", org, repo, sha),
 		fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, prNumber),

@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -30,6 +31,15 @@ func newReportCmd() *cobra.Command {
 				return fmt.Errorf("opening database: %w", err)
 			}
 			defer dbConn.Close()
+
+			// Support org/repo format for --repo flag.
+			if repo != "" && strings.Contains(repo, "/") {
+				parts := strings.SplitN(repo, "/", 2)
+				if org == "" {
+					org = parts[0]
+				}
+				repo = parts[1]
+			}
 
 			opts := report.ReportOpts{
 				Org:          org,

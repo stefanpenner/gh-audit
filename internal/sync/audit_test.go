@@ -68,6 +68,7 @@ func TestEvaluateCommit(t *testing.T) {
 		requiredChecks   []RequiredCheck
 		wantCompliant    bool
 		wantBot          bool
+		wantExempt       bool
 		wantEmpty        bool
 		wantHasPR        bool
 		wantSelfApproved bool
@@ -87,13 +88,34 @@ func TestEvaluateCommit(t *testing.T) {
 			wantReasons:    []string{"compliant"},
 		},
 		{
-			name:          "bot author is exempt",
-			commit:        model.Commit{Org: "myorg", Repo: "myrepo", SHA: "abc123", AuthorLogin: "dependabot", Additions: 5, Deletions: 3},
+			name:          "exempt author is compliant",
+			commit:        model.Commit{Org: "myorg", Repo: "myrepo", SHA: "abc123", AuthorLogin: "dependabot[bot]", Additions: 5, Deletions: 3},
 			enrichment:    model.EnrichmentResult{},
-			exemptAuthors: []string{"dependabot", "renovate"},
+			exemptAuthors: []string{"dependabot[bot]", "renovate[bot]"},
 			wantCompliant: true,
 			wantBot:       true,
-			wantReasons:   []string{"exempt: bot author"},
+			wantExempt:    true,
+			wantReasons:   []string{"exempt: configured author"},
+		},
+		{
+			name:          "bot not in exempt list is not exempt",
+			commit:        model.Commit{Org: "myorg", Repo: "myrepo", SHA: "abc123", AuthorLogin: "some-ci[bot]", Additions: 5, Deletions: 3},
+			enrichment:    model.EnrichmentResult{},
+			exemptAuthors: []string{"dependabot[bot]"},
+			wantCompliant: false,
+			wantBot:       true,
+			wantExempt:    false,
+			wantReasons:   []string{"no associated pull request"},
+		},
+		{
+			name:          "non-bot exempt author is exempt but not bot",
+			commit:        model.Commit{Org: "myorg", Repo: "myrepo", SHA: "abc123", AuthorLogin: "service-account", Additions: 5, Deletions: 3},
+			enrichment:    model.EnrichmentResult{},
+			exemptAuthors: []string{"service-account"},
+			wantCompliant: true,
+			wantBot:       false,
+			wantExempt:    true,
+			wantReasons:   []string{"exempt: configured author"},
 		},
 		{
 			name:          "empty commit is exempt",
@@ -102,6 +124,14 @@ func TestEvaluateCommit(t *testing.T) {
 			wantCompliant: true,
 			wantEmpty:     true,
 			wantReasons:   []string{"empty commit"},
+		},
+		{
+			name:          "commit with additions is not empty",
+			commit:        model.Commit{Org: "myorg", Repo: "myrepo", SHA: "abc123", AuthorLogin: "developer", Additions: 42, Deletions: 0},
+			enrichment:    model.EnrichmentResult{},
+			wantCompliant: false,
+			wantEmpty:     false,
+			wantReasons:   []string{"no associated pull request"},
 		},
 		{
 			name:          "no PR is non-compliant",
@@ -392,6 +422,9 @@ func TestEvaluateCommit(t *testing.T) {
 			}
 			if result.IsBot != tt.wantBot {
 				t.Errorf("IsBot = %v, want %v", result.IsBot, tt.wantBot)
+			}
+			if result.IsExemptAuthor != tt.wantExempt {
+				t.Errorf("IsExemptAuthor = %v, want %v", result.IsExemptAuthor, tt.wantExempt)
 			}
 			if result.IsEmptyCommit != tt.wantEmpty {
 				t.Errorf("IsEmptyCommit = %v, want %v", result.IsEmptyCommit, tt.wantEmpty)

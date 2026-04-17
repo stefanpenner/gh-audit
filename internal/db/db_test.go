@@ -260,7 +260,7 @@ func TestUpsertAuditResultsAndGetAuditResults(t *testing.T) {
 	results := []model.AuditResult{
 		{
 			Org: "org1", Repo: "repo1", SHA: "sha1",
-			IsEmptyCommit: false, IsBot: false, HasPR: true, PRNumber: 42,
+			IsEmptyCommit: false, IsBot: false, IsExemptAuthor: false, HasPR: true, PRNumber: 42,
 			HasFinalApproval: true,
 			ApproverLogins:   []string{"bob", "carol"},
 			OwnerApprovalCheck: "success",

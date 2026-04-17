@@ -31,7 +31,7 @@ func (r *Reporter) GenerateXLSX(ctx context.Context, opts ReportOpts, outputPath
 	var exemptions []DetailRow
 	var selfApproved []DetailRow
 	for _, d := range details {
-		if d.IsBot || d.IsEmptyCommit {
+		if d.IsExemptAuthor || d.IsBot || d.IsEmptyCommit {
 			exemptions = append(exemptions, d)
 		}
 		if d.IsSelfApproved {
@@ -378,7 +378,9 @@ func writeExemptionsSheet(f *excelize.File, sheet string, details []DetailRow) e
 
 		// Exemption reason
 		reason := ""
-		if d.IsBot {
+		if d.IsExemptAuthor {
+			reason = "Exempt author: " + d.AuthorLogin
+		} else if d.IsBot {
 			reason = "Bot author: " + d.AuthorLogin
 		} else if d.IsEmptyCommit {
 			reason = "Empty commit"

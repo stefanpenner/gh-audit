@@ -117,7 +117,8 @@ type AuditResult struct {
 	Repo               string
 	SHA                string
 	IsEmptyCommit      bool
-	IsBot              bool
+	IsBot              bool // author name ends with [bot] — informational only
+	IsExemptAuthor     bool // author is on the configured exemption list
 	HasPR              bool
 	PRNumber           int
 	HasFinalApproval   bool

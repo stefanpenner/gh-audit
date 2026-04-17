@@ -91,6 +91,7 @@ const (
 		sha                  TEXT NOT NULL,
 		is_empty_commit      BOOLEAN,
 		is_bot               BOOLEAN,
+		is_exempt_author     BOOLEAN,
 		has_pr               BOOLEAN,
 		pr_number            INTEGER,
 		has_final_approval   BOOLEAN,

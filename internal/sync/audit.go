@@ -22,12 +22,17 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		CommitHref: commit.Href,
 	}
 
-	// Check exempt author (bot)
+	// Detect bot authors (informational — login ending in [bot])
+	if strings.HasSuffix(strings.ToLower(commit.AuthorLogin), "[bot]") {
+		result.IsBot = true
+	}
+
+	// Check exempt author list (compliance — skips review requirements)
 	for _, exempt := range exemptAuthors {
 		if strings.EqualFold(commit.AuthorLogin, exempt) {
-			result.IsBot = true
+			result.IsExemptAuthor = true
 			result.IsCompliant = true
-			result.Reasons = []string{"exempt: bot author"}
+			result.Reasons = []string{"exempt: configured author"}
 			return result
 		}
 	}
