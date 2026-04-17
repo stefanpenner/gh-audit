@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -137,7 +138,7 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		g.Go(func() error {
 			if err := p.syncRepo(gctx, rwo.repo, rwo.orgCfg, writer); err != nil {
 				p.logger.Error("sync repo failed", "org", rwo.repo.Org, "repo", rwo.repo.Name, "error", err)
-				return nil
+				return err
 			}
 			return nil
 		})
@@ -152,12 +153,14 @@ func (p *Pipeline) syncRepo(ctx context.Context, repo model.RepoInfo, orgCfg Org
 		branches = []string{repo.DefaultBranch}
 	}
 
+	var errs []error
 	for _, branch := range branches {
 		if err := p.syncRepoBranch(ctx, repo, branch, writer); err != nil {
 			p.logger.Error("sync branch failed", "org", repo.Org, "repo", repo.Name, "branch", branch, "error", err)
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, branch string, writer *DBWriter) error {

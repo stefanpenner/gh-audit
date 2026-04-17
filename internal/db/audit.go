@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
 	"strings"
 	"time"
@@ -26,64 +27,55 @@ type AuditRow struct {
 	Message     string
 }
 
-// UpsertAuditResults batch-inserts audit results using multi-value INSERT OR REPLACE.
+var auditResultColumns = []string{
+	"org", "repo", "sha", "is_empty_commit", "is_bot", "is_exempt_author",
+	"has_pr", "pr_number", "has_final_approval", "is_self_approved",
+	"approver_logins", "owner_approval_check", "is_compliant",
+	"reasons", "commit_href", "pr_href",
+}
+
+// UpsertAuditResults batch-inserts audit results using the DuckDB Appender API
+// with a staging table for upsert semantics.
 func (d *DB) UpsertAuditResults(ctx context.Context, results []model.AuditResult) error {
 	if len(results) == 0 {
 		return nil
 	}
-	for i := 0; i < len(results); i += batchSize {
-		end := min(i+batchSize, len(results))
-		if err := d.upsertAuditBatch(ctx, results[i:end]); err != nil {
-			return err
-		}
-	}
-	return nil
-}
 
-func (d *DB) upsertAuditBatch(ctx context.Context, results []model.AuditResult) error {
-	tx, err := d.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	placeholders := make([]string, len(results))
-	args := make([]any, 0, len(results)*16)
+	rows := make([][]driver.Value, len(results))
 	for i, r := range results {
-		placeholders[i] = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-		args = append(args,
+		rows[i] = []driver.Value{
 			r.Org, r.Repo, r.SHA,
 			r.IsEmptyCommit, r.IsBot, r.IsExemptAuthor, r.HasPR, r.PRNumber,
 			r.HasFinalApproval, r.IsSelfApproved,
-			toDuckDBList(r.ApproverLogins),
-			r.OwnerApprovalCheck, r.IsCompliant,
-			toDuckDBList(r.Reasons),
+			toAnySlice(r.ApproverLogins),
+			nullIfEmpty(r.OwnerApprovalCheck), r.IsCompliant,
+			toAnySlice(r.Reasons),
 			r.CommitHref, r.PRHref,
-		)
+		}
 	}
 
-	q := fmt.Sprintf(`INSERT OR REPLACE INTO audit_results
-		(org, repo, sha, is_empty_commit, is_bot, is_exempt_author, has_pr, pr_number,
-		 has_final_approval, is_self_approved, approver_logins, owner_approval_check, is_compliant,
-		 reasons, commit_href, pr_href)
-		VALUES %s`, strings.Join(placeholders, ", "))
-
-	if _, err := tx.ExecContext(ctx, q, args...); err != nil {
-		return fmt.Errorf("upsert audit results: %w", err)
-	}
-	return tx.Commit()
+	return d.bulkUpsert(ctx, "audit_results", auditResultColumns, rows)
 }
 
-// toDuckDBList converts a Go string slice to a DuckDB list literal like ['a','b'].
-func toDuckDBList(ss []string) string {
-	if len(ss) == 0 {
-		return "[]"
+// toAnySlice converts a []string to []any for the DuckDB Appender LIST type.
+func toAnySlice(ss []string) []any {
+	if ss == nil {
+		return []any{}
 	}
-	escaped := make([]string, len(ss))
+	result := make([]any, len(ss))
 	for i, s := range ss {
-		escaped[i] = "'" + strings.ReplaceAll(s, "'", "''") + "'"
+		result[i] = s
 	}
-	return "[" + strings.Join(escaped, ", ") + "]"
+	return result
+}
+
+// nullIfEmpty returns nil if the string is empty, otherwise returns the string.
+// Used to insert NULL for optional enum columns.
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // scanDuckDBTextArray converts the value returned by DuckDB for a TEXT[] column
@@ -160,7 +152,7 @@ func (d *DB) GetAuditResults(ctx context.Context, opts AuditQueryOpts) ([]AuditR
 
 	q := fmt.Sprintf(`
 		SELECT a.org, a.repo, a.sha, a.is_empty_commit, a.is_bot, a.is_exempt_author, a.has_pr, a.pr_number,
-		       a.has_final_approval, a.is_self_approved, a.approver_logins, a.owner_approval_check, a.is_compliant,
+		       a.has_final_approval, a.is_self_approved, a.approver_logins, COALESCE(a.owner_approval_check::TEXT, ''), a.is_compliant,
 		       a.reasons, a.commit_href, a.pr_href, a.audited_at,
 		       COALESCE(c.author_login, ''), COALESCE(c.committed_at, '1970-01-01'::TIMESTAMP), COALESCE(c.message, '')
 		FROM audit_results a

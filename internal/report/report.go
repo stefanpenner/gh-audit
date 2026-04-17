@@ -166,7 +166,7 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			COALESCE(p.merged_by_login, ''),
 			a.has_final_approval,
 			COALESCE(array_to_string(a.approver_logins, ', '), ''),
-			COALESCE(a.owner_approval_check, ''),
+			COALESCE(a.owner_approval_check::TEXT, ''),
 			a.is_compliant,
 			COALESCE(array_to_string(a.reasons, ', '), ''),
 			COALESCE(a.commit_href, ''),

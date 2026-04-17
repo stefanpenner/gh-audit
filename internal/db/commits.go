@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
 	"strings"
 
@@ -10,45 +11,30 @@ import (
 
 const batchSize = 500
 
-// UpsertCommits batch-inserts commits using multi-value INSERT OR REPLACE.
+var commitColumns = []string{
+	"org", "repo", "sha", "author_login", "author_email",
+	"committed_at", "message", "parent_count", "additions", "deletions", "href",
+}
+
+// UpsertCommits batch-inserts commits using the DuckDB Appender API with
+// a staging table for upsert semantics.
 func (d *DB) UpsertCommits(ctx context.Context, commits []model.Commit) error {
 	if len(commits) == 0 {
 		return nil
 	}
 
-	for i := 0; i < len(commits); i += batchSize {
-		end := min(i+batchSize, len(commits))
-		if err := d.upsertCommitBatch(ctx, commits[i:end]); err != nil {
-			return err
+	rows := make([][]driver.Value, len(commits))
+	for i, c := range commits {
+		rows[i] = []driver.Value{
+			c.Org, c.Repo, c.SHA, c.AuthorLogin, c.AuthorEmail,
+			c.CommittedAt, c.Message, c.ParentCount, c.Additions, c.Deletions, c.Href,
 		}
 	}
-	return nil
+
+	return d.bulkUpsert(ctx, "commits", commitColumns, rows)
 }
 
-func (d *DB) upsertCommitBatch(ctx context.Context, commits []model.Commit) error {
-	tx, err := d.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	placeholders := make([]string, len(commits))
-	args := make([]any, 0, len(commits)*11)
-	for i, c := range commits {
-		placeholders[i] = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-		args = append(args, c.Org, c.Repo, c.SHA, c.AuthorLogin, c.AuthorEmail,
-			c.CommittedAt, c.Message, c.ParentCount, c.Additions, c.Deletions, c.Href)
-	}
-
-	q := fmt.Sprintf(`INSERT OR REPLACE INTO commits
-		(org, repo, sha, author_login, author_email, committed_at, message, parent_count, additions, deletions, href)
-		VALUES %s`, strings.Join(placeholders, ", "))
-
-	if _, err := tx.ExecContext(ctx, q, args...); err != nil {
-		return fmt.Errorf("upsert commits: %w", err)
-	}
-	return tx.Commit()
-}
+var commitBranchColumns = []string{"org", "repo", "sha", "branch"}
 
 // UpsertCommitBranches records which branch(es) a set of commits belong to.
 func (d *DB) UpsertCommitBranches(ctx context.Context, org, repo string, shas []string, branch string) error {
@@ -56,25 +42,12 @@ func (d *DB) UpsertCommitBranches(ctx context.Context, org, repo string, shas []
 		return nil
 	}
 
-	for i := 0; i < len(shas); i += batchSize {
-		end := min(i+batchSize, len(shas))
-		batch := shas[i:end]
-
-		placeholders := make([]string, len(batch))
-		args := make([]any, 0, len(batch)*4)
-		for j, sha := range batch {
-			placeholders[j] = "(?, ?, ?, ?)"
-			args = append(args, org, repo, sha, branch)
-		}
-
-		q := fmt.Sprintf(`INSERT OR REPLACE INTO commit_branches (org, repo, sha, branch) VALUES %s`,
-			strings.Join(placeholders, ", "))
-
-		if _, err := d.DB.ExecContext(ctx, q, args...); err != nil {
-			return fmt.Errorf("upsert commit branches: %w", err)
-		}
+	rows := make([][]driver.Value, len(shas))
+	for i, sha := range shas {
+		rows[i] = []driver.Value{org, repo, sha, branch}
 	}
-	return nil
+
+	return d.bulkUpsert(ctx, "commit_branches", commitBranchColumns, rows)
 }
 
 // GetUnauditedCommits returns commits in org/repo that have no corresponding audit_results row.

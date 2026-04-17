@@ -1,0 +1,28 @@
+orgs:
+  - name: nodejs
+    repos: [node]
+    branches: [main]
+
+  - name: rails
+    repos: [rails]
+    branches: [main]
+
+tokens:
+  - kind: pat
+    env: GITHUB_TOKEN
+    scopes:
+      - org: nodejs
+      - org: rails
+
+audit_rules:
+  require_pr: true
+  require_approval: true
+
+sync:
+  concurrency: 10
+  initial_lookback_days: 30
+
+exemptions:
+  authors:
+    - "dependabot[bot]"
+    - "github-actions[bot]"

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "github.com/marcboeker/go-duckdb"
 )
@@ -58,10 +59,37 @@ func (d *DB) Close() error {
 }
 
 func (d *DB) migrate(ctx context.Context) error {
+	// Create ENUM types first. DuckDB lacks CREATE TYPE IF NOT EXISTS,
+	// so we ignore "already exists" errors to make migration idempotent.
+	for _, ddl := range enumTypes {
+		if _, err := d.DB.ExecContext(ctx, ddl); err != nil {
+			if !isTypeExistsError(err) {
+				return fmt.Errorf("executing DDL: %w\nSQL: %s", err, ddl)
+			}
+		}
+	}
+
 	for _, ddl := range allTables {
 		if _, err := d.DB.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("executing DDL: %w\nSQL: %s", err, ddl)
 		}
 	}
+
+	// Migrate check_runs enum columns to TEXT for forward-compatibility
+	// with new GitHub API values. Ignore errors if already TEXT.
+	for _, col := range []string{"status", "conclusion"} {
+		sql := fmt.Sprintf("ALTER TABLE check_runs ALTER COLUMN %s SET DATA TYPE TEXT", col)
+		if _, err := d.DB.ExecContext(ctx, sql); err != nil {
+			if !strings.Contains(err.Error(), "same type") {
+				return fmt.Errorf("migrating check_runs.%s to TEXT: %w", col, err)
+			}
+		}
+	}
+
 	return nil
+}
+
+// isTypeExistsError returns true if the error indicates a DuckDB type already exists.
+func isTypeExistsError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "already exists")
 }

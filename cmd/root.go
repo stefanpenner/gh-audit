@@ -38,6 +38,8 @@ func NewRootCmd() *cobra.Command {
 	rootCmd.AddCommand(newSyncCmd())
 	rootCmd.AddCommand(newReportCmd())
 	rootCmd.AddCommand(newConfigCmd())
+	rootCmd.AddCommand(newExportCmd())
+	rootCmd.AddCommand(newImportCmd())
 
 	return rootCmd
 }

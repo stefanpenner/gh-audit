@@ -492,6 +492,59 @@ func TestUpsertCommitBranches(t *testing.T) {
 	}
 }
 
+func TestEnumColumnsAcceptValidValues(t *testing.T) {
+	db := mustOpenMemory(t)
+	ctx := context.Background()
+
+	// Insert a review with a valid enum state and read it back.
+	reviews := []model.Review{
+		{
+			Org: "org1", Repo: "repo1", PRNumber: 1,
+			ReviewID: 1, ReviewerLogin: "alice",
+			State: "APPROVED", CommitID: "abc",
+			SubmittedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+	}
+	if err := db.UpsertReviews(ctx, reviews); err != nil {
+		t.Fatalf("UpsertReviews with valid enum: %v", err)
+	}
+
+	got, err := db.GetReviewsForPR(ctx, "org1", "repo1", 1)
+	if err != nil {
+		t.Fatalf("GetReviewsForPR: %v", err)
+	}
+	if len(got) != 1 || got[0].State != "APPROVED" {
+		t.Fatalf("expected state APPROVED, got %q", got[0].State)
+	}
+
+	// Inserting an invalid enum value should fail.
+	_, err = db.ExecContext(ctx,
+		`INSERT INTO reviews (org, repo, pr_number, review_id, state)
+		 VALUES ('org1', 'repo1', 2, 2, 'INVALID_STATE')`)
+	if err == nil {
+		t.Fatal("expected error inserting invalid review_state enum value, got nil")
+	}
+
+	// Verify check_runs accept arbitrary status/conclusion values (TEXT columns).
+	checkRuns := []model.CheckRun{
+		{
+			Org: "org1", Repo: "repo1", CommitSHA: "abc",
+			CheckRunID: 1, CheckName: "ci",
+			Status: "completed", Conclusion: "success",
+			CompletedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			Org: "org1", Repo: "repo1", CommitSHA: "abc",
+			CheckRunID: 2, CheckName: "ci2",
+			Status: "waiting", Conclusion: "startup_failure",
+			CompletedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+	}
+	if err := db.UpsertCheckRuns(ctx, checkRuns); err != nil {
+		t.Fatalf("UpsertCheckRuns: %v", err)
+	}
+}
+
 func TestEmptyCommitStoredCorrectly(t *testing.T) {
 	db := mustOpenMemory(t)
 	ctx := context.Background()

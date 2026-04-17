@@ -1,5 +1,17 @@
 package db
 
+// ENUM type DDL statements. DuckDB does not support CREATE TYPE IF NOT EXISTS,
+// so the migrate function ignores "already exists" errors for these.
+const (
+	createReviewStateEnum = `CREATE TYPE review_state AS ENUM (
+		'APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED'
+	)`
+
+	createOwnerApprovalCheckEnum = `CREATE TYPE owner_approval_check AS ENUM (
+		'success', 'failure', 'missing'
+	)`
+)
+
 // Schema DDL statements. All use CREATE TABLE IF NOT EXISTS for idempotency.
 const (
 	createSyncCursors = `CREATE TABLE IF NOT EXISTS sync_cursors (
@@ -57,7 +69,7 @@ const (
 		pr_number      INTEGER NOT NULL,
 		review_id      BIGINT NOT NULL,
 		reviewer_login TEXT,
-		state          TEXT,
+		state          review_state,
 		commit_id      TEXT,
 		submitted_at   TIMESTAMP,
 		href           TEXT,
@@ -98,7 +110,7 @@ const (
 		has_final_approval   BOOLEAN,
 		is_self_approved     BOOLEAN,
 		approver_logins      TEXT[],
-		owner_approval_check TEXT,
+		owner_approval_check owner_approval_check,
 		is_compliant         BOOLEAN,
 		reasons              TEXT[],
 		commit_href          TEXT,
@@ -107,6 +119,13 @@ const (
 		PRIMARY KEY (org, repo, sha)
 	)`
 )
+
+// enumTypes is the ordered list of CREATE TYPE statements to run during migration.
+// DuckDB lacks IF NOT EXISTS for types, so migrate ignores "already exists" errors.
+var enumTypes = []string{
+	createReviewStateEnum,
+	createOwnerApprovalCheckEnum,
+}
 
 // allTables is the ordered list of DDL statements to run during migration.
 var allTables = []string{
