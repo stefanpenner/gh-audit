@@ -45,6 +45,9 @@ func (c *Client) ListOrgRepos(ctx context.Context, org string) ([]model.RepoInfo
 	}
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		// Pick a fresh token for each page to distribute load.
 		gh, err := c.ghClient(ctx, org, "")
 		if err != nil {
@@ -114,6 +117,9 @@ func (c *Client) ListCommits(ctx context.Context, org, repo, branch string, sinc
 	}
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		gh, err := c.ghClient(ctx, org, repo)
 		if err != nil {
 			return nil, err
@@ -210,6 +216,9 @@ func (c *Client) ListCommitPullRequests(ctx context.Context, org, repo, sha stri
 	opts := &gogithub.ListOptions{PerPage: 100}
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		gh, err := c.ghClient(ctx, org, repo)
 		if err != nil {
 			return nil, err
@@ -264,6 +273,9 @@ func (c *Client) ListReviews(ctx context.Context, org, repo string, prNumber int
 	opts := &gogithub.ListOptions{PerPage: 100}
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		gh, err := c.ghClient(ctx, org, repo)
 		if err != nil {
 			return nil, err
@@ -314,6 +326,9 @@ func (c *Client) ListCheckRunsForRef(ctx context.Context, org, repo, ref string)
 	}
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		gh, err := c.ghClient(ctx, org, repo)
 		if err != nil {
 			return nil, err
@@ -401,6 +416,9 @@ func (c *Client) ListPRCommits(ctx context.Context, org, repo string, prNumber i
 	var all []model.Commit
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		commits, resp, err := gh.PullRequests.ListCommits(ctx, org, repo, prNumber, opts)
 		if err != nil {
 			return nil, fmt.Errorf("listing PR commits %s/%s#%d page %d: %w", org, repo, prNumber, opts.Page, err)
@@ -503,6 +521,10 @@ func (c *Client) EnrichCommits(ctx context.Context, org, repo string, shas []str
 	return results, nil
 }
 
+// noreplyRe extracts a GitHub login from noreply email addresses.
+// Handles both "user@users.noreply.github.com" and "12345+user@users.noreply.github.com".
+var noreplyRe = regexp.MustCompile(`^(?:\d+\+)?([^@]+)@users\.noreply\.github\.com$`)
+
 // parseCoAuthors extracts co-authors from "Co-authored-by" trailers in commit messages.
 func parseCoAuthors(message string) []model.CoAuthor {
 	if !strings.Contains(strings.ToLower(message), "co-authored-by") {
@@ -514,10 +536,23 @@ func parseCoAuthors(message string) []model.CoAuthor {
 	}
 	coAuthors := make([]model.CoAuthor, 0, len(matches))
 	for _, m := range matches {
+		email := strings.TrimSpace(m[2])
+		login := loginFromNoreplyEmail(email)
 		coAuthors = append(coAuthors, model.CoAuthor{
 			Name:  strings.TrimSpace(m[1]),
-			Email: strings.TrimSpace(m[2]),
+			Email: email,
+			Login: login,
 		})
 	}
 	return coAuthors
+}
+
+// loginFromNoreplyEmail extracts a GitHub login from a noreply email address.
+// Returns empty string if the email is not a GitHub noreply address.
+func loginFromNoreplyEmail(email string) string {
+	m := noreplyRe.FindStringSubmatch(strings.ToLower(email))
+	if m == nil {
+		return ""
+	}
+	return m[1]
 }

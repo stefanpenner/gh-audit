@@ -84,11 +84,13 @@ func runReAudit(ctx context.Context, dbConn *db.DB, logger *slog.Logger, exemptA
 			results = append(results, result)
 		}
 
-		if err := dbConn.DeleteAuditResults(ctx, or.org, or.repo); err != nil {
-			return fmt.Errorf("clearing old audit results for %s/%s: %w", or.org, or.repo, err)
-		}
+		// Upsert first (INSERT OR REPLACE) so existing rows are preserved on failure.
 		if err := dbConn.UpsertAuditResults(ctx, results); err != nil {
 			return fmt.Errorf("inserting re-audit results for %s/%s: %w", or.org, or.repo, err)
+		}
+		// Clean up orphaned audit results for commits that no longer exist.
+		if err := dbConn.DeleteOrphanedAuditResults(ctx, or.org, or.repo); err != nil {
+			return fmt.Errorf("cleaning orphaned audit results for %s/%s: %w", or.org, or.repo, err)
 		}
 
 		logger.Info("re-audited", "org", or.org, "repo", or.repo, "commits", len(results))

@@ -412,6 +412,50 @@ func TestParseCoAuthors(t *testing.T) {
 	}
 }
 
+func TestParseCoAuthors_NoreplyLogin(t *testing.T) {
+	tests := []struct {
+		name      string
+		message   string
+		wantLogin string
+	}{
+		{
+			name:      "simple noreply email",
+			message:   "feat: stuff\n\nCo-authored-by: Jane Doe <janedoe@users.noreply.github.com>",
+			wantLogin: "janedoe",
+		},
+		{
+			name:      "numeric prefix noreply email",
+			message:   "feat: stuff\n\nCo-authored-by: Jane Doe <12345+janedoe@users.noreply.github.com>",
+			wantLogin: "janedoe",
+		},
+		{
+			name:      "non-github email has no login",
+			message:   "feat: stuff\n\nCo-authored-by: Jane Doe <jane@example.com>",
+			wantLogin: "",
+		},
+		{
+			name:      "uppercase noreply email normalizes login",
+			message:   "feat: stuff\n\nCo-authored-by: Jane Doe <JaneDoe@users.noreply.github.com>",
+			wantLogin: "janedoe",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseCoAuthors(tt.message)
+			require.Len(t, got, 1)
+			assert.Equal(t, tt.wantLogin, got[0].Login)
+		})
+	}
+}
+
+func TestLoginFromNoreplyEmail(t *testing.T) {
+	assert.Equal(t, "user", loginFromNoreplyEmail("user@users.noreply.github.com"))
+	assert.Equal(t, "user", loginFromNoreplyEmail("12345+user@users.noreply.github.com"))
+	assert.Equal(t, "", loginFromNoreplyEmail("user@example.com"))
+	assert.Equal(t, "", loginFromNoreplyEmail(""))
+}
+
 func TestListCommitPullRequests(t *testing.T) {
 	tests := []struct {
 		name      string

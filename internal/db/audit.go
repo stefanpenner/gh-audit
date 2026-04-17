@@ -131,6 +131,21 @@ func (d *DB) DeleteAuditResults(ctx context.Context, org, repo string) error {
 	return nil
 }
 
+// DeleteOrphanedAuditResults removes audit results whose SHA no longer appears
+// in the commits table. Safe to call after UpsertAuditResults — if it fails,
+// the only consequence is stale rows (no data loss).
+func (d *DB) DeleteOrphanedAuditResults(ctx context.Context, org, repo string) error {
+	_, err := d.DB.ExecContext(ctx, `
+		DELETE FROM audit_results
+		WHERE org = ? AND repo = ?
+		  AND sha NOT IN (SELECT sha FROM commits WHERE org = ? AND repo = ?)`,
+		org, repo, org, repo)
+	if err != nil {
+		return fmt.Errorf("delete orphaned audit results for %s/%s: %w", org, repo, err)
+	}
+	return nil
+}
+
 // GetAuditResults retrieves audit results with optional filters, joined with commit data.
 func (d *DB) GetAuditResults(ctx context.Context, opts AuditQueryOpts) ([]AuditRow, error) {
 	var conditions []string
@@ -163,8 +178,9 @@ func (d *DB) GetAuditResults(ctx context.Context, opts AuditQueryOpts) ([]AuditR
 
 	q := fmt.Sprintf(`
 		SELECT a.org, a.repo, a.sha, a.is_empty_commit, a.is_bot, a.is_exempt_author, a.has_pr, a.pr_number,
-		       a.has_final_approval, a.is_self_approved, a.approver_logins, COALESCE(a.owner_approval_check::TEXT, ''), a.is_compliant,
-		       a.reasons, a.commit_href, a.pr_href, a.audited_at,
+		       COALESCE(a.pr_count, 0), a.has_final_approval, COALESCE(a.has_stale_approval, false),
+		       a.is_self_approved, a.approver_logins, COALESCE(a.owner_approval_check::TEXT, ''), a.is_compliant,
+		       a.reasons, COALESCE(a.merge_strategy, ''), a.commit_href, a.pr_href, a.audited_at,
 		       COALESCE(c.author_login, ''), COALESCE(c.committed_at, '1970-01-01'::TIMESTAMP), COALESCE(c.message, '')
 		FROM audit_results a
 		LEFT JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
@@ -184,8 +200,9 @@ func (d *DB) GetAuditResults(ctx context.Context, opts AuditQueryOpts) ([]AuditR
 		if err := rows.Scan(
 			&row.Org, &row.Repo, &row.SHA,
 			&row.IsEmptyCommit, &row.IsBot, &row.IsExemptAuthor, &row.HasPR, &row.PRNumber,
-			&row.HasFinalApproval, &row.IsSelfApproved, &approvers, &row.OwnerApprovalCheck,
-			&row.IsCompliant, &reasons, &row.CommitHref, &row.PRHref, &row.AuditedAt,
+			&row.PRCount, &row.HasFinalApproval, &row.HasStaleApproval,
+			&row.IsSelfApproved, &approvers, &row.OwnerApprovalCheck,
+			&row.IsCompliant, &reasons, &row.MergeStrategy, &row.CommitHref, &row.PRHref, &row.AuditedAt,
 			&row.AuthorLogin, &row.CommittedAt, &row.Message,
 		); err != nil {
 			return nil, fmt.Errorf("scan audit row: %w", err)

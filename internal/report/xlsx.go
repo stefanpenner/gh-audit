@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/xuri/excelize/v2"
 )
@@ -467,7 +468,7 @@ func writeSelfApprovedSheet(f *excelize.File, sheet string, details []DetailRow,
 			shaDisplay = shaDisplay[:8]
 		}
 		if d.CommitHref != "" {
-			f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, d.CommitHref, shaDisplay))
+			f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, escapeFormulaURL(d.CommitHref), shaDisplay))
 			f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
 		} else {
 			f.SetCellValue(sheet, shaCell, shaDisplay)
@@ -475,23 +476,23 @@ func writeSelfApprovedSheet(f *excelize.File, sheet string, details []DetailRow,
 
 		f.SetCellValue(sheet, cellName(1, row), d.Org)
 		f.SetCellValue(sheet, cellName(2, row), d.Repo)
-		f.SetCellValue(sheet, cellName(4, row), d.AuthorLogin)
-		f.SetCellValue(sheet, cellName(5, row), d.ApproverLogins)
+		f.SetCellValue(sheet, cellName(4, row), sanitizeCell(d.AuthorLogin))
+		f.SetCellValue(sheet, cellName(5, row), sanitizeCell(d.ApproverLogins))
 		f.SetCellValue(sheet, cellName(6, row), d.CommittedAt.Format("2006-01-02 15:04"))
 
 		// PR # with hyperlink
 		prCell := cellName(7, row)
 		if d.PRNumber > 0 {
 			if d.PRHref != "" {
-				f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, d.PRHref, d.PRNumber))
+				f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, escapeFormulaURL(d.PRHref), d.PRNumber))
 				f.SetCellStyle(sheet, prCell, prCell, linkStyle)
 			} else {
 				f.SetCellValue(sheet, prCell, fmt.Sprintf("#%d", d.PRNumber))
 			}
 		}
 
-		f.SetCellValue(sheet, cellName(8, row), d.BranchName)
-		f.SetCellValue(sheet, cellName(9, row), truncate(d.Message, 80))
+		f.SetCellValue(sheet, cellName(8, row), sanitizeCell(d.BranchName))
+		f.SetCellValue(sheet, cellName(9, row), sanitizeCell(truncate(d.Message, 80)))
 	}
 
 	// Auto-filter
@@ -546,7 +547,7 @@ func writeDetailRowWithHyperlinks(f *excelize.File, sheet string, row int, d Det
 	f.SetCellValue(sheet, cellName(2, row), d.Repo)
 	shaCell := cellName(3, row)
 	if d.CommitHref != "" {
-		f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, d.CommitHref, shaDisplay))
+		f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, escapeFormulaURL(d.CommitHref), shaDisplay))
 		f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
 	} else {
 		f.SetCellValue(sheet, shaCell, shaDisplay)
@@ -554,7 +555,7 @@ func writeDetailRowWithHyperlinks(f *excelize.File, sheet string, row int, d Det
 	prCell := cellName(4, row)
 	if d.PRNumber > 0 {
 		if d.PRHref != "" {
-			f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, d.PRHref, d.PRNumber))
+			f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, escapeFormulaURL(d.PRHref), d.PRNumber))
 			f.SetCellStyle(sheet, prCell, prCell, linkStyle)
 		} else {
 			f.SetCellValue(sheet, prCell, fmt.Sprintf("#%d", d.PRNumber))
@@ -562,10 +563,10 @@ func writeDetailRowWithHyperlinks(f *excelize.File, sheet string, row int, d Det
 	}
 
 	// People: Author, Committer, Merged By, Approver
-	f.SetCellValue(sheet, cellName(5, row), d.AuthorLogin)
-	f.SetCellValue(sheet, cellName(6, row), d.CommitterLogin)
-	f.SetCellValue(sheet, cellName(7, row), d.MergedByLogin)
-	f.SetCellValue(sheet, cellName(8, row), d.ApproverLogins)
+	f.SetCellValue(sheet, cellName(5, row), sanitizeCell(d.AuthorLogin))
+	f.SetCellValue(sheet, cellName(6, row), sanitizeCell(d.CommitterLogin))
+	f.SetCellValue(sheet, cellName(7, row), sanitizeCell(d.MergedByLogin))
+	f.SetCellValue(sheet, cellName(8, row), sanitizeCell(d.ApproverLogins))
 
 	// Approval
 	f.SetCellValue(sheet, cellName(9, row), approvedStr)
@@ -574,14 +575,14 @@ func writeDetailRowWithHyperlinks(f *excelize.File, sheet string, row int, d Det
 
 	// Result
 	f.SetCellValue(sheet, cellName(12, row), compliantStr)
-	f.SetCellValue(sheet, cellName(13, row), d.Reasons)
+	f.SetCellValue(sheet, cellName(13, row), sanitizeCell(d.Reasons))
 	f.SetCellValue(sheet, cellName(14, row), d.MergeStrategy)
-	f.SetCellValue(sheet, cellName(15, row), d.PRCommitAuthorLogins)
+	f.SetCellValue(sheet, cellName(15, row), sanitizeCell(d.PRCommitAuthorLogins))
 
 	// Context: Date, Branch, Message
 	f.SetCellValue(sheet, cellName(16, row), dateStr)
-	f.SetCellValue(sheet, cellName(17, row), d.BranchName)
-	f.SetCellValue(sheet, cellName(18, row), msg)
+	f.SetCellValue(sheet, cellName(17, row), sanitizeCell(d.BranchName))
+	f.SetCellValue(sheet, cellName(18, row), sanitizeCell(msg))
 
 	// Binary reason columns for filtering/sorting
 	f.SetCellValue(sheet, cellName(19, row), boolToYesNo(!d.HasPR))
@@ -621,7 +622,7 @@ func writeStaleApprovalsSheet(f *excelize.File, sheet string, details []DetailRo
 			shaDisplay = shaDisplay[:8]
 		}
 		if d.CommitHref != "" {
-			f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, d.CommitHref, shaDisplay))
+			f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, escapeFormulaURL(d.CommitHref), shaDisplay))
 			f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
 		} else {
 			f.SetCellValue(sheet, shaCell, shaDisplay)
@@ -635,22 +636,22 @@ func writeStaleApprovalsSheet(f *excelize.File, sheet string, details []DetailRo
 		prCell := cellName(6, row)
 		if d.PRNumber > 0 {
 			if d.PRHref != "" {
-				f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, d.PRHref, d.PRNumber))
+				f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, escapeFormulaURL(d.PRHref), d.PRNumber))
 				f.SetCellStyle(sheet, prCell, prCell, linkStyle)
 			} else {
 				f.SetCellValue(sheet, prCell, fmt.Sprintf("#%d", d.PRNumber))
 			}
 		}
 
-		f.SetCellValue(sheet, cellName(7, row), d.BranchName)
-		f.SetCellValue(sheet, cellName(8, row), d.ApproverLogins)
+		f.SetCellValue(sheet, cellName(7, row), sanitizeCell(d.BranchName))
+		f.SetCellValue(sheet, cellName(8, row), sanitizeCell(d.ApproverLogins))
 		compliantStr := "No"
 		if d.IsCompliant {
 			compliantStr = "Yes"
 		}
 		f.SetCellValue(sheet, cellName(9, row), compliantStr)
-		f.SetCellValue(sheet, cellName(10, row), d.Reasons)
-		f.SetCellValue(sheet, cellName(11, row), truncate(d.Message, 80))
+		f.SetCellValue(sheet, cellName(10, row), sanitizeCell(d.Reasons))
+		f.SetCellValue(sheet, cellName(11, row), sanitizeCell(truncate(d.Message, 80)))
 	}
 
 	lastCell := cellName(len(headers), max(len(details)+1, 1))
@@ -701,7 +702,7 @@ func writeMultiplePRsSheet(f *excelize.File, sheet string, rows []MultiplePRRow,
 			shaDisplay = shaDisplay[:8]
 		}
 		if m.CommitHref != "" {
-			f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, m.CommitHref, shaDisplay))
+			f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, escapeFormulaURL(m.CommitHref), shaDisplay))
 			f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
 		} else {
 			f.SetCellValue(sheet, shaCell, shaDisplay)
@@ -715,15 +716,15 @@ func writeMultiplePRsSheet(f *excelize.File, sheet string, rows []MultiplePRRow,
 
 		prCell := cellName(7, row)
 		if m.PRHref != "" {
-			f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, m.PRHref, m.PRNumber))
+			f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, escapeFormulaURL(m.PRHref), m.PRNumber))
 			f.SetCellStyle(sheet, prCell, prCell, linkStyle)
 		} else {
 			f.SetCellValue(sheet, prCell, fmt.Sprintf("#%d", m.PRNumber))
 		}
 
-		f.SetCellValue(sheet, cellName(8, row), truncate(m.PRTitle, 60))
-		f.SetCellValue(sheet, cellName(9, row), m.PRAuthorLogin)
-		f.SetCellValue(sheet, cellName(10, row), m.PRMergedBy)
+		f.SetCellValue(sheet, cellName(8, row), sanitizeCell(truncate(m.PRTitle, 60)))
+		f.SetCellValue(sheet, cellName(9, row), sanitizeCell(m.PRAuthorLogin))
+		f.SetCellValue(sheet, cellName(10, row), sanitizeCell(m.PRMergedBy))
 		auditedStr := "No"
 		if m.IsAuditedPR {
 			auditedStr = "Yes"
@@ -766,4 +767,18 @@ func boolToYesNo(b bool) string {
 		return "Yes"
 	}
 	return "No"
+}
+
+// escapeFormulaURL escapes double quotes in a URL for use inside HYPERLINK formulas.
+func escapeFormulaURL(url string) string {
+	return strings.ReplaceAll(url, `"`, `""`)
+}
+
+// sanitizeCell prevents formula injection by prefixing dangerous values with
+// a single quote, which forces Excel to treat the cell as text.
+func sanitizeCell(s string) string {
+	if len(s) > 0 && (s[0] == '=' || s[0] == '+' || s[0] == '-' || s[0] == '@') {
+		return "'" + s
+	}
+	return s
 }

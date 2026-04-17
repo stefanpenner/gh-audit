@@ -35,10 +35,11 @@ func newReportCmd() *cobra.Command {
 			// Build repo filters from --repo flags (org/repo format).
 			var repoFilters []report.RepoFilter
 			for _, r := range repos {
-				if strings.Contains(r, "/") {
-					parts := strings.SplitN(r, "/", 2)
-					repoFilters = append(repoFilters, report.RepoFilter{Org: parts[0], Repo: parts[1]})
+				parts := strings.SplitN(r, "/", 2)
+				if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+					return fmt.Errorf("invalid --repo format %q: expected org/repo", r)
 				}
+				repoFilters = append(repoFilters, report.RepoFilter{Org: parts[0], Repo: parts[1]})
 			}
 
 			opts := report.ReportOpts{

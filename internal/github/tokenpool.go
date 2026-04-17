@@ -290,7 +290,7 @@ func (t *rateLimitTransport) RoundTrip(req *http.Request) (*http.Response, error
 		body, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if readErr != nil {
-			return resp, nil
+			return nil, fmt.Errorf("reading 403 response body: %w", readErr)
 		}
 		bodyStr := strings.ToLower(string(body))
 		if strings.Contains(bodyStr, "abuse") || strings.Contains(bodyStr, "secondary rate limit") {
@@ -306,16 +306,16 @@ func (t *rateLimitTransport) RoundTrip(req *http.Request) (*http.Response, error
 
 	case 429:
 		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+		resp.Body.Close()
 
 		// Sleep and retry once.
 		timer := time.NewTimer(retryAfter)
 		select {
 		case <-req.Context().Done():
 			timer.Stop()
-			return resp, nil
+			return nil, req.Context().Err()
 		case <-timer.C:
 		}
-		resp.Body.Close()
 
 		return t.base.RoundTrip(req)
 

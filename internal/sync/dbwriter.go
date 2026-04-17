@@ -1,6 +1,9 @@
 package sync
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // A DBWriter serializes database write operations through a single goroutine.
 // DuckDB allows only one concurrent writer; this makes that constraint
@@ -58,7 +61,11 @@ func (w *DBWriter) Write(ctx context.Context, fn func() error) error {
 
 // Close drains pending writes and stops the writer goroutine.
 // All callers must have finished submitting writes before calling Close.
+// Times out after 30 seconds to prevent hanging on stuck DB writes.
 func (w *DBWriter) Close() {
 	close(w.requests)
-	<-w.done
+	select {
+	case <-w.done:
+	case <-time.After(30 * time.Second):
+	}
 }

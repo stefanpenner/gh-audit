@@ -184,12 +184,14 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			COALESCE(a.merge_strategy, ''),
 			COALESCE(array_to_string(a.pr_commit_author_logins, ', '), ''),
 			COALESCE(a.commit_href, ''),
-			COALESCE((SELECT cb.branch FROM commit_branches cb
-				WHERE cb.org = a.org AND cb.repo = a.repo AND cb.sha = a.sha
-				LIMIT 1), '')
+			COALESCE(cb.branch, '')
 		FROM audit_results a
 		JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
 		LEFT JOIN pull_requests p ON a.org = p.org AND a.repo = p.repo AND a.pr_number = p.number
+		LEFT JOIN (
+			SELECT DISTINCT ON (org, repo, sha) org, repo, sha, branch
+			FROM commit_branches
+		) cb ON a.org = cb.org AND a.repo = cb.repo AND a.sha = cb.sha
 		WHERE 1=1
 	`
 
@@ -417,12 +419,13 @@ func (r *Reporter) GetMultiplePRDetails(ctx context.Context, opts ReportOpts) ([
 	return result, rows.Err()
 }
 
-// truncate shortens a string to maxLen, adding "..." if truncated.
+// truncate shortens a string to maxLen runes, adding "..." if truncated.
 func truncate(s string, maxLen int) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	s = strings.ReplaceAll(s, "\r", "")
-	if len(s) > maxLen {
-		return s[:maxLen-3] + "..."
+	runes := []rune(s)
+	if len(runes) > maxLen {
+		return string(runes[:maxLen-3]) + "..."
 	}
 	return s
 }

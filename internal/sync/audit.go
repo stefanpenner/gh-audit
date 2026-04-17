@@ -168,8 +168,8 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 			return result
 		}
 
-		// Track best PR (fewest reasons = closest to compliant)
-		if bestPR == nil || len(prReasons) < len(bestReasons) {
+		// Track best PR (fewest reasons = closest to compliant; highest PR number breaks ties)
+		if bestPR == nil || len(prReasons) < len(bestReasons) || (len(prReasons) == len(bestReasons) && pr.Number > bestPR.Number) {
 			bestPR = pr
 			bestReasons = prReasons
 			bestApprovers = prApprovers
@@ -225,7 +225,7 @@ func evaluateRequiredChecks(checkRuns []model.CheckRun, headSHA string, required
 	for _, rc := range requiredChecks {
 		found := false
 		for _, cr := range checkRuns {
-			if cr.CommitSHA == headSHA && cr.CheckName == rc.Name {
+			if cr.CommitSHA == headSHA && strings.EqualFold(cr.CheckName, rc.Name) {
 				found = true
 				if !strings.EqualFold(cr.Conclusion, rc.Conclusion) {
 					anyFailed = true

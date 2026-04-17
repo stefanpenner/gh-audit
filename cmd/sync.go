@@ -182,9 +182,10 @@ func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until stri
 		orgRepos := make(map[string][]string)
 		for _, r := range repos {
 			parts := strings.SplitN(r, "/", 2)
-			if len(parts) == 2 {
-				orgRepos[parts[0]] = append(orgRepos[parts[0]], parts[1])
+			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+				return nil, fmt.Errorf("invalid --repo format %q: expected org/repo", r)
 			}
+			orgRepos[parts[0]] = append(orgRepos[parts[0]], parts[1])
 		}
 		for orgName, repoNames := range orgRepos {
 			syncCfg.Orgs = append(syncCfg.Orgs, sync.OrgConfig{
