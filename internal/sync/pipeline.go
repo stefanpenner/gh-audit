@@ -251,6 +251,11 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 	var auditResults []model.AuditResult
 	for _, c := range unaudited {
 		enrichment := enrichmentMap[c.SHA]
+		// Update commit stats from GraphQL enrichment (ListCommits doesn't return these)
+		if e, ok := enrichmentMap[c.SHA]; ok {
+			c.Additions = e.Commit.Additions
+			c.Deletions = e.Commit.Deletions
+		}
 		result := EvaluateCommit(c, enrichment, p.config.ExemptAuthors, p.config.RequiredChecks)
 		result.AuditedAt = time.Now()
 		auditResults = append(auditResults, result)

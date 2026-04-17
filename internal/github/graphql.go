@@ -16,7 +16,7 @@ import (
 
 const (
 	graphQLEndpoint    = "https://api.github.com/graphql"
-	graphQLBatchSize   = 25
+	graphQLBatchSize   = 5
 )
 
 // GraphQLClient provides batched GraphQL enrichment of commits.
@@ -98,7 +98,9 @@ func buildBatchQuery(org, repo string, shas []string) string {
 		buf.WriteString(fmt.Sprintf("    c%d: object(oid: %q) {\n", i, sha))
 		buf.WriteString("      ... on Commit {\n")
 		buf.WriteString("        oid\n")
-		buf.WriteString("        associatedPullRequests(first: 10, states: MERGED) {\n")
+		buf.WriteString("        additions\n")
+		buf.WriteString("        deletions\n")
+		buf.WriteString("        associatedPullRequests(first: 10) {\n")
 		buf.WriteString("          nodes {\n")
 		buf.WriteString("            number\n")
 		buf.WriteString("            title\n")
@@ -122,9 +124,9 @@ func buildBatchQuery(org, repo string, shas []string) string {
 		buf.WriteString("            commits(last: 1) {\n")
 		buf.WriteString("              nodes {\n")
 		buf.WriteString("                commit {\n")
-		buf.WriteString("                  checkSuites(first: 20) {\n")
+		buf.WriteString("                  checkSuites(first: 10) {\n")
 		buf.WriteString("                    nodes {\n")
-		buf.WriteString("                      checkRuns(first: 100) {\n")
+		buf.WriteString("                      checkRuns(first: 20) {\n")
 		buf.WriteString("                        nodes {\n")
 		buf.WriteString("                          databaseId\n")
 		buf.WriteString("                          name\n")
@@ -134,7 +136,7 @@ func buildBatchQuery(org, repo string, shas []string) string {
 		buf.WriteString("                        }\n")
 		buf.WriteString("                        pageInfo { hasNextPage }\n")
 		buf.WriteString("                      }\n")
-		buf.WriteString("                      pageInfo { hasNextPage }\n")
+		// checkSuites doesn't support pageInfo
 		buf.WriteString("                    }\n")
 		buf.WriteString("                  }\n")
 		buf.WriteString("                }\n")
@@ -208,11 +210,13 @@ func (c *GraphQLClient) parseGraphQLResponse(ctx context.Context, body []byte, o
 			continue
 		}
 
-		prs, reviews, checkRuns, err := c.parseCommitObject(ctx, commitData, org, repo, sha)
+		prs, reviews, checkRuns, additions, deletions, err := c.parseCommitObject(ctx, commitData, org, repo, sha)
 		if err != nil {
 			return nil, fmt.Errorf("parsing commit %s: %w", sha, err)
 		}
 
+		result.Commit.Additions = additions
+		result.Commit.Deletions = deletions
 		result.PRs = prs
 		result.Reviews = reviews
 		result.CheckRuns = checkRuns
@@ -222,15 +226,17 @@ func (c *GraphQLClient) parseGraphQLResponse(ctx context.Context, body []byte, o
 	return results, nil
 }
 
-func (c *GraphQLClient) parseCommitObject(ctx context.Context, data json.RawMessage, org, repo, sha string) ([]model.PullRequest, []model.Review, []model.CheckRun, error) {
+func (c *GraphQLClient) parseCommitObject(ctx context.Context, data json.RawMessage, org, repo, sha string) ([]model.PullRequest, []model.Review, []model.CheckRun, int, int, error) {
 	var obj struct {
+		Additions              int `json:"additions"`
+		Deletions              int `json:"deletions"`
 		AssociatedPullRequests struct {
 			Nodes    []json.RawMessage `json:"nodes"`
 			PageInfo gqlPageInfo       `json:"pageInfo"`
 		} `json:"associatedPullRequests"`
 	}
 	if err := json.Unmarshal(data, &obj); err != nil {
-		return nil, nil, nil, fmt.Errorf("unmarshaling commit object: %w", err)
+		return nil, nil, nil, 0, 0, fmt.Errorf("unmarshaling commit object: %w", err)
 	}
 
 	if obj.AssociatedPullRequests.PageInfo.HasNextPage {
@@ -246,7 +252,10 @@ func (c *GraphQLClient) parseCommitObject(ctx context.Context, data json.RawMess
 	for _, prRaw := range obj.AssociatedPullRequests.Nodes {
 		pr, prReviews, prCheckRuns, err := c.parsePRNode(ctx, prRaw, org, repo, sha)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, 0, 0, err
+		}
+		if !pr.Merged {
+			continue
 		}
 		prs = append(prs, pr)
 		reviews = append(reviews, prReviews...)
@@ -263,7 +272,7 @@ func (c *GraphQLClient) parseCommitObject(ctx context.Context, data json.RawMess
 		checkRuns = []model.CheckRun{}
 	}
 
-	return prs, reviews, checkRuns, nil
+	return prs, reviews, checkRuns, obj.Additions, obj.Deletions, nil
 }
 
 type gqlPRNode struct {
@@ -292,9 +301,7 @@ type gqlPRNode struct {
 							Nodes    []gqlCheckRunNode `json:"nodes"`
 							PageInfo gqlPageInfo       `json:"pageInfo"`
 						} `json:"checkRuns"`
-						PageInfo gqlPageInfo `json:"pageInfo"`
 					} `json:"nodes"`
-					PageInfo gqlPageInfo `json:"pageInfo"`
 				} `json:"checkSuites"`
 			} `json:"commit"`
 		} `json:"nodes"`
@@ -373,21 +380,11 @@ func (c *GraphQLClient) parsePRNode(ctx context.Context, data json.RawMessage, o
 	// Parse check runs from the last commit in the PR.
 	var checkRuns []model.CheckRun
 	for _, commitNode := range node.Commits.Nodes {
-		if commitNode.Commit.CheckSuites.PageInfo.HasNextPage {
-			c.logger.Warn("pagination truncated: checkSuites",
-				"org", org, "repo", repo, "sha", sha,
-				"field", "checkSuites", "pr", node.Number)
-		}
 		for _, suite := range commitNode.Commit.CheckSuites.Nodes {
 			if suite.CheckRuns.PageInfo.HasNextPage {
 				c.logger.Warn("pagination truncated: checkRuns",
 					"org", org, "repo", repo, "sha", sha,
 					"field", "checkRuns", "pr", node.Number)
-			}
-			if suite.PageInfo.HasNextPage {
-				c.logger.Warn("pagination truncated: checkSuites inner",
-					"org", org, "repo", repo, "sha", sha,
-					"field", "checkSuites", "pr", node.Number)
 			}
 			for _, cr := range suite.CheckRuns.Nodes {
 				checkRun := model.CheckRun{

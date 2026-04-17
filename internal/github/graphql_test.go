@@ -23,7 +23,9 @@ func graphqlFixtureWithPageInfo(shas []string, withPRs bool, reviewsHasNext, che
 		alias := fmt.Sprintf("c%d", i)
 		if !withPRs {
 			repo[alias] = map[string]any{
-				"oid": sha,
+				"oid":       sha,
+				"additions": 0,
+				"deletions": 0,
 				"associatedPullRequests": map[string]any{
 					"nodes":    []any{},
 					"pageInfo": map[string]any{"hasNextPage": false},
@@ -33,7 +35,9 @@ func graphqlFixtureWithPageInfo(shas []string, withPRs bool, reviewsHasNext, che
 		}
 
 		repo[alias] = map[string]any{
-			"oid": sha,
+			"oid":       sha,
+			"additions": 10 + i,
+			"deletions": 5 + i,
 			"associatedPullRequests": map[string]any{
 				"pageInfo": map[string]any{"hasNextPage": false},
 				"nodes": []any{
@@ -149,10 +153,16 @@ func TestEnrichCommits_SingleCommit(t *testing.T) {
 	if r.CheckRuns[0].CheckName != "ci/tests" {
 		t.Errorf("check name = %q, want ci/tests", r.CheckRuns[0].CheckName)
 	}
+	if r.Commit.Additions != 10 {
+		t.Errorf("Additions = %d, want 10", r.Commit.Additions)
+	}
+	if r.Commit.Deletions != 5 {
+		t.Errorf("Deletions = %d, want 5", r.Commit.Deletions)
+	}
 }
 
-func TestEnrichCommits_BatchOf25SendsSingleQuery(t *testing.T) {
-	shas := make([]string, 25)
+func TestEnrichCommits_BatchOf5SendsSingleQuery(t *testing.T) {
+	shas := make([]string, 5)
 	for i := range shas {
 		shas[i] = fmt.Sprintf("%040x", i)
 	}
@@ -161,8 +171,7 @@ func TestEnrichCommits_BatchOf25SendsSingleQuery(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		queryCount++
 		body, _ := io.ReadAll(r.Body)
-		// Verify all 25 aliases are present.
-		for i := range 25 {
+		for i := range 5 {
 			alias := fmt.Sprintf("c%d", i)
 			if !strings.Contains(string(body), alias) {
 				t.Errorf("query missing alias %s", alias)
@@ -184,13 +193,13 @@ func TestEnrichCommits_BatchOf25SendsSingleQuery(t *testing.T) {
 	if queryCount != 1 {
 		t.Errorf("expected 1 GraphQL query, got %d", queryCount)
 	}
-	if len(results) != 25 {
-		t.Errorf("expected 25 results, got %d", len(results))
+	if len(results) != 5 {
+		t.Errorf("expected 5 results, got %d", len(results))
 	}
 }
 
-func TestEnrichCommits_50CommitsSends2Queries(t *testing.T) {
-	shas := make([]string, 50)
+func TestEnrichCommits_10CommitsSends2Queries(t *testing.T) {
+	shas := make([]string, 10)
 	for i := range shas {
 		shas[i] = fmt.Sprintf("%040x", i)
 	}
@@ -202,12 +211,10 @@ func TestEnrichCommits_50CommitsSends2Queries(t *testing.T) {
 		var req map[string]string
 		json.Unmarshal(body, &req)
 
-		// Count aliases in the query to determine batch.
 		query := req["query"]
 		aliasCount := strings.Count(query, ": object(oid:")
 
-		// Build response for this batch.
-		batchStart := (queryCount - 1) * 25
+		batchStart := (queryCount - 1) * graphQLBatchSize
 		batchShas := shas[batchStart : batchStart+aliasCount]
 
 		w.Header().Set("Content-Type", "application/json")
@@ -226,8 +233,8 @@ func TestEnrichCommits_50CommitsSends2Queries(t *testing.T) {
 	if queryCount != 2 {
 		t.Errorf("expected 2 GraphQL queries, got %d", queryCount)
 	}
-	if len(results) != 50 {
-		t.Errorf("expected 50 results, got %d", len(results))
+	if len(results) != 10 {
+		t.Errorf("expected 10 results, got %d", len(results))
 	}
 }
 
@@ -264,7 +271,9 @@ func TestEnrichCommits_MultiplePRs(t *testing.T) {
 			"data": map[string]any{
 				"repository": map[string]any{
 					"c0": map[string]any{
-						"oid": sha,
+						"oid":       sha,
+						"additions": 42,
+						"deletions": 13,
 						"associatedPullRequests": map[string]any{
 							"pageInfo": map[string]any{"hasNextPage": false},
 							"nodes": []any{
@@ -370,7 +379,9 @@ func TestEnrichCommits_ResponseParsing(t *testing.T) {
 			"data": map[string]any{
 				"repository": map[string]any{
 					"c0": map[string]any{
-						"oid": sha,
+						"oid":       sha,
+						"additions": 100,
+						"deletions": 25,
 						"associatedPullRequests": map[string]any{
 							"pageInfo": map[string]any{"hasNextPage": false},
 							"nodes": []any{
