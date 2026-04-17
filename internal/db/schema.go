@@ -108,7 +108,9 @@ const (
 		is_exempt_author     BOOLEAN,
 		has_pr               BOOLEAN,
 		pr_number            INTEGER,
+		pr_count             INTEGER DEFAULT 0,
 		has_final_approval   BOOLEAN,
+		has_stale_approval   BOOLEAN DEFAULT false,
 		is_self_approved     BOOLEAN,
 		approver_logins      TEXT[],
 		owner_approval_check owner_approval_check,
@@ -132,6 +134,8 @@ var enumTypes = []string{
 // Each ALTER is idempotent: the migrate function ignores "already exists" errors.
 var addColumnMigrations = []string{
 	`ALTER TABLE commits ADD COLUMN committer_login TEXT`,
+	`ALTER TABLE audit_results ADD COLUMN has_stale_approval BOOLEAN DEFAULT false`,
+	`ALTER TABLE audit_results ADD COLUMN pr_count INTEGER DEFAULT 0`,
 }
 
 // allTables is the ordered list of DDL statements to run during migration.

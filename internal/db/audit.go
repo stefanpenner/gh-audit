@@ -29,8 +29,8 @@ type AuditRow struct {
 
 var auditResultColumns = []string{
 	"org", "repo", "sha", "is_empty_commit", "is_bot", "is_exempt_author",
-	"has_pr", "pr_number", "has_final_approval", "is_self_approved",
-	"approver_logins", "owner_approval_check", "is_compliant",
+	"has_pr", "pr_number", "pr_count", "has_final_approval", "has_stale_approval",
+	"is_self_approved", "approver_logins", "owner_approval_check", "is_compliant",
 	"reasons", "commit_href", "pr_href",
 }
 
@@ -45,8 +45,8 @@ func (d *DB) UpsertAuditResults(ctx context.Context, results []model.AuditResult
 	for i, r := range results {
 		rows[i] = []driver.Value{
 			r.Org, r.Repo, r.SHA,
-			r.IsEmptyCommit, r.IsBot, r.IsExemptAuthor, r.HasPR, r.PRNumber,
-			r.HasFinalApproval, r.IsSelfApproved,
+			r.IsEmptyCommit, r.IsBot, r.IsExemptAuthor, r.HasPR, r.PRNumber, r.PRCount,
+			r.HasFinalApproval, r.HasStaleApproval, r.IsSelfApproved,
 			toAnySlice(r.ApproverLogins),
 			nullIfEmpty(r.OwnerApprovalCheck), r.IsCompliant,
 			toAnySlice(r.Reasons),

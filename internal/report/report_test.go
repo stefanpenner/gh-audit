@@ -112,7 +112,9 @@ CREATE TABLE IF NOT EXISTS audit_results (
 	is_exempt_author     BOOLEAN,
 	has_pr               BOOLEAN,
 	pr_number            INTEGER,
+	pr_count             INTEGER DEFAULT 0,
 	has_final_approval   BOOLEAN,
+	has_stale_approval   BOOLEAN DEFAULT false,
 	approver_logins      TEXT[],
 	owner_approval_check TEXT,
 	is_compliant         BOOLEAN,
@@ -153,10 +155,10 @@ func insertCommit(t *testing.T, db *sql.DB, org, repo, sha, author string, commi
 }
 
 type auditResultOpts struct {
-	isBot, isExempt, isEmpty, hasPR, hasApproval, isCompliant, isSelfApproved bool
-	prNumber                                                                  int
-	approvers                                                                 []string
-	reasons                                                                   []string
+	isBot, isExempt, isEmpty, hasPR, hasApproval, isCompliant, isSelfApproved, hasStaleApproval bool
+	prNumber, prCount                                                                           int
+	approvers                                                                                   []string
+	reasons                                                                                     []string
 }
 
 func insertAuditResult(t *testing.T, db *sql.DB, org, repo, sha string, isBot, isEmpty, hasPR, hasApproval, isCompliant bool, prNumber int, approvers []string, reasons []string) {
@@ -189,11 +191,11 @@ func insertAuditResultFull(t *testing.T, db *sql.DB, org, repo, sha string, opts
 		reasonExpr = fmt.Sprintf("list_value(%s)", strings.Join(quoted, ", "))
 	}
 
-	q := fmt.Sprintf(`INSERT INTO audit_results (org, repo, sha, is_empty_commit, is_bot, is_exempt_author, has_pr, pr_number, has_final_approval, approver_logins, owner_approval_check, is_compliant, reasons, commit_href, pr_href, is_self_approved)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, %s, ?, ?, %s, ?, ?, ?)`, approverExpr, reasonExpr)
+	q := fmt.Sprintf(`INSERT INTO audit_results (org, repo, sha, is_empty_commit, is_bot, is_exempt_author, has_pr, pr_number, pr_count, has_final_approval, has_stale_approval, approver_logins, owner_approval_check, is_compliant, reasons, commit_href, pr_href, is_self_approved)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, %s, ?, ?, %s, ?, ?, ?)`, approverExpr, reasonExpr)
 
 	_, err := db.Exec(q,
-		org, repo, sha, opts.isEmpty, opts.isBot, opts.isExempt, opts.hasPR, opts.prNumber, opts.hasApproval,
+		org, repo, sha, opts.isEmpty, opts.isBot, opts.isExempt, opts.hasPR, opts.prNumber, opts.prCount, opts.hasApproval, opts.hasStaleApproval,
 		"success", opts.isCompliant,
 		fmt.Sprintf("https://github.com/%s/%s/commit/%s", org, repo, sha),
 		fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, opts.prNumber),
@@ -509,7 +511,7 @@ func TestGenerateXLSXLargeDataset(t *testing.T) {
 	assert.Greater(t, info.Size(), int64(0))
 }
 
-func TestGenerateXLSXHasFiveSheets(t *testing.T) {
+func TestGenerateXLSXHasSevenSheets(t *testing.T) {
 	db := setupTestDB(t)
 	now := time.Now().Truncate(time.Second)
 
@@ -533,7 +535,7 @@ func TestGenerateXLSXHasFiveSheets(t *testing.T) {
 	defer xf.Close()
 
 	sheets := xf.GetSheetList()
-	expected := []string{"Summary", "All Commits", "Non-Compliant", "Exemptions", "Self-Approved"}
+	expected := []string{"Summary", "All Commits", "Non-Compliant", "Exemptions", "Self-Approved", "Stale Approvals", "Multiple PRs"}
 	require.Len(t, sheets, len(expected))
 	for i, name := range expected {
 		assert.Equal(t, name, sheets[i], "sheet %d", i)

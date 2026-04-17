@@ -122,7 +122,9 @@ type AuditResult struct {
 	IsExemptAuthor     bool // author is on the configured exemption list
 	HasPR              bool
 	PRNumber           int
+	PRCount            int
 	HasFinalApproval   bool
+	HasStaleApproval   bool // approval exists but on a pre-force-push commit
 	IsSelfApproved     bool // true if only approvals are from code contributors
 	ApproverLogins     []string
 	OwnerApprovalCheck string // success, failure, missing

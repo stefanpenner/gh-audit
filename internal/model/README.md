@@ -99,8 +99,10 @@ classDiagram
         IsExemptAuthor bool
         IsEmptyCommit bool
         IsSelfApproved bool
+        HasStaleApproval bool
         HasPR bool
         PRNumber int
+        PRCount int
         HasFinalApproval bool
         ApproverLogins []string
         OwnerApprovalCheck string

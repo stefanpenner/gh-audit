@@ -168,7 +168,7 @@ func TestEvaluateCommit(t *testing.T) {
 			requiredChecks: requiredChecks,
 			wantCompliant:  false,
 			wantHasPR:      true,
-			wantReasons:    []string{"no approval on final commit (PR #42)"},
+			wantReasons:    []string{"approval is stale \u2014 not on final commit (PR #42)"},
 		},
 		{
 			name:   "approved on final but Owner Approval missing",
@@ -404,7 +404,7 @@ func TestEvaluateCommit(t *testing.T) {
 			requiredChecks: requiredChecks,
 			wantCompliant:  false,
 			wantHasPR:      true,
-			wantReasons:    []string{"no approval on final commit (PR #42)"},
+			wantReasons:    []string{"approval is stale \u2014 not on final commit (PR #42)"},
 		},
 		{
 			name:   "stale approval from one reviewer fresh approval from another",
@@ -436,7 +436,7 @@ func TestEvaluateCommit(t *testing.T) {
 			requiredChecks: requiredChecks,
 			wantCompliant:  false,
 			wantHasPR:      true,
-			wantReasons:    []string{"no approval on final commit (PR #42)"},
+			wantReasons:    []string{"approval is stale \u2014 not on final commit (PR #42)"},
 		},
 		{
 			name:   "re-approval after force-push same reviewer",

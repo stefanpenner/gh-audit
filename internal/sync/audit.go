@@ -54,12 +54,14 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	}
 
 	result.HasPR = true
+	result.PRCount = len(enrichment.PRs)
 
 	// Evaluate each PR for compliance
 	var bestPR *model.PullRequest
 	var bestReasons []string
 	var bestApprovers []string
 	var bestSelfApproved bool
+	var bestStaleApproval bool
 
 	for i := range enrichment.PRs {
 		pr := &enrichment.PRs[i]
@@ -96,9 +98,25 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 			}
 		}
 
+		// Detect stale approvals: approvals on older commits (pre-force-push)
+		hasStaleApproval := false
+		if !hasApprovalOnFinal {
+			for _, review := range enrichment.Reviews {
+				if review.PRNumber != pr.Number || review.CommitID == pr.HeadSHA {
+					continue
+				}
+				if review.State == "APPROVED" && !isSelfApproval(review, commit, *pr) {
+					hasStaleApproval = true
+					break
+				}
+			}
+		}
+
 		if !hasApprovalOnFinal {
 			if hasSelfApproval {
 				prReasons = append(prReasons, fmt.Sprintf("self-approved (reviewer is code author) (PR #%d)", pr.Number))
+			} else if hasStaleApproval {
+				prReasons = append(prReasons, fmt.Sprintf("approval is stale — not on final commit (PR #%d)", pr.Number))
 			} else {
 				prReasons = append(prReasons, fmt.Sprintf("no approval on final commit (PR #%d)", pr.Number))
 			}
@@ -128,12 +146,14 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 			bestReasons = prReasons
 			bestApprovers = prApprovers
 			bestSelfApproved = hasSelfApproval && !hasApprovalOnFinal
+			bestStaleApproval = hasStaleApproval
 		}
 	}
 
 	// No PR satisfied all checks
 	result.IsCompliant = false
 	result.IsSelfApproved = bestSelfApproved
+	result.HasStaleApproval = bestStaleApproval
 	if bestPR != nil {
 		result.PRNumber = bestPR.Number
 		result.PRHref = bestPR.Href
