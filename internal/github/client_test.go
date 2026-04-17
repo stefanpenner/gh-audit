@@ -287,5 +287,59 @@ func TestGetCommitDetail(t *testing.T) {
 	}
 }
 
+func TestParseCoAuthors(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		want    int
+		names   []string
+		emails  []string
+	}{
+		{
+			name:    "no co-authors",
+			message: "feat: add feature\n\nSome description",
+			want:    0,
+		},
+		{
+			name:    "single co-author",
+			message: "feat: add feature\n\nCo-authored-by: Jane Doe <jane@example.com>",
+			want:    1,
+			names:   []string{"Jane Doe"},
+			emails:  []string{"jane@example.com"},
+		},
+		{
+			name:    "multiple co-authors",
+			message: "feat: add feature\n\nCo-authored-by: Jane Doe <jane@example.com>\nCo-authored-by: Bob Smith <bob@example.com>",
+			want:    2,
+			names:   []string{"Jane Doe", "Bob Smith"},
+			emails:  []string{"jane@example.com", "bob@example.com"},
+		},
+		{
+			name:    "case insensitive",
+			message: "fix: bug\n\nco-authored-by: Alice <alice@test.com>",
+			want:    1,
+			names:   []string{"Alice"},
+			emails:  []string{"alice@test.com"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseCoAuthors(tt.message)
+			if len(got) != tt.want {
+				t.Fatalf("parseCoAuthors() returned %d, want %d", len(got), tt.want)
+			}
+			for i, ca := range got {
+				if i < len(tt.names) && ca.Name != tt.names[i] {
+					t.Errorf("co-author[%d].Name = %q, want %q", i, ca.Name, tt.names[i])
+				}
+				if i < len(tt.emails) && ca.Email != tt.emails[i] {
+					t.Errorf("co-author[%d].Email = %q, want %q", i, ca.Email, tt.emails[i])
+				}
+			}
+		})
+	}
+}
+
 // Ensure go-github is used (compile check).
 var _ = (*gogithub.Client)(nil)

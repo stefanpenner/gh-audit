@@ -4,11 +4,15 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strings"
 	"time"
 
 	gogithub "github.com/google/go-github/v72/github"
 	"github.com/stefanpenner/gh-audit/internal/model"
 )
+
+var coAuthorRe = regexp.MustCompile(`(?i)co-authored-by:\s*(.+?)\s*<([^>]+)>`)
 
 // Client wraps the GitHub REST API with token-pool-aware authentication.
 type Client struct {
@@ -118,6 +122,7 @@ func (c *Client) ListCommits(ctx context.Context, org, repo, branch string, sinc
 			}
 			commit.ParentCount = len(rc.Parents)
 			commit.Branch = branch
+			commit.CoAuthors = parseCoAuthors(commit.Message)
 			allCommits = append(allCommits, commit)
 		}
 
@@ -162,10 +167,30 @@ func (c *Client) GetCommitDetail(ctx context.Context, org, repo, sha string) (*m
 		}
 	}
 	commit.ParentCount = len(rc.Parents)
+	commit.CoAuthors = parseCoAuthors(commit.Message)
 	if rc.GetStats() != nil {
 		commit.Additions = rc.GetStats().GetAdditions()
 		commit.Deletions = rc.GetStats().GetDeletions()
 	}
 
 	return commit, nil
+}
+
+// parseCoAuthors extracts co-authors from "Co-authored-by" trailers in commit messages.
+func parseCoAuthors(message string) []model.CoAuthor {
+	if !strings.Contains(strings.ToLower(message), "co-authored-by") {
+		return nil
+	}
+	matches := coAuthorRe.FindAllStringSubmatch(message, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	coAuthors := make([]model.CoAuthor, 0, len(matches))
+	for _, m := range matches {
+		coAuthors = append(coAuthors, model.CoAuthor{
+			Name:  strings.TrimSpace(m[1]),
+			Email: strings.TrimSpace(m[2]),
+		})
+	}
+	return coAuthors
 }

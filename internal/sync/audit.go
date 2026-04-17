@@ -66,11 +66,27 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		prReasons := []string{}
 		prApprovers := []string{}
 
-		// Check for approval on final commit, filtering out self-approvals
+		// Per-reviewer last-state tracking: for each reviewer on the final commit,
+		// keep only their most recent review. A DISMISSED review overrides an
+		// earlier APPROVED from the same reviewer (SOX requirement).
+		latestByReviewer := make(map[string]model.Review)
+		for _, review := range enrichment.Reviews {
+			if review.PRNumber != pr.Number || review.CommitID != pr.HeadSHA {
+				continue
+			}
+			if review.ReviewerLogin == "" {
+				continue
+			}
+			existing, exists := latestByReviewer[review.ReviewerLogin]
+			if !exists || review.SubmittedAt.After(existing.SubmittedAt) {
+				latestByReviewer[review.ReviewerLogin] = review
+			}
+		}
+
 		hasApprovalOnFinal := false
 		hasSelfApproval := false
-		for _, review := range enrichment.Reviews {
-			if review.PRNumber == pr.Number && review.State == "APPROVED" && review.CommitID == pr.HeadSHA {
+		for _, review := range latestByReviewer {
+			if review.State == "APPROVED" {
 				if isSelfApproval(review, commit, *pr) {
 					hasSelfApproval = true
 				} else {
@@ -122,12 +138,21 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		result.PRNumber = bestPR.Number
 		result.PRHref = bestPR.Href
 		result.ApproverLogins = bestApprovers
+		// Use per-reviewer last-state tracking for fallback too
+		fallbackLatest := make(map[string]model.Review)
 		for _, review := range enrichment.Reviews {
-			if review.PRNumber == bestPR.Number && review.State == "APPROVED" && review.CommitID == bestPR.HeadSHA {
-				if !isSelfApproval(review, commit, *bestPR) {
-					result.HasFinalApproval = true
-					break
-				}
+			if review.PRNumber != bestPR.Number || review.CommitID != bestPR.HeadSHA || review.ReviewerLogin == "" {
+				continue
+			}
+			existing, exists := fallbackLatest[review.ReviewerLogin]
+			if !exists || review.SubmittedAt.After(existing.SubmittedAt) {
+				fallbackLatest[review.ReviewerLogin] = review
+			}
+		}
+		for _, review := range fallbackLatest {
+			if review.State == "APPROVED" && !isSelfApproval(review, commit, *bestPR) {
+				result.HasFinalApproval = true
+				break
 			}
 		}
 		ownerApprovalStatus := evaluateRequiredChecks(enrichment.CheckRuns, bestPR.HeadSHA, requiredChecks)

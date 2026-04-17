@@ -468,10 +468,7 @@ func TestEvaluateCommit(t *testing.T) {
 			wantReasons:    []string{"no approval on final commit (PR #42)"},
 		},
 		{
-			// NOTE: The current implementation does not track dismissals — it sees
-			// the earlier APPROVED review and treats the PR as approved. If we add
-			// per-reviewer last-state tracking, this should become non-compliant.
-			name:   "APPROVED then DISMISSED on final commit (currently compliant — dismissal not tracked)",
+			name:   "APPROVED then DISMISSED on final commit is non-compliant",
 			commit: baseCommit,
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{basePR},
@@ -482,9 +479,9 @@ func TestEvaluateCommit(t *testing.T) {
 				CheckRuns: []model.CheckRun{ownerApprovalCheck},
 			},
 			requiredChecks: requiredChecks,
-			wantCompliant:  true,
+			wantCompliant:  false,
 			wantHasPR:      true,
-			wantReasons:    []string{"compliant"},
+			wantReasons:    []string{"no approval on final commit (PR #42)"},
 		},
 		{
 			name:   "mixed states on final CHANGES_REQUESTED and APPROVED from different reviewers",
