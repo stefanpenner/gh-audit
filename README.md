@@ -1,6 +1,6 @@
 # gh-audit
 
-Enterprise-scale GitHub commit compliance auditor. Verifies that every commit on protected branches was properly code-reviewed, approved on its final commit, and passed required status checks. Built for SOX/SOC2 audit evidence.
+Proof of Concept: Enterprise-scale GitHub commit compliance auditor. Verifies that every commit on protected branches was properly code-reviewed, approved on its final commit, and passed required status checks. Built for SOX/SOC2 audit evidence.
 
 ## What it checks
 
