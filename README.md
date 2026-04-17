@@ -182,6 +182,10 @@ All SHA and PR cells are clickable hyperlinks to GitHub.
 - **GitHub REST API** for commit listing and pagination fallback
 - **Token pool** with rate-limit-aware selection across multiple PATs and App tokens
 
+## GitHub's org audit log
+
+GitHub provides an [organization audit log](https://docs.github.com/en/organizations/keeping-your-organization-secure/managing-security-settings-for-your-organization/reviewing-the-audit-log-for-your-organization) that tracks administrative actions (branch protection changes, team membership, deploy keys, etc.). It answers "who changed the rules?" while gh-audit answers "did everyone follow the rules?" They're complementary -- see [docs/github-audit-log-comparison.md](docs/github-audit-log-comparison.md) for the full breakdown.
+
 ## Future enhancements
 
 - **Webhook-based sync**: Use GitHub `push` event webhooks for real-time updates after initial historical sync
