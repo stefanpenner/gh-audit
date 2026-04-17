@@ -227,6 +227,7 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 
 	seenPRs := make(map[string]bool)
 	seenReviews := make(map[string]bool)
+	seenCheckRuns := make(map[string]bool)
 	for _, e := range allEnrichments {
 		for _, pr := range e.PRs {
 			key := fmt.Sprintf("%s/%s/%d", pr.Org, pr.Repo, pr.Number)
@@ -242,7 +243,13 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 				allReviews = append(allReviews, r)
 			}
 		}
-		allCheckRuns = append(allCheckRuns, e.CheckRuns...)
+		for _, cr := range e.CheckRuns {
+			key := fmt.Sprintf("%s/%s/%s/%d", cr.Org, cr.Repo, cr.CommitSHA, cr.CheckRunID)
+			if !seenCheckRuns[key] {
+				seenCheckRuns[key] = true
+				allCheckRuns = append(allCheckRuns, cr)
+			}
+		}
 		prNums := make([]int, len(e.PRs))
 		for j, pr := range e.PRs {
 			prNums[j] = pr.Number
