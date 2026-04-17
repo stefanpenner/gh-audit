@@ -73,8 +73,9 @@ type DetailRow struct {
 	OwnerApprovalCheck string    `json:"owner_approval_check"`
 	IsCompliant        bool      `json:"is_compliant"`
 	Reasons            string    `json:"reasons"`
-	MergeStrategy      string    `json:"merge_strategy"`
-	CommitHref         string    `json:"commit_href"`
+	MergeStrategy         string `json:"merge_strategy"`
+	PRCommitAuthorLogins  string `json:"pr_commit_author_logins"`
+	CommitHref            string `json:"commit_href"`
 	BranchName         string    `json:"branch_name"`
 }
 
@@ -181,6 +182,7 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			a.is_compliant,
 			COALESCE(array_to_string(a.reasons, ', '), ''),
 			COALESCE(a.merge_strategy, ''),
+			COALESCE(array_to_string(a.pr_commit_author_logins, ', '), ''),
 			COALESCE(a.commit_href, ''),
 			COALESCE((SELECT cb.branch FROM commit_branches cb
 				WHERE cb.org = a.org AND cb.repo = a.repo AND cb.sha = a.sha
@@ -221,7 +223,7 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			&d.Message, &d.IsBot, &d.IsExemptAuthor, &d.IsEmptyCommit, &d.IsSelfApproved,
 			&d.HasStaleApproval, &d.HasPR, &d.PRNumber, &d.PRCount, &d.PRHref, &d.MergedByLogin,
 			&d.HasFinalApproval, &d.ApproverLogins,
-			&d.OwnerApprovalCheck, &d.IsCompliant, &d.Reasons, &d.MergeStrategy, &d.CommitHref, &d.BranchName,
+			&d.OwnerApprovalCheck, &d.IsCompliant, &d.Reasons, &d.MergeStrategy, &d.PRCommitAuthorLogins, &d.CommitHref, &d.BranchName,
 		); err != nil {
 			return nil, fmt.Errorf("scan detail: %w", err)
 		}
@@ -273,7 +275,7 @@ func (r *Reporter) FormatCSV(w io.Writer, details []DetailRow) error {
 		"Org", "Repo", "SHA", "PR #", "PR Link",
 		"Author", "Committer", "Merged By", "Approvers",
 		"Approved", "Self-Approved", "Owner Approval",
-		"Compliant", "Reasons", "Merge Strategy",
+		"Compliant", "Reasons", "Merge Strategy", "PR Commit Authors",
 		"Date", "Branch", "Message",
 		"Is Bot", "Is Empty",
 		"No PR", "Stale Approval", "Self-Approved Flag", "No Approval",
@@ -294,6 +296,7 @@ func (r *Reporter) FormatCSV(w io.Writer, details []DetailRow) error {
 			fmt.Sprintf("%v", d.IsCompliant),
 			d.Reasons,
 			d.MergeStrategy,
+			d.PRCommitAuthorLogins,
 			d.CommittedAt.Format("2006-01-02 15:04:05"),
 			d.BranchName,
 			d.Message,

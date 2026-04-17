@@ -9,7 +9,7 @@ import (
 )
 
 var prColumns = []string{
-	"org", "repo", "number", "title", "merged", "head_sha",
+	"org", "repo", "number", "title", "merged", "head_sha", "head_branch",
 	"merge_commit_sha", "author_login", "merged_by_login", "merged_at", "href",
 }
 
@@ -24,7 +24,7 @@ func (d *DB) UpsertPullRequests(ctx context.Context, prs []model.PullRequest) er
 	for i, pr := range prs {
 		rows[i] = []driver.Value{
 			pr.Org, pr.Repo, pr.Number, pr.Title, pr.Merged,
-			pr.HeadSHA, pr.MergeCommitSHA, pr.AuthorLogin, pr.MergedByLogin, pr.MergedAt, pr.Href,
+			pr.HeadSHA, pr.HeadBranch, pr.MergeCommitSHA, pr.AuthorLogin, pr.MergedByLogin, pr.MergedAt, pr.Href,
 		}
 	}
 
@@ -97,7 +97,8 @@ func (d *DB) UpsertCommitPRs(ctx context.Context, org, repo, sha string, prNumbe
 func (d *DB) GetPRsForCommit(ctx context.Context, org, repo, sha string) ([]model.PullRequest, error) {
 	rows, err := d.DB.QueryContext(ctx, `
 		SELECT p.org, p.repo, p.number, p.title, p.merged, p.head_sha,
-		       p.merge_commit_sha, p.author_login, COALESCE(p.merged_by_login, ''), p.merged_at, p.href
+		       COALESCE(p.head_branch, ''), p.merge_commit_sha, p.author_login,
+		       COALESCE(p.merged_by_login, ''), p.merged_at, p.href
 		FROM pull_requests p
 		INNER JOIN commit_prs cp ON p.org = cp.org AND p.repo = cp.repo AND p.number = cp.pr_number
 		WHERE cp.org = ? AND cp.repo = ? AND cp.sha = ?`, org, repo, sha)
@@ -110,12 +111,29 @@ func (d *DB) GetPRsForCommit(ctx context.Context, org, repo, sha string) ([]mode
 	for rows.Next() {
 		var pr model.PullRequest
 		if err := rows.Scan(&pr.Org, &pr.Repo, &pr.Number, &pr.Title, &pr.Merged,
-			&pr.HeadSHA, &pr.MergeCommitSHA, &pr.AuthorLogin, &pr.MergedByLogin, &pr.MergedAt, &pr.Href); err != nil {
+			&pr.HeadSHA, &pr.HeadBranch, &pr.MergeCommitSHA, &pr.AuthorLogin,
+			&pr.MergedByLogin, &pr.MergedAt, &pr.Href); err != nil {
 			return nil, fmt.Errorf("scan PR: %w", err)
 		}
 		result = append(result, pr)
 	}
 	return result, rows.Err()
+}
+
+// GetCommitsForPR retrieves commits associated with a PR via commit_prs.
+func (d *DB) GetCommitsForPR(ctx context.Context, org, repo string, prNumber int) ([]model.Commit, error) {
+	rows, err := d.DB.QueryContext(ctx, `
+		SELECT c.org, c.repo, c.sha, c.author_login, c.author_email, c.committer_login,
+		       c.committed_at, c.message, c.parent_count, c.additions, c.deletions, c.href
+		FROM commits c
+		INNER JOIN commit_prs cp ON c.org = cp.org AND c.repo = cp.repo AND c.sha = cp.sha
+		WHERE cp.org = ? AND cp.repo = ? AND cp.pr_number = ?`, org, repo, prNumber)
+	if err != nil {
+		return nil, fmt.Errorf("query commits for PR: %w", err)
+	}
+	defer rows.Close()
+
+	return scanCommits(rows)
 }
 
 // GetReviewsForPR retrieves reviews for a specific pull request.

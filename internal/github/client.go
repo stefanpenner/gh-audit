@@ -227,14 +227,15 @@ func (c *Client) ListCommitPullRequests(ctx context.Context, org, repo, sha stri
 				continue
 			}
 			p := model.PullRequest{
-				Org:      org,
-				Repo:     repo,
-				Number:   pr.GetNumber(),
-				Title:    pr.GetTitle(),
-				Merged:   true,
-				HeadSHA:  pr.GetHead().GetSHA(),
-				MergedAt: pr.MergedAt.Time,
-				Href:     pr.GetHTMLURL(),
+				Org:        org,
+				Repo:       repo,
+				Number:     pr.GetNumber(),
+				Title:      pr.GetTitle(),
+				Merged:     true,
+				HeadSHA:    pr.GetHead().GetSHA(),
+				HeadBranch: pr.GetHead().GetRef(),
+				MergedAt:   pr.MergedAt.Time,
+				Href:       pr.GetHTMLURL(),
 			}
 			if pr.GetMergeCommitSHA() != "" {
 				p.MergeCommitSHA = pr.GetMergeCommitSHA()
@@ -370,6 +371,7 @@ func (c *Client) GetPullRequest(ctx context.Context, org, repo string, number in
 	}
 	if pr.GetHead() != nil {
 		p.HeadSHA = pr.GetHead().GetSHA()
+		p.HeadBranch = pr.GetHead().GetRef()
 	}
 	if pr.GetMergeCommitSHA() != "" {
 		p.MergeCommitSHA = pr.GetMergeCommitSHA()
@@ -386,8 +388,57 @@ func (c *Client) GetPullRequest(ctx context.Context, org, repo string, number in
 	return p, nil
 }
 
-// EnrichCommits fetches PRs, reviews, and check runs for a batch of commits via REST.
-// Each commit triggers: GET commit (stats), GET commit PRs, GET PR detail, GET reviews per PR, GET check runs per PR head.
+// ListPRCommits returns all commits on a pull request's feature branch as
+// regular Commit objects. These are stored in the commits table alongside
+// default-branch commits, distinguished by commit_branches entries.
+func (c *Client) ListPRCommits(ctx context.Context, org, repo string, prNumber int) ([]model.Commit, error) {
+	gh, err := c.ghClient(ctx, org, repo)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := &gogithub.ListOptions{PerPage: 100}
+	var all []model.Commit
+
+	for {
+		commits, resp, err := gh.PullRequests.ListCommits(ctx, org, repo, prNumber, opts)
+		if err != nil {
+			return nil, fmt.Errorf("listing PR commits %s/%s#%d page %d: %w", org, repo, prNumber, opts.Page, err)
+		}
+
+		for _, rc := range commits {
+			commit := model.Commit{
+				Org:  org,
+				Repo: repo,
+				SHA:  rc.GetSHA(),
+			}
+			if rc.GetAuthor() != nil {
+				commit.AuthorLogin = rc.GetAuthor().GetLogin()
+			}
+			if rc.GetCommitter() != nil {
+				commit.CommitterLogin = rc.GetCommitter().GetLogin()
+			}
+			if rc.GetCommit() != nil {
+				commit.Message = rc.GetCommit().GetMessage()
+				if rc.GetCommit().GetCommitter() != nil {
+					commit.CommittedAt = rc.GetCommit().GetCommitter().GetDate().Time
+				}
+			}
+			commit.ParentCount = len(rc.Parents)
+			all = append(all, commit)
+		}
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	return all, nil
+}
+
+// EnrichCommits fetches PRs, reviews, check runs, and PR branch commits for a batch of commits via REST.
+// Each commit triggers: GET commit, GET commit PRs, GET PR detail, GET reviews, GET check runs, GET PR commits.
 func (c *Client) EnrichCommits(ctx context.Context, org, repo string, shas []string) ([]model.EnrichmentResult, error) {
 	results := make([]model.EnrichmentResult, len(shas))
 
@@ -404,10 +455,10 @@ func (c *Client) EnrichCommits(ctx context.Context, org, repo string, shas []str
 
 		var allReviews []model.Review
 		var allCheckRuns []model.CheckRun
+		prBranchCommits := make(map[int][]model.Commit)
 		seenCheckRef := make(map[string]bool)
 
 		for j, pr := range prs {
-			// The /commits/{sha}/pulls endpoint omits merged_by — fetch full PR detail.
 			fullPR, err := c.GetPullRequest(ctx, org, repo, pr.Number)
 			if err != nil {
 				return nil, fmt.Errorf("commit %s PR #%d detail: %w", sha[:12], pr.Number, err)
@@ -416,6 +467,7 @@ func (c *Client) EnrichCommits(ctx context.Context, org, repo string, shas []str
 			if fullPR.HeadSHA != "" {
 				prs[j].HeadSHA = fullPR.HeadSHA
 			}
+			prs[j].HeadBranch = fullPR.HeadBranch
 
 			reviews, err := c.ListReviews(ctx, org, repo, pr.Number)
 			if err != nil {
@@ -431,13 +483,20 @@ func (c *Client) EnrichCommits(ctx context.Context, org, repo string, shas []str
 				}
 				allCheckRuns = append(allCheckRuns, runs...)
 			}
+
+			branchCommits, err := c.ListPRCommits(ctx, org, repo, pr.Number)
+			if err != nil {
+				return nil, fmt.Errorf("commit %s PR #%d pr-commits: %w", sha[:12], pr.Number, err)
+			}
+			prBranchCommits[pr.Number] = branchCommits
 		}
 
 		results[i] = model.EnrichmentResult{
-			Commit:    *detail,
-			PRs:       prs,
-			Reviews:   allReviews,
-			CheckRuns: allCheckRuns,
+			Commit:          *detail,
+			PRs:             prs,
+			Reviews:         allReviews,
+			CheckRuns:       allCheckRuns,
+			PRBranchCommits: prBranchCommits,
 		}
 	}
 

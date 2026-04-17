@@ -31,6 +31,14 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	for _, exempt := range exemptAuthors {
 		if strings.EqualFold(commit.AuthorLogin, exempt) {
 			result.IsExemptAuthor = true
+
+			// For squash merges, check if PR has non-exempt contributors.
+			// If so, the exempt shortcut must not apply — fall through to
+			// normal review checks so the human code gets audited.
+			if hasNonExemptPRContributors(enrichment, exemptAuthors) {
+				break
+			}
+
 			result.IsCompliant = true
 			result.Reasons = []string{"exempt: configured author"}
 			result.MergeStrategy = classifyMergeStrategy(commit, false)
@@ -65,11 +73,25 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	var bestApprovers []string
 	var bestSelfApproved bool
 	var bestStaleApproval bool
+	var bestPRCommitAuthors []string
 
 	for i := range enrichment.PRs {
 		pr := &enrichment.PRs[i]
 		prReasons := []string{}
 		prApprovers := []string{}
+
+		// Collect distinct PR commit authors for expanded self-approval checks
+		var prCommitAuthors []string
+		seen := make(map[string]bool)
+		for _, c := range enrichment.PRBranchCommits[pr.Number] {
+			if c.AuthorLogin != "" {
+				lower := strings.ToLower(c.AuthorLogin)
+				if !seen[lower] {
+					seen[lower] = true
+					prCommitAuthors = append(prCommitAuthors, c.AuthorLogin)
+				}
+			}
+		}
 
 		// Per-reviewer last-state tracking: for each reviewer on the final commit,
 		// keep only their most recent review. A DISMISSED review overrides an
@@ -92,7 +114,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		hasSelfApproval := false
 		for _, review := range latestByReviewer {
 			if review.State == "APPROVED" {
-				if isSelfApproval(review, commit, *pr) {
+				if isSelfApproval(review, commit, *pr, prCommitAuthors) {
 					hasSelfApproval = true
 				} else {
 					hasApprovalOnFinal = true
@@ -108,7 +130,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 				if review.PRNumber != pr.Number || review.CommitID == pr.HeadSHA {
 					continue
 				}
-				if review.State == "APPROVED" && !isSelfApproval(review, commit, *pr) {
+				if review.State == "APPROVED" && !isSelfApproval(review, commit, *pr, prCommitAuthors) {
 					hasStaleApproval = true
 					break
 				}
@@ -141,6 +163,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 			result.PRHref = pr.Href
 			result.Reasons = []string{"compliant"}
 			result.MergeStrategy = classifyMergeStrategy(commit, true)
+			result.PRCommitAuthorLogins = distinctPRBranchAuthors(enrichment.PRBranchCommits)
 			return result
 		}
 
@@ -151,6 +174,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 			bestApprovers = prApprovers
 			bestSelfApproved = hasSelfApproval && !hasApprovalOnFinal
 			bestStaleApproval = hasStaleApproval
+			bestPRCommitAuthors = prCommitAuthors
 		}
 	}
 
@@ -174,7 +198,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 			}
 		}
 		for _, review := range fallbackLatest {
-			if review.State == "APPROVED" && !isSelfApproval(review, commit, *bestPR) {
+			if review.State == "APPROVED" && !isSelfApproval(review, commit, *bestPR, bestPRCommitAuthors) {
 				result.HasFinalApproval = true
 				break
 			}
@@ -184,6 +208,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	}
 	result.Reasons = bestReasons
 	result.MergeStrategy = classifyMergeStrategy(commit, true)
+	result.PRCommitAuthorLogins = distinctPRBranchAuthors(enrichment.PRBranchCommits)
 	return result
 }
 
@@ -224,22 +249,18 @@ func evaluateRequiredChecks(checkRuns []model.CheckRun, headSHA string, required
 // isSelfApproval checks whether a review's author is the same person who
 // contributed code to the commit or PR. GitHub's merge bot logins
 // ("web-flow", "github") are excluded from the committer check.
-func isSelfApproval(review model.Review, commit model.Commit, pr model.PullRequest) bool {
+func isSelfApproval(review model.Review, commit model.Commit, pr model.PullRequest, prCommitAuthors []string) bool {
 	reviewer := strings.ToLower(review.ReviewerLogin)
 
-	// Ignore empty reviewer
 	if reviewer == "" {
 		return false
 	}
 
-	// Check against PR author
 	if strings.EqualFold(pr.AuthorLogin, reviewer) {
 		return true
 	}
 
-	// Check against commit author and committer, but skip merge commits —
-	// the commit author of a merge commit is the person who clicked merge,
-	// not a code contributor.
+	// Skip merge commits — the commit author is the person who clicked merge.
 	if commit.ParentCount <= 1 {
 		if strings.EqualFold(commit.AuthorLogin, reviewer) {
 			return true
@@ -251,14 +272,56 @@ func isSelfApproval(review model.Review, commit model.Commit, pr model.PullReque
 		}
 	}
 
-	// Check against co-authors
 	for _, ca := range commit.CoAuthors {
 		if strings.EqualFold(ca.Login, reviewer) {
 			return true
 		}
 	}
 
+	// For squash merges: check against all PR branch commit authors
+	for _, author := range prCommitAuthors {
+		if strings.EqualFold(author, reviewer) {
+			return true
+		}
+	}
+
 	return false
+}
+
+// hasNonExemptPRContributors returns true if any PR branch commit author is not
+// in the exempt list. Used to prevent exempt-author early return when a squash
+// merge contains human contributions.
+func hasNonExemptPRContributors(enrichment model.EnrichmentResult, exemptAuthors []string) bool {
+	if len(enrichment.PRBranchCommits) == 0 {
+		return false
+	}
+	exemptSet := make(map[string]bool, len(exemptAuthors))
+	for _, a := range exemptAuthors {
+		exemptSet[strings.ToLower(a)] = true
+	}
+	for _, commits := range enrichment.PRBranchCommits {
+		for _, c := range commits {
+			if c.AuthorLogin != "" && !exemptSet[strings.ToLower(c.AuthorLogin)] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// distinctPRBranchAuthors returns unique author logins from all PR branch commits.
+func distinctPRBranchAuthors(prBranchCommits map[int][]model.Commit) []string {
+	seen := make(map[string]bool)
+	var result []string
+	for _, commits := range prBranchCommits {
+		for _, c := range commits {
+			if c.AuthorLogin != "" && !seen[strings.ToLower(c.AuthorLogin)] {
+				seen[strings.ToLower(c.AuthorLogin)] = true
+				result = append(result, c.AuthorLogin)
+			}
+		}
+	}
+	return result
 }
 
 func classifyMergeStrategy(c model.Commit, hasPR bool) string {

@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS pull_requests (
 	title            TEXT,
 	merged           BOOLEAN,
 	head_sha         TEXT,
+	head_branch      TEXT,
 	merge_commit_sha TEXT,
 	author_login     TEXT,
 	merged_by_login  TEXT,
@@ -122,8 +123,9 @@ CREATE TABLE IF NOT EXISTS audit_results (
 	commit_href          TEXT,
 	pr_href              TEXT,
 	is_self_approved     BOOLEAN,
-	merge_strategy       TEXT,
-	audited_at           TIMESTAMP DEFAULT current_timestamp,
+	merge_strategy            TEXT,
+	pr_commit_author_logins   TEXT[],
+	audited_at                TIMESTAMP DEFAULT current_timestamp,
 	PRIMARY KEY (org, repo, sha)
 );
 `

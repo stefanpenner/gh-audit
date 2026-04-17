@@ -54,6 +54,7 @@ type CoAuthor struct {
 // HeadSHA is the tip of the PR's source branch — the last commit the
 // author pushed. MergeCommitSHA is the commit GitHub created on the
 // base branch when merged (merge, squash, or last rebase commit).
+// HeadBranch is the source branch ref (e.g. "feature/xyz").
 //
 //	Commit ──→ PullRequest ──→ Review
 //	                 └──→ EnrichmentResult
@@ -64,6 +65,7 @@ type PullRequest struct {
 	Title          string
 	Merged         bool
 	HeadSHA        string
+	HeadBranch     string
 	MergeCommitSHA string
 	AuthorLogin    string
 	MergedByLogin  string
@@ -130,8 +132,9 @@ type AuditResult struct {
 	OwnerApprovalCheck string // success, failure, missing
 	IsCompliant        bool
 	Reasons            []string
-	MergeStrategy      string // merge, squash, direct-push, initial
-	CommitHref         string
+	MergeStrategy         string // merge, squash, direct-push, initial
+	PRCommitAuthorLogins  []string
+	CommitHref            string
 	PRHref             string
 	AuditedAt          time.Time
 }
@@ -164,15 +167,20 @@ type RepoInfo struct {
 
 // An EnrichmentResult bundles a commit with all its related GitHub
 // data. Intermediate structure: after fetching a commit, the enricher
-// populates PRs, reviews, and check runs before persisting.
+// populates PRs, reviews, check runs, and PR branch commits before persisting.
+//
+// PRBranchCommits maps PR number → commits on that PR's feature branch.
+// Used to detect all contributors in squash-merged PRs where the squash
+// commit hides the original per-commit authorship.
 //
 //	Commit ──┐
 //	PullRequest ──→ EnrichmentResult ──→ AuditResult
 //	Review ──┘
 //	CheckRun ──┘
 type EnrichmentResult struct {
-	Commit    Commit
-	PRs       []PullRequest
-	Reviews   []Review
-	CheckRuns []CheckRun
+	Commit          Commit
+	PRs             []PullRequest
+	Reviews         []Review
+	CheckRuns       []CheckRun
+	PRBranchCommits map[int][]Commit // PR number → commits on the PR's branch
 }

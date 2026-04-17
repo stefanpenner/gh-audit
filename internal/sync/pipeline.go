@@ -264,21 +264,48 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 	var allPRs []model.PullRequest
 	var allReviews []model.Review
 	var allCheckRuns []model.CheckRun
+	var allBranchCommits []model.Commit
+	type branchCommitLink struct {
+		prNumber int
+		shas     []string
+		branch   string
+	}
 	type commitPRLink struct {
 		sha       string
 		prNumbers []int
 	}
 	var allLinks []commitPRLink
+	var allBranchLinks []branchCommitLink
 
 	seenPRs := make(map[string]bool)
 	seenReviews := make(map[string]bool)
 	seenCheckRuns := make(map[string]bool)
+	seenBranchCommits := make(map[string]bool)
 	for _, e := range allEnrichments {
 		for _, pr := range e.PRs {
 			key := fmt.Sprintf("%s/%s/%d", pr.Org, pr.Repo, pr.Number)
 			if !seenPRs[key] {
 				seenPRs[key] = true
 				allPRs = append(allPRs, pr)
+			}
+
+			if commits, ok := e.PRBranchCommits[pr.Number]; ok {
+				var branchSHAs []string
+				for _, c := range commits {
+					cKey := fmt.Sprintf("%s/%s/%s", c.Org, c.Repo, c.SHA)
+					if !seenBranchCommits[cKey] {
+						seenBranchCommits[cKey] = true
+						allBranchCommits = append(allBranchCommits, c)
+					}
+					branchSHAs = append(branchSHAs, c.SHA)
+				}
+				if len(branchSHAs) > 0 {
+					allBranchLinks = append(allBranchLinks, branchCommitLink{
+						prNumber: pr.Number,
+						shas:     branchSHAs,
+						branch:   pr.HeadBranch,
+					})
+				}
 			}
 		}
 		for _, r := range e.Reviews {
@@ -321,6 +348,23 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 		}
 		if err := p.store.UpsertCheckRuns(ctx, allCheckRuns); err != nil {
 			return fmt.Errorf("upserting check runs: %w", err)
+		}
+		if len(allBranchCommits) > 0 {
+			if err := p.store.UpsertCommits(ctx, allBranchCommits); err != nil {
+				return fmt.Errorf("upserting PR branch commits: %w", err)
+			}
+		}
+		for _, bl := range allBranchLinks {
+			if bl.branch != "" {
+				if err := p.store.UpsertCommitBranches(ctx, repo.Org, repo.Name, bl.shas, bl.branch); err != nil {
+					return fmt.Errorf("upserting PR branch commit branches: %w", err)
+				}
+			}
+			for _, sha := range bl.shas {
+				if err := p.store.UpsertCommitPRs(ctx, repo.Org, repo.Name, sha, []int{bl.prNumber}); err != nil {
+					return fmt.Errorf("upserting PR branch commit-PR links: %w", err)
+				}
+			}
 		}
 		for _, link := range allLinks {
 			if err := p.store.UpsertCommitPRs(ctx, repo.Org, repo.Name, link.sha, link.prNumbers); err != nil {

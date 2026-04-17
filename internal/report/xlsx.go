@@ -281,7 +281,7 @@ func detailHeaders() []string {
 		"Org", "Repo", "SHA", "PR #",
 		"Author", "Committer", "Merged By", "Approver",
 		"Approved?", "Self-Approved?", "Owner Approval",
-		"Compliant?", "Reasons", "Merge Strategy",
+		"Compliant?", "Reasons", "Merge Strategy", "PR Commit Authors",
 		"Date", "Branch", "Message",
 		"No PR", "Stale Approval", "Self-Approved", "No Approval",
 	}
@@ -576,17 +576,18 @@ func writeDetailRowWithHyperlinks(f *excelize.File, sheet string, row int, d Det
 	f.SetCellValue(sheet, cellName(12, row), compliantStr)
 	f.SetCellValue(sheet, cellName(13, row), d.Reasons)
 	f.SetCellValue(sheet, cellName(14, row), d.MergeStrategy)
+	f.SetCellValue(sheet, cellName(15, row), d.PRCommitAuthorLogins)
 
 	// Context: Date, Branch, Message
-	f.SetCellValue(sheet, cellName(15, row), dateStr)
-	f.SetCellValue(sheet, cellName(16, row), d.BranchName)
-	f.SetCellValue(sheet, cellName(17, row), msg)
+	f.SetCellValue(sheet, cellName(16, row), dateStr)
+	f.SetCellValue(sheet, cellName(17, row), d.BranchName)
+	f.SetCellValue(sheet, cellName(18, row), msg)
 
 	// Binary reason columns for filtering/sorting
-	f.SetCellValue(sheet, cellName(18, row), boolToYesNo(!d.HasPR))
-	f.SetCellValue(sheet, cellName(19, row), boolToYesNo(d.HasStaleApproval))
-	f.SetCellValue(sheet, cellName(20, row), boolToYesNo(d.IsSelfApproved))
-	f.SetCellValue(sheet, cellName(21, row), boolToYesNo(!d.HasFinalApproval && !d.IsSelfApproved))
+	f.SetCellValue(sheet, cellName(19, row), boolToYesNo(!d.HasPR))
+	f.SetCellValue(sheet, cellName(20, row), boolToYesNo(d.HasStaleApproval))
+	f.SetCellValue(sheet, cellName(21, row), boolToYesNo(d.IsSelfApproved))
+	f.SetCellValue(sheet, cellName(22, row), boolToYesNo(!d.HasFinalApproval && !d.IsSelfApproved))
 }
 
 // writeStaleApprovalsSheet writes commits where approval existed but was stale (pre-force-push).
@@ -748,7 +749,7 @@ func writeMultiplePRsSheet(f *excelize.File, sheet string, rows []MultiplePRRow,
 }
 
 func setDetailColumnWidths(f *excelize.File, sheet string, numCols int) {
-	widths := []float64{12, 25, 12, 10, 15, 15, 15, 20, 10, 14, 15, 10, 40, 14, 18, 20, 40, 8, 14, 14, 13}
+	widths := []float64{12, 25, 12, 10, 15, 15, 15, 20, 10, 14, 15, 10, 40, 14, 25, 18, 20, 40, 8, 14, 14, 13}
 	for i := 0; i < numCols && i < len(widths); i++ {
 		colName, _ := excelize.ColumnNumberToName(i + 1)
 		f.SetColWidth(sheet, colName, colName, widths[i])

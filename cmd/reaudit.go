@@ -108,6 +108,8 @@ func buildEnrichmentFromDB(ctx context.Context, dbConn *db.DB, org, repo, sha st
 	}
 	result.PRs = prs
 
+	result.PRBranchCommits = make(map[int][]model.Commit)
+
 	for _, pr := range prs {
 		reviews, err := dbConn.GetReviewsForPR(ctx, org, repo, pr.Number)
 		if err != nil {
@@ -121,6 +123,14 @@ func buildEnrichmentFromDB(ctx context.Context, dbConn *db.DB, org, repo, sha st
 				return result, err
 			}
 			result.CheckRuns = append(result.CheckRuns, runs...)
+		}
+
+		branchCommits, err := dbConn.GetCommitsForPR(ctx, org, repo, pr.Number)
+		if err != nil {
+			return result, err
+		}
+		if len(branchCommits) > 0 {
+			result.PRBranchCommits[pr.Number] = branchCommits
 		}
 	}
 

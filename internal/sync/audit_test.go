@@ -760,3 +760,184 @@ func TestEvaluateRequiredChecks(t *testing.T) {
 		})
 	}
 }
+
+func TestSquashMergePRCommitAuthors(t *testing.T) {
+	now := time.Now()
+
+	squashCommit := model.Commit{
+		Org:         "myorg",
+		Repo:        "myrepo",
+		SHA:         "squash1",
+		AuthorLogin: "dev-a",
+		CommittedAt: now,
+		Message:     "feat: squash merged",
+		ParentCount: 1,
+		Additions:   10,
+		Deletions:   5,
+		Href:        "https://github.com/myorg/myrepo/commit/squash1",
+	}
+
+	pr := model.PullRequest{
+		Org:         "myorg",
+		Repo:        "myrepo",
+		Number:      10,
+		HeadSHA:     "head1",
+		AuthorLogin: "dev-a",
+		Merged:      true,
+		Href:        "https://github.com/myorg/myrepo/pull/10",
+	}
+
+	approvalFromDevB := model.Review{
+		Org:            "myorg",
+		Repo:           "myrepo",
+		PRNumber:       10,
+		ReviewID:       1,
+		ReviewerLogin:  "dev-b",
+		State:          "APPROVED",
+		CommitID:       "head1",
+		SubmittedAt:    now,
+	}
+
+	approvalFromIndependent := model.Review{
+		Org:            "myorg",
+		Repo:           "myrepo",
+		PRNumber:       10,
+		ReviewID:       2,
+		ReviewerLogin:  "independent-reviewer",
+		State:          "APPROVED",
+		CommitID:       "head1",
+		SubmittedAt:    now,
+	}
+
+	t.Run("reviewer is PR commit author — self-approved", func(t *testing.T) {
+		enrichment := model.EnrichmentResult{
+			Commit:  squashCommit,
+			PRs:     []model.PullRequest{pr},
+			Reviews: []model.Review{approvalFromDevB},
+			PRBranchCommits: map[int][]model.Commit{
+				10: {
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a"},
+					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "dev-b"},
+				},
+			},
+		}
+
+		result := EvaluateCommit(squashCommit, enrichment, nil, nil)
+		assert.True(t, result.IsSelfApproved, "dev-b approved but also contributed commits")
+		assert.False(t, result.IsCompliant)
+		assert.Contains(t, result.PRCommitAuthorLogins, "dev-a")
+		assert.Contains(t, result.PRCommitAuthorLogins, "dev-b")
+	})
+
+	t.Run("reviewer is independent — compliant", func(t *testing.T) {
+		enrichment := model.EnrichmentResult{
+			Commit:  squashCommit,
+			PRs:     []model.PullRequest{pr},
+			Reviews: []model.Review{approvalFromIndependent},
+			PRBranchCommits: map[int][]model.Commit{
+				10: {
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a"},
+					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "dev-b"},
+				},
+			},
+		}
+
+		result := EvaluateCommit(squashCommit, enrichment, nil, nil)
+		assert.False(t, result.IsSelfApproved)
+		assert.True(t, result.IsCompliant)
+	})
+
+	t.Run("exempt bot + human contributor, no review — non-compliant", func(t *testing.T) {
+		botCommit := squashCommit
+		botCommit.AuthorLogin = "dependabot[bot]"
+
+		botPR := pr
+		botPR.AuthorLogin = "dependabot[bot]"
+
+		enrichment := model.EnrichmentResult{
+			Commit: botCommit,
+			PRs:    []model.PullRequest{botPR},
+			PRBranchCommits: map[int][]model.Commit{
+				10: {
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dependabot[bot]"},
+					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "human-dev"},
+				},
+			},
+		}
+
+		result := EvaluateCommit(botCommit, enrichment, []string{"dependabot[bot]"}, nil)
+		assert.True(t, result.IsExemptAuthor, "commit author is exempt")
+		assert.False(t, result.IsCompliant, "non-exempt contributor needs review")
+	})
+
+	t.Run("exempt bot + human contributor, reviewed — compliant", func(t *testing.T) {
+		botCommit := squashCommit
+		botCommit.AuthorLogin = "dependabot[bot]"
+
+		botPR := pr
+		botPR.AuthorLogin = "dependabot[bot]"
+
+		enrichment := model.EnrichmentResult{
+			Commit:  botCommit,
+			PRs:     []model.PullRequest{botPR},
+			Reviews: []model.Review{approvalFromIndependent},
+			PRBranchCommits: map[int][]model.Commit{
+				10: {
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dependabot[bot]"},
+					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "human-dev"},
+				},
+			},
+		}
+
+		result := EvaluateCommit(botCommit, enrichment, []string{"dependabot[bot]"}, nil)
+		assert.True(t, result.IsExemptAuthor)
+		assert.True(t, result.IsCompliant, "independent review covers human contributor")
+	})
+
+	t.Run("bot-only PR — stays compliant via exempt", func(t *testing.T) {
+		botCommit := squashCommit
+		botCommit.AuthorLogin = "dependabot[bot]"
+
+		botPR := pr
+		botPR.AuthorLogin = "dependabot[bot]"
+
+		enrichment := model.EnrichmentResult{
+			Commit: botCommit,
+			PRs:    []model.PullRequest{botPR},
+			PRBranchCommits: map[int][]model.Commit{
+				10: {
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dependabot[bot]"},
+				},
+			},
+		}
+
+		result := EvaluateCommit(botCommit, enrichment, []string{"dependabot[bot]"}, nil)
+		require.True(t, result.IsCompliant)
+		assert.True(t, result.IsExemptAuthor)
+		assert.Equal(t, []string{"exempt: configured author"}, result.Reasons)
+	})
+
+	t.Run("merge commit — PR commit authors still checked for self-approval", func(t *testing.T) {
+		mergeCommit := squashCommit
+		mergeCommit.ParentCount = 2
+		mergeCommit.AuthorLogin = "merger"
+
+		mergePR := pr
+		mergePR.AuthorLogin = "dev-a"
+
+		enrichment := model.EnrichmentResult{
+			Commit:  mergeCommit,
+			PRs:     []model.PullRequest{mergePR},
+			Reviews: []model.Review{approvalFromDevB},
+			PRBranchCommits: map[int][]model.Commit{
+				10: {
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a"},
+					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "dev-b"},
+				},
+			},
+		}
+
+		result := EvaluateCommit(mergeCommit, enrichment, nil, nil)
+		assert.True(t, result.IsSelfApproved, "dev-b is both reviewer and PR commit author")
+	})
+}
