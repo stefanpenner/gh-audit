@@ -17,6 +17,7 @@ const enrichBatchSize = 25
 // GitHubSource abstracts GitHub API access for listing repos and commits.
 type GitHubSource interface {
 	ListOrgRepos(ctx context.Context, org string) ([]model.RepoInfo, error)
+	GetRepo(ctx context.Context, org, repo string) (model.RepoInfo, error)
 	ListCommits(ctx context.Context, org, repo, branch string, since, until time.Time) ([]model.Commit, error)
 }
 
@@ -107,15 +108,14 @@ func (p *Pipeline) Run(ctx context.Context) error {
 
 	for _, orgCfg := range p.config.Orgs {
 		if len(orgCfg.Repos) > 0 {
-			// Explicit repos: skip API discovery, construct directly.
+			// Explicit repos: fetch metadata from API for each.
 			for _, repoName := range orgCfg.Repos {
+				info, err := p.source.GetRepo(ctx, orgCfg.Name, repoName)
+				if err != nil {
+					return fmt.Errorf("fetching repo %s/%s: %w", orgCfg.Name, repoName, err)
+				}
 				allRepos = append(allRepos, repoWithOrg{
-					repo: model.RepoInfo{
-						Org:           orgCfg.Name,
-						Name:          repoName,
-						FullName:      orgCfg.Name + "/" + repoName,
-						DefaultBranch: "main",
-					},
+					repo:   info,
 					orgCfg: orgCfg,
 				})
 			}

@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/stefanpenner/gh-audit/internal/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestEvaluateCommit(t *testing.T) {
@@ -583,34 +585,14 @@ func TestEvaluateCommit(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := EvaluateCommit(tt.commit, tt.enrichment, tt.exemptAuthors, tt.requiredChecks)
 
-			if result.IsCompliant != tt.wantCompliant {
-				t.Errorf("IsCompliant = %v, want %v (reasons: %v)", result.IsCompliant, tt.wantCompliant, result.Reasons)
-			}
-			if result.IsBot != tt.wantBot {
-				t.Errorf("IsBot = %v, want %v", result.IsBot, tt.wantBot)
-			}
-			if result.IsExemptAuthor != tt.wantExempt {
-				t.Errorf("IsExemptAuthor = %v, want %v", result.IsExemptAuthor, tt.wantExempt)
-			}
-			if result.IsEmptyCommit != tt.wantEmpty {
-				t.Errorf("IsEmptyCommit = %v, want %v", result.IsEmptyCommit, tt.wantEmpty)
-			}
-			if result.HasPR != tt.wantHasPR {
-				t.Errorf("HasPR = %v, want %v", result.HasPR, tt.wantHasPR)
-			}
-			if result.IsSelfApproved != tt.wantSelfApproved {
-				t.Errorf("IsSelfApproved = %v, want %v", result.IsSelfApproved, tt.wantSelfApproved)
-			}
+			assert.Equal(t, tt.wantCompliant, result.IsCompliant, "IsCompliant (reasons: %v)", result.Reasons)
+			assert.Equal(t, tt.wantBot, result.IsBot, "IsBot")
+			assert.Equal(t, tt.wantExempt, result.IsExemptAuthor, "IsExemptAuthor")
+			assert.Equal(t, tt.wantEmpty, result.IsEmptyCommit, "IsEmptyCommit")
+			assert.Equal(t, tt.wantHasPR, result.HasPR, "HasPR")
+			assert.Equal(t, tt.wantSelfApproved, result.IsSelfApproved, "IsSelfApproved")
 			if tt.wantReasons != nil {
-				if len(result.Reasons) != len(tt.wantReasons) {
-					t.Errorf("Reasons = %v, want %v", result.Reasons, tt.wantReasons)
-				} else {
-					for i, r := range tt.wantReasons {
-						if result.Reasons[i] != r {
-							t.Errorf("Reasons[%d] = %q, want %q", i, result.Reasons[i], r)
-						}
-					}
-				}
+				require.Equal(t, tt.wantReasons, result.Reasons, "Reasons")
 			}
 		})
 	}
@@ -709,9 +691,7 @@ func TestEvaluateRequiredChecks(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := evaluateRequiredChecks(checks, tt.headSHA, tt.requiredChecks)
-			if got != tt.want {
-				t.Errorf("evaluateRequiredChecks() = %q, want %q", got, tt.want)
-			}
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

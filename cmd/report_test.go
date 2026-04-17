@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/stefanpenner/gh-audit/internal/report"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseRepoFlag(t *testing.T) {
@@ -68,16 +70,10 @@ func TestParseRepoFlag(t *testing.T) {
 				Repos: repoFilters,
 			}
 
-			if opts.Org != tt.wantOpts.Org {
-				t.Errorf("Org = %q, want %q", opts.Org, tt.wantOpts.Org)
-			}
-			if len(opts.Repos) != len(tt.wantOpts.Repos) {
-				t.Fatalf("len(Repos) = %d, want %d", len(opts.Repos), len(tt.wantOpts.Repos))
-			}
+			assert.Equal(t, tt.wantOpts.Org, opts.Org)
+			require.Len(t, opts.Repos, len(tt.wantOpts.Repos))
 			for i, rf := range opts.Repos {
-				if rf != tt.wantOpts.Repos[i] {
-					t.Errorf("Repos[%d] = %+v, want %+v", i, rf, tt.wantOpts.Repos[i])
-				}
+				assert.Equal(t, tt.wantOpts.Repos[i], rf, "Repos[%d]", i)
 			}
 		})
 	}

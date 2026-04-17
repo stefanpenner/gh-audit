@@ -13,6 +13,8 @@ import (
 	"time"
 
 	_ "github.com/marcboeker/go-duckdb"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -126,9 +128,7 @@ CREATE TABLE IF NOT EXISTS audit_results (
 func setupTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("duckdb", "")
-	if err != nil {
-		t.Fatalf("opening duckdb: %v", err)
-	}
+	require.NoError(t, err, "opening duckdb")
 	t.Cleanup(func() { db.Close() })
 
 	for _, stmt := range strings.Split(schemaDDL, ";") {
@@ -136,9 +136,8 @@ func setupTestDB(t *testing.T) *sql.DB {
 		if stmt == "" {
 			continue
 		}
-		if _, err := db.Exec(stmt); err != nil {
-			t.Fatalf("schema exec: %v\nSQL: %s", err, stmt)
-		}
+		_, err := db.Exec(stmt)
+		require.NoError(t, err, "schema exec: SQL: %s", stmt)
 	}
 
 	return db
@@ -150,32 +149,41 @@ func insertCommit(t *testing.T, db *sql.DB, org, repo, sha, author string, commi
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		org, repo, sha, author, committedAt, "commit "+sha, 1, additions, deletions,
 		fmt.Sprintf("https://github.com/%s/%s/commit/%s", org, repo, sha))
-	if err != nil {
-		t.Fatalf("insert commit: %v", err)
-	}
+	require.NoError(t, err, "insert commit")
+}
+
+type auditResultOpts struct {
+	isBot, isExempt, isEmpty, hasPR, hasApproval, isCompliant, isSelfApproved bool
+	prNumber                                                                  int
+	approvers                                                                 []string
+	reasons                                                                   []string
 }
 
 func insertAuditResult(t *testing.T, db *sql.DB, org, repo, sha string, isBot, isEmpty, hasPR, hasApproval, isCompliant bool, prNumber int, approvers []string, reasons []string) {
 	t.Helper()
-	insertAuditResultFull(t, db, org, repo, sha, isBot, isEmpty, hasPR, hasApproval, isCompliant, false, prNumber, approvers, reasons)
+	insertAuditResultFull(t, db, org, repo, sha, auditResultOpts{
+		isBot: isBot, isExempt: isBot, isEmpty: isEmpty,
+		hasPR: hasPR, hasApproval: hasApproval, isCompliant: isCompliant,
+		prNumber: prNumber, approvers: approvers, reasons: reasons,
+	})
 }
 
-func insertAuditResultFull(t *testing.T, db *sql.DB, org, repo, sha string, isBot, isEmpty, hasPR, hasApproval, isCompliant, isSelfApproved bool, prNumber int, approvers []string, reasons []string) {
+func insertAuditResultFull(t *testing.T, db *sql.DB, org, repo, sha string, opts auditResultOpts) {
 	t.Helper()
 
 	approverExpr := "list_value()"
-	if len(approvers) > 0 {
-		quoted := make([]string, len(approvers))
-		for i, a := range approvers {
+	if len(opts.approvers) > 0 {
+		quoted := make([]string, len(opts.approvers))
+		for i, a := range opts.approvers {
 			quoted[i] = fmt.Sprintf("'%s'", a)
 		}
 		approverExpr = fmt.Sprintf("list_value(%s)", strings.Join(quoted, ", "))
 	}
 
 	reasonExpr := "list_value()"
-	if len(reasons) > 0 {
-		quoted := make([]string, len(reasons))
-		for i, r := range reasons {
+	if len(opts.reasons) > 0 {
+		quoted := make([]string, len(opts.reasons))
+		for i, r := range opts.reasons {
 			quoted[i] = fmt.Sprintf("'%s'", r)
 		}
 		reasonExpr = fmt.Sprintf("list_value(%s)", strings.Join(quoted, ", "))
@@ -185,23 +193,19 @@ func insertAuditResultFull(t *testing.T, db *sql.DB, org, repo, sha string, isBo
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, %s, ?, ?, %s, ?, ?, ?)`, approverExpr, reasonExpr)
 
 	_, err := db.Exec(q,
-		org, repo, sha, isEmpty, isBot, isBot, hasPR, prNumber, hasApproval,
-		"success", isCompliant,
+		org, repo, sha, opts.isEmpty, opts.isBot, opts.isExempt, opts.hasPR, opts.prNumber, opts.hasApproval,
+		"success", opts.isCompliant,
 		fmt.Sprintf("https://github.com/%s/%s/commit/%s", org, repo, sha),
-		fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, prNumber),
-		isSelfApproved)
-	if err != nil {
-		t.Fatalf("insert audit result: %v", err)
-	}
+		fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, opts.prNumber),
+		opts.isSelfApproved)
+	require.NoError(t, err, "insert audit result")
 }
 
 func insertCommitBranch(t *testing.T, db *sql.DB, org, repo, sha, branch string) {
 	t.Helper()
 	_, err := db.Exec(`INSERT INTO commit_branches (org, repo, sha, branch) VALUES (?, ?, ?, ?)`,
 		org, repo, sha, branch)
-	if err != nil {
-		t.Fatalf("insert commit branch: %v", err)
-	}
+	require.NoError(t, err, "insert commit branch")
 }
 
 func TestGetSummaryCorrectCounts(t *testing.T) {
@@ -220,26 +224,60 @@ func TestGetSummaryCorrectCounts(t *testing.T) {
 
 	r := New(db)
 	summary, err := r.GetSummary(context.Background(), ReportOpts{})
-	if err != nil {
-		t.Fatalf("GetSummary: %v", err)
-	}
-
-	if len(summary) != 2 {
-		t.Fatalf("expected 2 summary rows, got %d", len(summary))
-	}
+	require.NoError(t, err, "GetSummary")
+	require.Len(t, summary, 2)
 
 	// repo1: 3 total, 2 compliant, 1 non-compliant, 0 bots, 1 empty
 	s := summary[0]
-	if s.TotalCommits != 3 || s.CompliantCount != 2 || s.NonCompliantCount != 1 || s.EmptyCount != 1 {
-		t.Errorf("repo1 summary: total=%d, compliant=%d, non=%d, empty=%d",
-			s.TotalCommits, s.CompliantCount, s.NonCompliantCount, s.EmptyCount)
-	}
+	assert.Equal(t, 3, s.TotalCommits, "repo1 total")
+	assert.Equal(t, 2, s.CompliantCount, "repo1 compliant")
+	assert.Equal(t, 1, s.NonCompliantCount, "repo1 non-compliant")
+	assert.Equal(t, 1, s.EmptyCount, "repo1 empty")
 
 	// repo2: 1 total, 1 compliant
 	s = summary[1]
-	if s.TotalCommits != 1 || s.CompliantCount != 1 {
-		t.Errorf("repo2 summary: total=%d, compliant=%d", s.TotalCommits, s.CompliantCount)
-	}
+	assert.Equal(t, 1, s.TotalCommits, "repo2 total")
+	assert.Equal(t, 1, s.CompliantCount, "repo2 compliant")
+}
+
+func TestGetSummaryPartitionInvariant(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	// Mix of overlapping categories:
+	// exempt bot (compliant + bot + exempt), empty (compliant + empty),
+	// non-exempt bot (non-compliant + bot), self-approved (non-compliant + self-approved),
+	// normal compliant
+	insertCommit(t, db, "org1", "repo1", "aaa", "dependabot[bot]", now, 5, 2)
+	insertCommit(t, db, "org1", "repo1", "bbb", "dev1", now, 0, 0)
+	insertCommit(t, db, "org1", "repo1", "ccc", "ci-bot[bot]", now, 3, 1)
+	insertCommit(t, db, "org1", "repo1", "ddd", "dev2", now, 10, 5)
+	insertCommit(t, db, "org1", "repo1", "eee", "dev3", now, 7, 3)
+
+	insertAuditResultFull(t, db, "org1", "repo1", "aaa", auditResultOpts{isBot: true, isExempt: true, isCompliant: true, reasons: []string{"exempt: configured author"}})
+	insertAuditResultFull(t, db, "org1", "repo1", "bbb", auditResultOpts{isEmpty: true, isCompliant: true, reasons: []string{"empty commit"}})
+	insertAuditResultFull(t, db, "org1", "repo1", "ccc", auditResultOpts{isBot: true, reasons: []string{"no associated pull request"}})
+	insertAuditResultFull(t, db, "org1", "repo1", "ddd", auditResultOpts{hasPR: true, hasApproval: true, isSelfApproved: true, prNumber: 1, approvers: []string{"dev2"}, reasons: []string{"self-approved"}})
+	insertAuditResultFull(t, db, "org1", "repo1", "eee", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: true, prNumber: 2, approvers: []string{"reviewer1"}, reasons: []string{"compliant"}})
+
+	r := New(db)
+	summary, err := r.GetSummary(context.Background(), ReportOpts{})
+	require.NoError(t, err, "GetSummary")
+	require.Len(t, summary, 1)
+	s := summary[0]
+
+	// Primary partition: Compliant + Non-Compliant must equal Total
+	assert.Equal(t, s.TotalCommits, s.CompliantCount+s.NonCompliantCount, "partition broken")
+
+	assert.Equal(t, 5, s.TotalCommits, "total")
+	assert.Equal(t, 3, s.CompliantCount, "compliant (exempt bot + empty + normal)")
+	assert.Equal(t, 2, s.NonCompliantCount, "non-compliant (non-exempt bot + self-approved)")
+
+	// Annotation counts overlap with primary partition
+	assert.Equal(t, 2, s.BotCount, "bots (one compliant, one not)")
+	assert.Equal(t, 1, s.ExemptCount, "exempt")
+	assert.Equal(t, 1, s.EmptyCount, "empty")
+	assert.Equal(t, 1, s.SelfApprovedCount, "self_approved")
 }
 
 func TestGetSummaryRespectsSinceUntil(t *testing.T) {
@@ -258,16 +296,9 @@ func TestGetSummaryRespectsSinceUntil(t *testing.T) {
 	summary, err := r.GetSummary(context.Background(), ReportOpts{
 		Since: time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC),
 	})
-	if err != nil {
-		t.Fatalf("GetSummary: %v", err)
-	}
-
-	if len(summary) != 1 {
-		t.Fatalf("expected 1 summary row, got %d", len(summary))
-	}
-	if summary[0].TotalCommits != 1 {
-		t.Errorf("expected 1 commit, got %d", summary[0].TotalCommits)
-	}
+	require.NoError(t, err, "GetSummary")
+	require.Len(t, summary, 1)
+	assert.Equal(t, 1, summary[0].TotalCommits)
 }
 
 func TestGetSummaryRespectsOrgRepoFilters(t *testing.T) {
@@ -282,16 +313,9 @@ func TestGetSummaryRespectsOrgRepoFilters(t *testing.T) {
 
 	r := New(db)
 	summary, err := r.GetSummary(context.Background(), ReportOpts{Org: "org1"})
-	if err != nil {
-		t.Fatalf("GetSummary: %v", err)
-	}
-
-	if len(summary) != 1 {
-		t.Fatalf("expected 1 summary row, got %d", len(summary))
-	}
-	if summary[0].Org != "org1" {
-		t.Errorf("expected org1, got %s", summary[0].Org)
-	}
+	require.NoError(t, err, "GetSummary")
+	require.Len(t, summary, 1)
+	assert.Equal(t, "org1", summary[0].Org)
 }
 
 func TestGetSummaryMultiRepoFilter(t *testing.T) {
@@ -315,21 +339,15 @@ func TestGetSummaryMultiRepoFilter(t *testing.T) {
 			{Org: "rails", Repo: "rails"},
 		},
 	})
-	if err != nil {
-		t.Fatalf("GetSummary: %v", err)
-	}
-
-	if len(summary) != 2 {
-		t.Fatalf("expected 2 summary rows, got %d", len(summary))
-	}
+	require.NoError(t, err, "GetSummary")
+	require.Len(t, summary, 2)
 
 	orgs := map[string]bool{}
 	for _, s := range summary {
 		orgs[s.Org+"/"+s.Repo] = true
 	}
-	if !orgs["nodejs/node"] || !orgs["rails/rails"] {
-		t.Errorf("expected nodejs/node and rails/rails, got %v", orgs)
-	}
+	assert.True(t, orgs["nodejs/node"], "expected nodejs/node in results")
+	assert.True(t, orgs["rails/rails"], "expected rails/rails in results")
 
 	// Verify details also filtered
 	details, err := r.GetDetails(context.Background(), ReportOpts{
@@ -337,15 +355,10 @@ func TestGetSummaryMultiRepoFilter(t *testing.T) {
 			{Org: "nodejs", Repo: "node"},
 		},
 	})
-	if err != nil {
-		t.Fatalf("GetDetails: %v", err)
-	}
-	if len(details) != 1 {
-		t.Fatalf("expected 1 detail row, got %d", len(details))
-	}
-	if details[0].Org != "nodejs" || details[0].Repo != "node" {
-		t.Errorf("expected nodejs/node, got %s/%s", details[0].Org, details[0].Repo)
-	}
+	require.NoError(t, err, "GetDetails")
+	require.Len(t, details, 1)
+	assert.Equal(t, "nodejs", details[0].Org)
+	assert.Equal(t, "node", details[0].Repo)
 }
 
 func TestGetDetailsReturnsAllFields(t *testing.T) {
@@ -357,30 +370,18 @@ func TestGetDetailsReturnsAllFields(t *testing.T) {
 
 	r := New(db)
 	details, err := r.GetDetails(context.Background(), ReportOpts{})
-	if err != nil {
-		t.Fatalf("GetDetails: %v", err)
-	}
-
-	if len(details) != 1 {
-		t.Fatalf("expected 1 detail row, got %d", len(details))
-	}
+	require.NoError(t, err, "GetDetails")
+	require.Len(t, details, 1)
 
 	d := details[0]
-	if d.Org != "org1" || d.Repo != "repo1" || d.SHA != "aaa" {
-		t.Errorf("wrong identity: %s/%s/%s", d.Org, d.Repo, d.SHA)
-	}
-	if d.AuthorLogin != "dev1" {
-		t.Errorf("author = %s, want dev1", d.AuthorLogin)
-	}
-	if d.PRNumber != 42 {
-		t.Errorf("pr_number = %d, want 42", d.PRNumber)
-	}
-	if !d.IsCompliant {
-		t.Error("expected compliant")
-	}
-	if !strings.Contains(d.ApproverLogins, "reviewer1") || !strings.Contains(d.ApproverLogins, "reviewer2") {
-		t.Errorf("approvers = %s, expected reviewer1 and reviewer2", d.ApproverLogins)
-	}
+	assert.Equal(t, "org1", d.Org)
+	assert.Equal(t, "repo1", d.Repo)
+	assert.Equal(t, "aaa", d.SHA)
+	assert.Equal(t, "dev1", d.AuthorLogin)
+	assert.Equal(t, 42, d.PRNumber)
+	assert.True(t, d.IsCompliant)
+	assert.Contains(t, d.ApproverLogins, "reviewer1")
+	assert.Contains(t, d.ApproverLogins, "reviewer2")
 }
 
 func TestGetDetailsOnlyFailuresFilter(t *testing.T) {
@@ -395,16 +396,9 @@ func TestGetDetailsOnlyFailuresFilter(t *testing.T) {
 
 	r := New(db)
 	details, err := r.GetDetails(context.Background(), ReportOpts{OnlyFailures: true})
-	if err != nil {
-		t.Fatalf("GetDetails: %v", err)
-	}
-
-	if len(details) != 1 {
-		t.Fatalf("expected 1 detail row, got %d", len(details))
-	}
-	if details[0].SHA != "bbb" {
-		t.Errorf("expected SHA bbb, got %s", details[0].SHA)
-	}
+	require.NoError(t, err, "GetDetails")
+	require.Len(t, details, 1)
+	assert.Equal(t, "bbb", details[0].SHA)
 }
 
 func TestFormatTable(t *testing.T) {
@@ -420,20 +414,12 @@ func TestFormatTable(t *testing.T) {
 
 	var buf bytes.Buffer
 	err := r.FormatTable(&buf, summary, details)
-	if err != nil {
-		t.Fatalf("FormatTable: %v", err)
-	}
+	require.NoError(t, err, "FormatTable")
 
 	output := buf.String()
-	if !strings.Contains(output, "SUMMARY") {
-		t.Error("missing SUMMARY header")
-	}
-	if !strings.Contains(output, "DETAILS") {
-		t.Error("missing DETAILS header")
-	}
-	if !strings.Contains(output, "80.0%") {
-		t.Error("missing compliance percentage")
-	}
+	assert.Contains(t, output, "SUMMARY")
+	assert.Contains(t, output, "DETAILS")
+	assert.Contains(t, output, "80.0%")
 }
 
 func TestFormatCSV(t *testing.T) {
@@ -446,21 +432,13 @@ func TestFormatCSV(t *testing.T) {
 
 	var buf bytes.Buffer
 	err := r.FormatCSV(&buf, details)
-	if err != nil {
-		t.Fatalf("FormatCSV: %v", err)
-	}
+	require.NoError(t, err, "FormatCSV")
 
 	reader := csv.NewReader(&buf)
 	records, err := reader.ReadAll()
-	if err != nil {
-		t.Fatalf("parsing CSV: %v", err)
-	}
-	if len(records) != 2 { // header + 1 row
-		t.Fatalf("expected 2 records, got %d", len(records))
-	}
-	if records[0][0] != "Org" {
-		t.Errorf("expected header Org, got %s", records[0][0])
-	}
+	require.NoError(t, err, "parsing CSV")
+	require.Len(t, records, 2) // header + 1 row
+	assert.Equal(t, "Org", records[0][0])
 }
 
 func TestFormatJSON(t *testing.T) {
@@ -476,20 +454,12 @@ func TestFormatJSON(t *testing.T) {
 
 	var buf bytes.Buffer
 	err := r.FormatJSON(&buf, summary, details)
-	if err != nil {
-		t.Fatalf("FormatJSON: %v", err)
-	}
+	require.NoError(t, err, "FormatJSON")
 
 	var result map[string]json.RawMessage
-	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-	if _, ok := result["summary"]; !ok {
-		t.Error("missing summary key")
-	}
-	if _, ok := result["details"]; !ok {
-		t.Error("missing details key")
-	}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &result), "invalid JSON")
+	assert.Contains(t, result, "summary")
+	assert.Contains(t, result, "details")
 }
 
 func TestGenerateXLSXCreatesFile(t *testing.T) {
@@ -505,18 +475,11 @@ func TestGenerateXLSXCreatesFile(t *testing.T) {
 
 	tmpFile := t.TempDir() + "/test-report.xlsx"
 	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
-	if err != nil {
-		t.Fatalf("GenerateXLSX: %v", err)
-	}
+	require.NoError(t, err, "GenerateXLSX")
 
-	// Verify file exists
 	info, err := os.Stat(tmpFile)
-	if err != nil {
-		t.Fatalf("file not created: %v", err)
-	}
-	if info.Size() == 0 {
-		t.Error("file is empty")
-	}
+	require.NoError(t, err, "file not created")
+	assert.Greater(t, info.Size(), int64(0))
 }
 
 func TestGenerateXLSXLargeDataset(t *testing.T) {
@@ -539,17 +502,11 @@ func TestGenerateXLSXLargeDataset(t *testing.T) {
 
 	tmpFile := t.TempDir() + "/test-large-report.xlsx"
 	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
-	if err != nil {
-		t.Fatalf("GenerateXLSX with 1000 rows: %v", err)
-	}
+	require.NoError(t, err, "GenerateXLSX with 1000 rows")
 
 	info, err := os.Stat(tmpFile)
-	if err != nil {
-		t.Fatalf("file not created: %v", err)
-	}
-	if info.Size() == 0 {
-		t.Error("file is empty")
-	}
+	require.NoError(t, err, "file not created")
+	assert.Greater(t, info.Size(), int64(0))
 }
 
 func TestGenerateXLSXHasFiveSheets(t *testing.T) {
@@ -561,7 +518,7 @@ func TestGenerateXLSXHasFiveSheets(t *testing.T) {
 	insertCommit(t, db, "org1", "repo1", "ccc333ccc", "bot1", now, 0, 0)
 	insertCommitBranch(t, db, "org1", "repo1", "aaa111aaa", "main")
 
-	insertAuditResultFull(t, db, "org1", "repo1", "aaa111aaa", false, false, true, true, true, true, 1, []string{"dev1"}, []string{"compliant"})
+	insertAuditResultFull(t, db, "org1", "repo1", "aaa111aaa", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: true, isSelfApproved: true, prNumber: 1, approvers: []string{"dev1"}, reasons: []string{"compliant"}})
 	insertAuditResult(t, db, "org1", "repo1", "bbb222bbb", false, false, false, false, false, 0, nil, []string{"no associated pull request"})
 	insertAuditResult(t, db, "org1", "repo1", "ccc333ccc", false, true, false, false, true, 0, nil, []string{"empty commit"})
 
@@ -569,25 +526,17 @@ func TestGenerateXLSXHasFiveSheets(t *testing.T) {
 
 	tmpFile := t.TempDir() + "/test-five-sheets.xlsx"
 	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
-	if err != nil {
-		t.Fatalf("GenerateXLSX: %v", err)
-	}
+	require.NoError(t, err, "GenerateXLSX")
 
 	xf, err := excelize.OpenFile(tmpFile)
-	if err != nil {
-		t.Fatalf("opening xlsx: %v", err)
-	}
+	require.NoError(t, err, "opening xlsx")
 	defer xf.Close()
 
 	sheets := xf.GetSheetList()
 	expected := []string{"Summary", "All Commits", "Non-Compliant", "Exemptions", "Self-Approved"}
-	if len(sheets) != len(expected) {
-		t.Fatalf("expected %d sheets, got %d: %v", len(expected), len(sheets), sheets)
-	}
+	require.Len(t, sheets, len(expected))
 	for i, name := range expected {
-		if sheets[i] != name {
-			t.Errorf("sheet %d: expected %q, got %q", i, name, sheets[i])
-		}
+		assert.Equal(t, name, sheets[i], "sheet %d", i)
 	}
 }
 
@@ -598,36 +547,23 @@ func TestSelfApprovedSheetContainsOnlySelfApproved(t *testing.T) {
 	insertCommit(t, db, "org1", "repo1", "selfaaa11", "dev1", now, 10, 5)
 	insertCommit(t, db, "org1", "repo1", "normalbbb", "dev2", now, 10, 5)
 
-	// Self-approved commit
-	insertAuditResultFull(t, db, "org1", "repo1", "selfaaa11", false, false, true, true, true, true, 1, []string{"dev1"}, []string{"self-approved"})
-	// Normal commit
-	insertAuditResultFull(t, db, "org1", "repo1", "normalbbb", false, false, true, true, true, false, 2, []string{"reviewer1"}, []string{"compliant"})
+	insertAuditResultFull(t, db, "org1", "repo1", "selfaaa11", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: true, isSelfApproved: true, prNumber: 1, approvers: []string{"dev1"}, reasons: []string{"self-approved"}})
+	insertAuditResultFull(t, db, "org1", "repo1", "normalbbb", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: true, prNumber: 2, approvers: []string{"reviewer1"}, reasons: []string{"compliant"}})
 
 	r := New(db)
 
 	tmpFile := t.TempDir() + "/test-self-approved.xlsx"
 	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
-	if err != nil {
-		t.Fatalf("GenerateXLSX: %v", err)
-	}
+	require.NoError(t, err, "GenerateXLSX")
 
 	xf, err := excelize.OpenFile(tmpFile)
-	if err != nil {
-		t.Fatalf("opening xlsx: %v", err)
-	}
+	require.NoError(t, err, "opening xlsx")
 	defer xf.Close()
 
 	rows, err := xf.GetRows("Self-Approved")
-	if err != nil {
-		t.Fatalf("getting Self-Approved rows: %v", err)
-	}
+	require.NoError(t, err, "getting Self-Approved rows")
+	require.Len(t, rows, 2) // 1 header + 1 data row
 
-	// 1 header + 1 data row
-	if len(rows) != 2 {
-		t.Fatalf("expected 2 rows (header + 1 data), got %d", len(rows))
-	}
-
-	// Check that the self-approved commit SHA prefix is present
 	found := false
 	for _, cell := range rows[1] {
 		if cell == "selfaaa1" {
@@ -635,9 +571,7 @@ func TestSelfApprovedSheetContainsOnlySelfApproved(t *testing.T) {
 			break
 		}
 	}
-	if !found {
-		t.Errorf("expected self-approved SHA prefix 'selfaaa1' in row, got: %v", rows[1])
-	}
+	assert.True(t, found, "expected self-approved SHA prefix 'selfaaa1' in row, got: %v", rows[1])
 }
 
 func TestSummarySelfApprovedCount(t *testing.T) {
@@ -647,21 +581,14 @@ func TestSummarySelfApprovedCount(t *testing.T) {
 	insertCommit(t, db, "org1", "repo1", "aaa111aaa", "dev1", now, 10, 5)
 	insertCommit(t, db, "org1", "repo1", "bbb222bbb", "dev2", now, 10, 5)
 
-	insertAuditResultFull(t, db, "org1", "repo1", "aaa111aaa", false, false, true, true, true, true, 1, []string{"dev1"}, []string{"compliant"})
-	insertAuditResultFull(t, db, "org1", "repo1", "bbb222bbb", false, false, true, true, true, false, 2, []string{"reviewer1"}, []string{"compliant"})
+	insertAuditResultFull(t, db, "org1", "repo1", "aaa111aaa", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: true, isSelfApproved: true, prNumber: 1, approvers: []string{"dev1"}, reasons: []string{"compliant"}})
+	insertAuditResultFull(t, db, "org1", "repo1", "bbb222bbb", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: true, prNumber: 2, approvers: []string{"reviewer1"}, reasons: []string{"compliant"}})
 
 	r := New(db)
 	summary, err := r.GetSummary(context.Background(), ReportOpts{})
-	if err != nil {
-		t.Fatalf("GetSummary: %v", err)
-	}
-
-	if len(summary) != 1 {
-		t.Fatalf("expected 1 summary row, got %d", len(summary))
-	}
-	if summary[0].SelfApprovedCount != 1 {
-		t.Errorf("expected SelfApprovedCount=1, got %d", summary[0].SelfApprovedCount)
-	}
+	require.NoError(t, err, "GetSummary")
+	require.Len(t, summary, 1)
+	assert.Equal(t, 1, summary[0].SelfApprovedCount)
 }
 
 func TestHyperlinksOnNonStreamingSheets(t *testing.T) {
@@ -675,36 +602,22 @@ func TestHyperlinksOnNonStreamingSheets(t *testing.T) {
 
 	tmpFile := t.TempDir() + "/test-hyperlinks.xlsx"
 	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
-	if err != nil {
-		t.Fatalf("GenerateXLSX: %v", err)
-	}
+	require.NoError(t, err, "GenerateXLSX")
 
 	xf, err := excelize.OpenFile(tmpFile)
-	if err != nil {
-		t.Fatalf("opening xlsx: %v", err)
-	}
+	require.NoError(t, err, "opening xlsx")
 	defer xf.Close()
 
 	// Non-Compliant sheet should have a hyperlink on SHA cell (C2)
 	val, err := xf.GetCellValue("Non-Compliant", "C2")
-	if err != nil {
-		t.Fatalf("getting cell C2: %v", err)
-	}
-	if val != "abc12345" {
-		t.Errorf("expected SHA display 'abc12345', got %q", val)
-	}
+	require.NoError(t, err, "getting cell C2")
+	assert.Equal(t, "abc12345", val)
 
 	// Check hyperlink exists
 	hasLink, target, err := xf.GetCellHyperLink("Non-Compliant", "C2")
-	if err != nil {
-		t.Fatalf("getting hyperlink: %v", err)
-	}
-	if !hasLink {
-		t.Error("expected hyperlink on SHA cell C2 in Non-Compliant sheet")
-	}
-	if target != "https://github.com/org1/repo1/commit/abc12345678" {
-		t.Errorf("unexpected hyperlink target: %s", target)
-	}
+	require.NoError(t, err, "getting hyperlink")
+	assert.True(t, hasLink, "expected hyperlink on SHA cell C2 in Non-Compliant sheet")
+	assert.Equal(t, "https://github.com/org1/repo1/commit/abc12345678", target)
 }
 
 func TestEmptyNonCompliantSheetStillCreated(t *testing.T) {
@@ -719,36 +632,19 @@ func TestEmptyNonCompliantSheetStillCreated(t *testing.T) {
 
 	tmpFile := t.TempDir() + "/test-empty-nc.xlsx"
 	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
-	if err != nil {
-		t.Fatalf("GenerateXLSX: %v", err)
-	}
+	require.NoError(t, err, "GenerateXLSX")
 
 	xf, err := excelize.OpenFile(tmpFile)
-	if err != nil {
-		t.Fatalf("opening xlsx: %v", err)
-	}
+	require.NoError(t, err, "opening xlsx")
 	defer xf.Close()
 
 	sheets := xf.GetSheetList()
-	found := false
-	for _, s := range sheets {
-		if s == "Non-Compliant" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("Non-Compliant sheet should exist even with zero non-compliant rows")
-	}
+	assert.Contains(t, sheets, "Non-Compliant", "Non-Compliant sheet should exist even with zero non-compliant rows")
 
 	// Should have header row only
 	rows, err := xf.GetRows("Non-Compliant")
-	if err != nil {
-		t.Fatalf("getting Non-Compliant rows: %v", err)
-	}
-	if len(rows) != 1 {
-		t.Errorf("expected 1 row (header only) in empty Non-Compliant sheet, got %d", len(rows))
-	}
+	require.NoError(t, err, "getting Non-Compliant rows")
+	assert.Len(t, rows, 1, "expected header only in empty Non-Compliant sheet")
 }
 
 func TestDetailRowMergedByLogin(t *testing.T) {
@@ -763,22 +659,13 @@ func TestDetailRowMergedByLogin(t *testing.T) {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		"org1", "repo1", 42, "fix stuff", true, "aaa111aaa", "alice", "carol", now,
 		"https://github.com/org1/repo1/pull/42")
-	if err != nil {
-		t.Fatalf("insert PR: %v", err)
-	}
+	require.NoError(t, err, "insert PR")
 
 	r := New(db)
 	details, err := r.GetDetails(context.Background(), ReportOpts{})
-	if err != nil {
-		t.Fatalf("GetDetails: %v", err)
-	}
-
-	if len(details) != 1 {
-		t.Fatalf("expected 1 detail row, got %d", len(details))
-	}
-	if details[0].MergedByLogin != "carol" {
-		t.Errorf("MergedByLogin = %q, want %q", details[0].MergedByLogin, "carol")
-	}
+	require.NoError(t, err, "GetDetails")
+	require.Len(t, details, 1)
+	assert.Equal(t, "carol", details[0].MergedByLogin)
 }
 
 func TestDetailRowMergedByLoginEmpty(t *testing.T) {
@@ -791,16 +678,9 @@ func TestDetailRowMergedByLoginEmpty(t *testing.T) {
 
 	r := New(db)
 	details, err := r.GetDetails(context.Background(), ReportOpts{})
-	if err != nil {
-		t.Fatalf("GetDetails: %v", err)
-	}
-
-	if len(details) != 1 {
-		t.Fatalf("expected 1 detail row, got %d", len(details))
-	}
-	if details[0].MergedByLogin != "" {
-		t.Errorf("MergedByLogin = %q, want empty", details[0].MergedByLogin)
-	}
+	require.NoError(t, err, "GetDetails")
+	require.Len(t, details, 1)
+	assert.Empty(t, details[0].MergedByLogin)
 }
 
 func TestDetailRowBranchName(t *testing.T) {
@@ -813,14 +693,7 @@ func TestDetailRowBranchName(t *testing.T) {
 
 	r := New(db)
 	details, err := r.GetDetails(context.Background(), ReportOpts{})
-	if err != nil {
-		t.Fatalf("GetDetails: %v", err)
-	}
-
-	if len(details) != 1 {
-		t.Fatalf("expected 1 detail row, got %d", len(details))
-	}
-	if details[0].BranchName != "main" {
-		t.Errorf("expected BranchName='main', got %q", details[0].BranchName)
-	}
+	require.NoError(t, err, "GetDetails")
+	require.Len(t, details, 1)
+	assert.Equal(t, "main", details[0].BranchName)
 }

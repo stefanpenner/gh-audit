@@ -85,6 +85,14 @@ func DefaultConfigPath() string {
 	return filepath.Join(home, ".config", "gh-audit", "config.yaml")
 }
 
+// Default returns a Config with only defaults applied — no orgs or tokens.
+// Suitable as a fallback when no config file exists.
+func Default() *Config {
+	cfg := &Config{}
+	cfg.applyDefaults()
+	return cfg
+}
+
 // Load reads the YAML config at path, applies defaults, and validates.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)

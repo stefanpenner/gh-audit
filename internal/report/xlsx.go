@@ -98,7 +98,7 @@ func (r *Reporter) GenerateXLSX(ctx context.Context, opts ReportOpts, outputPath
 }
 
 func writeSummarySheet(f *excelize.File, sheet string, summary []SummaryRow, opts ReportOpts) error {
-	headers := []string{"Org", "Repo", "Total Commits", "Compliant", "Non-Compliant", "Bot Exempt", "Empty", "Self-Approved", "Compliance %"}
+	headers := []string{"Org", "Repo", "Total Commits", "Compliant", "Non-Compliant", "Compliance %", "Bots", "Exempt", "Empty", "Self-Approved"}
 
 	// Date range subtitle in row 1
 	dateRange := "Report Period: All Time"
@@ -158,6 +158,8 @@ func writeSummarySheet(f *excelize.File, sheet string, summary []SummaryRow, opt
 	})
 
 	// Write data rows (starting at row 3)
+	// Columns: Org, Repo, Total, Compliant, Non-Compliant, Compliance%,
+	//          then informational tags: Bots, Exempt, Empty, Self-Approved
 	for i, s := range summary {
 		row := i + 3
 		f.SetCellValue(sheet, cellName(1, row), s.Org)
@@ -165,14 +167,15 @@ func writeSummarySheet(f *excelize.File, sheet string, summary []SummaryRow, opt
 		f.SetCellValue(sheet, cellName(3, row), s.TotalCommits)
 		f.SetCellValue(sheet, cellName(4, row), s.CompliantCount)
 		f.SetCellValue(sheet, cellName(5, row), s.NonCompliantCount)
-		f.SetCellValue(sheet, cellName(6, row), s.BotCount)
-		f.SetCellValue(sheet, cellName(7, row), s.EmptyCount)
-		f.SetCellValue(sheet, cellName(8, row), s.SelfApprovedCount)
 
-		pctCell := cellName(9, row)
+		pctCell := cellName(6, row)
 		f.SetCellValue(sheet, pctCell, s.CompliancePct)
 
-		// Apply conditional formatting on compliance %
+		f.SetCellValue(sheet, cellName(7, row), s.BotCount)
+		f.SetCellValue(sheet, cellName(8, row), s.ExemptCount)
+		f.SetCellValue(sheet, cellName(9, row), s.EmptyCount)
+		f.SetCellValue(sheet, cellName(10, row), s.SelfApprovedCount)
+
 		switch {
 		case s.CompliancePct >= 100:
 			f.SetCellStyle(sheet, pctCell, pctCell, greenStyle)
@@ -192,18 +195,18 @@ func writeSummarySheet(f *excelize.File, sheet string, summary []SummaryRow, opt
 
 		f.SetCellValue(sheet, cellName(1, totalsRow), "TOTAL")
 
-		// SUM formulas for numeric columns (cols 3-8)
-		for _, col := range []int{3, 4, 5, 6, 7, 8} {
+		// SUM formulas for count columns (3-5 = Total/Compliant/Non-Compliant, 7-10 = tags)
+		for _, col := range []int{3, 4, 5, 7, 8, 9, 10} {
 			colLetter, _ := excelize.ColumnNumberToName(col)
 			formula := fmt.Sprintf("SUM(%s%d:%s%d)", colLetter, 3, colLetter, totalsRow-1)
 			f.SetCellFormula(sheet, cellName(col, totalsRow), formula)
 		}
 
-		// Compliance % as formula: Compliant / Total * 100
+		// Compliance % in column 6: Compliant / Total * 100
 		colD, _ := excelize.ColumnNumberToName(4) // Compliant
 		colC, _ := excelize.ColumnNumberToName(3) // Total
 		pctFormula := fmt.Sprintf("IF(%s%d>0,%s%d/%s%d*100,0)", colC, totalsRow, colD, totalsRow, colC, totalsRow)
-		f.SetCellFormula(sheet, cellName(9, totalsRow), pctFormula)
+		f.SetCellFormula(sheet, cellName(6, totalsRow), pctFormula)
 
 		for col := 1; col <= len(headers); col++ {
 			c := cellName(col, totalsRow)
@@ -222,7 +225,7 @@ func writeSummarySheet(f *excelize.File, sheet string, summary []SummaryRow, opt
 	})
 
 	// Column widths
-	widths := []float64{15, 30, 15, 12, 15, 12, 10, 15, 15}
+	widths := []float64{15, 30, 15, 12, 15, 15, 10, 10, 10, 15}
 	for i, w := range widths {
 		colName, _ := excelize.ColumnNumberToName(i + 1)
 		f.SetColWidth(sheet, colName, colName, w)

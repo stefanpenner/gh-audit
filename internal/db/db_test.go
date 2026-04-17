@@ -7,14 +7,14 @@ import (
 	"time"
 
 	"github.com/stefanpenner/gh-audit/internal/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func mustOpenMemory(t *testing.T) *DB {
 	t.Helper()
 	db, err := OpenMemory()
-	if err != nil {
-		t.Fatalf("OpenMemory: %v", err)
-	}
+	require.NoError(t, err, "OpenMemory")
 	t.Cleanup(func() { db.Close() })
 	return db
 }
@@ -45,17 +45,11 @@ func TestUpsertCommitsAndGetUnaudited(t *testing.T) {
 		},
 	}
 
-	if err := db.UpsertCommits(ctx, commits); err != nil {
-		t.Fatalf("UpsertCommits: %v", err)
-	}
+	require.NoError(t, db.UpsertCommits(ctx, commits))
 
 	got, err := db.GetUnauditedCommits(ctx, "org1", "repo1")
-	if err != nil {
-		t.Fatalf("GetUnauditedCommits: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("expected 2 unaudited commits, got %d", len(got))
-	}
+	require.NoError(t, err)
+	require.Len(t, got, 2)
 }
 
 func TestUpsertCommitsIdempotent(t *testing.T) {
@@ -69,26 +63,16 @@ func TestUpsertCommitsIdempotent(t *testing.T) {
 		Message: "first", ParentCount: 1, Additions: 10, Deletions: 5,
 	}
 
-	if err := db.UpsertCommits(ctx, []model.Commit{c}); err != nil {
-		t.Fatalf("first UpsertCommits: %v", err)
-	}
+	require.NoError(t, db.UpsertCommits(ctx, []model.Commit{c}))
 
 	// Update message and re-upsert
 	c.Message = "updated"
-	if err := db.UpsertCommits(ctx, []model.Commit{c}); err != nil {
-		t.Fatalf("second UpsertCommits: %v", err)
-	}
+	require.NoError(t, db.UpsertCommits(ctx, []model.Commit{c}))
 
 	got, err := db.GetCommitsBySHA(ctx, "org1", "repo1", []string{"aaa"})
-	if err != nil {
-		t.Fatalf("GetCommitsBySHA: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("expected 1 commit, got %d", len(got))
-	}
-	if got[0].Message != "updated" {
-		t.Fatalf("expected message 'updated', got %q", got[0].Message)
-	}
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, "updated", got[0].Message)
 }
 
 func TestBatchInsertOver500(t *testing.T) {
@@ -104,17 +88,11 @@ func TestBatchInsertOver500(t *testing.T) {
 		}
 	}
 
-	if err := db.UpsertCommits(ctx, commits); err != nil {
-		t.Fatalf("UpsertCommits with >500: %v", err)
-	}
+	require.NoError(t, db.UpsertCommits(ctx, commits))
 
 	got, err := db.GetUnauditedCommits(ctx, "org1", "repo1")
-	if err != nil {
-		t.Fatalf("GetUnauditedCommits: %v", err)
-	}
-	if len(got) != 501 {
-		t.Fatalf("expected 501 commits, got %d", len(got))
-	}
+	require.NoError(t, err)
+	require.Len(t, got, 501)
 }
 
 func TestUpsertPullRequestsAndGetPRsForCommit(t *testing.T) {
@@ -132,24 +110,13 @@ func TestUpsertPullRequestsAndGetPRsForCommit(t *testing.T) {
 		},
 	}
 
-	if err := db.UpsertPullRequests(ctx, prs); err != nil {
-		t.Fatalf("UpsertPullRequests: %v", err)
-	}
-
-	if err := db.UpsertCommitPRs(ctx, "org1", "repo1", "def", []int{42}); err != nil {
-		t.Fatalf("UpsertCommitPRs: %v", err)
-	}
+	require.NoError(t, db.UpsertPullRequests(ctx, prs))
+	require.NoError(t, db.UpsertCommitPRs(ctx, "org1", "repo1", "def", []int{42}))
 
 	got, err := db.GetPRsForCommit(ctx, "org1", "repo1", "def")
-	if err != nil {
-		t.Fatalf("GetPRsForCommit: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("expected 1 PR, got %d", len(got))
-	}
-	if got[0].Number != 42 {
-		t.Fatalf("expected PR #42, got #%d", got[0].Number)
-	}
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, 42, got[0].Number)
 }
 
 func TestUpsertReviewsAndGetReviewsForPR(t *testing.T) {
@@ -166,20 +133,12 @@ func TestUpsertReviewsAndGetReviewsForPR(t *testing.T) {
 		},
 	}
 
-	if err := db.UpsertReviews(ctx, reviews); err != nil {
-		t.Fatalf("UpsertReviews: %v", err)
-	}
+	require.NoError(t, db.UpsertReviews(ctx, reviews))
 
 	got, err := db.GetReviewsForPR(ctx, "org1", "repo1", 42)
-	if err != nil {
-		t.Fatalf("GetReviewsForPR: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("expected 1 review, got %d", len(got))
-	}
-	if got[0].State != "APPROVED" {
-		t.Fatalf("expected APPROVED, got %q", got[0].State)
-	}
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, "APPROVED", got[0].State)
 }
 
 func TestUpsertCheckRunsAndGetCheckRunsForCommit(t *testing.T) {
@@ -195,20 +154,12 @@ func TestUpsertCheckRunsAndGetCheckRunsForCommit(t *testing.T) {
 		},
 	}
 
-	if err := db.UpsertCheckRuns(ctx, checkRuns); err != nil {
-		t.Fatalf("UpsertCheckRuns: %v", err)
-	}
+	require.NoError(t, db.UpsertCheckRuns(ctx, checkRuns))
 
 	got, err := db.GetCheckRunsForCommit(ctx, "org1", "repo1", "abc")
-	if err != nil {
-		t.Fatalf("GetCheckRunsForCommit: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("expected 1 check run, got %d", len(got))
-	}
-	if got[0].Conclusion != "success" {
-		t.Fatalf("expected conclusion 'success', got %q", got[0].Conclusion)
-	}
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, "success", got[0].Conclusion)
 }
 
 func TestCommitPRsLink(t *testing.T) {
@@ -222,22 +173,14 @@ func TestCommitPRsLink(t *testing.T) {
 		{Org: "org1", Repo: "repo1", Number: 20, Title: "PR20", AuthorLogin: "bob",
 			MergedAt: time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)},
 	}
-	if err := db.UpsertPullRequests(ctx, prs); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, db.UpsertPullRequests(ctx, prs))
 
 	// Link both to same commit
-	if err := db.UpsertCommitPRs(ctx, "org1", "repo1", "sha1", []int{10, 20}); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, db.UpsertCommitPRs(ctx, "org1", "repo1", "sha1", []int{10, 20}))
 
 	got, err := db.GetPRsForCommit(ctx, "org1", "repo1", "sha1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("expected 2 PRs linked, got %d", len(got))
-	}
+	require.NoError(t, err)
+	require.Len(t, got, 2)
 }
 
 func TestUpsertAuditResultsAndGetAuditResults(t *testing.T) {
@@ -253,9 +196,7 @@ func TestUpsertAuditResultsAndGetAuditResults(t *testing.T) {
 			Message: "feat: something",
 		},
 	}
-	if err := db.UpsertCommits(ctx, commits); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, db.UpsertCommits(ctx, commits))
 
 	results := []model.AuditResult{
 		{
@@ -271,35 +212,19 @@ func TestUpsertAuditResultsAndGetAuditResults(t *testing.T) {
 		},
 	}
 
-	if err := db.UpsertAuditResults(ctx, results); err != nil {
-		t.Fatalf("UpsertAuditResults: %v", err)
-	}
+	require.NoError(t, db.UpsertAuditResults(ctx, results))
 
 	got, err := db.GetAuditResults(ctx, AuditQueryOpts{Org: "org1", Repo: "repo1"})
-	if err != nil {
-		t.Fatalf("GetAuditResults: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("expected 1 audit row, got %d", len(got))
-	}
-	if got[0].AuthorLogin != "alice" {
-		t.Errorf("expected author 'alice', got %q", got[0].AuthorLogin)
-	}
-	if !got[0].IsCompliant {
-		t.Error("expected IsCompliant=true")
-	}
-	if len(got[0].ApproverLogins) != 2 {
-		t.Errorf("expected 2 approvers, got %d", len(got[0].ApproverLogins))
-	}
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "alice", got[0].AuthorLogin)
+	assert.True(t, got[0].IsCompliant)
+	assert.Len(t, got[0].ApproverLogins, 2)
 
 	// Verify the commit is now audited
 	unaudited, err := db.GetUnauditedCommits(ctx, "org1", "repo1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(unaudited) != 0 {
-		t.Errorf("expected 0 unaudited commits, got %d", len(unaudited))
-	}
+	require.NoError(t, err)
+	assert.Empty(t, unaudited)
 }
 
 func TestGetAuditResultsFilters(t *testing.T) {
@@ -315,9 +240,7 @@ func TestGetAuditResultsFilters(t *testing.T) {
 		{Org: "org2", Repo: "repo2", SHA: "other", AuthorLogin: "carol",
 			CommittedAt: time.Date(2025, 5, 1, 0, 0, 0, 0, time.UTC), Message: "other org"},
 	}
-	if err := db.UpsertCommits(ctx, commits); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, db.UpsertCommits(ctx, commits))
 
 	auditResults := []model.AuditResult{
 		{Org: "org1", Repo: "repo1", SHA: "good", IsCompliant: true},
@@ -325,68 +248,42 @@ func TestGetAuditResultsFilters(t *testing.T) {
 			Reasons: []string{"no PR", "no approval"}},
 		{Org: "org2", Repo: "repo2", SHA: "other", IsCompliant: true},
 	}
-	if err := db.UpsertAuditResults(ctx, auditResults); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, db.UpsertAuditResults(ctx, auditResults))
 
 	t.Run("filter by org", func(t *testing.T) {
 		got, err := db.GetAuditResults(ctx, AuditQueryOpts{Org: "org1"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(got) != 2 {
-			t.Fatalf("expected 2, got %d", len(got))
-		}
+		require.NoError(t, err)
+		require.Len(t, got, 2)
 	})
 
 	t.Run("filter by repo", func(t *testing.T) {
 		got, err := db.GetAuditResults(ctx, AuditQueryOpts{Org: "org1", Repo: "repo1"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(got) != 2 {
-			t.Fatalf("expected 2, got %d", len(got))
-		}
+		require.NoError(t, err)
+		require.Len(t, got, 2)
 	})
 
 	t.Run("filter since", func(t *testing.T) {
 		got, err := db.GetAuditResults(ctx, AuditQueryOpts{
 			Since: time.Date(2025, 3, 15, 0, 0, 0, 0, time.UTC),
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(got) != 2 {
-			t.Fatalf("expected 2 (april + may), got %d", len(got))
-		}
+		require.NoError(t, err)
+		require.Len(t, got, 2)
 	})
 
 	t.Run("filter until", func(t *testing.T) {
 		got, err := db.GetAuditResults(ctx, AuditQueryOpts{
 			Until: time.Date(2025, 4, 1, 0, 0, 0, 0, time.UTC),
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(got) != 1 {
-			t.Fatalf("expected 1 (march only), got %d", len(got))
-		}
+		require.NoError(t, err)
+		require.Len(t, got, 1)
 	})
 
 	t.Run("only failures", func(t *testing.T) {
 		got, err := db.GetAuditResults(ctx, AuditQueryOpts{OnlyFailures: true})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(got) != 1 {
-			t.Fatalf("expected 1 failure, got %d", len(got))
-		}
-		if got[0].SHA != "bad" {
-			t.Errorf("expected sha 'bad', got %q", got[0].SHA)
-		}
-		if len(got[0].Reasons) != 2 {
-			t.Errorf("expected 2 reasons, got %d", len(got[0].Reasons))
-		}
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, "bad", got[0].SHA)
+		assert.Len(t, got[0].Reasons, 2)
 	})
 }
 
@@ -401,23 +298,15 @@ func TestSyncCursorRoundTrip(t *testing.T) {
 		LastDate: time.Date(2025, 3, 1, 0, 0, 0, 0, time.UTC),
 	}
 
-	if err := db.UpsertSyncCursor(ctx, cursor); err != nil {
-		t.Fatalf("UpsertSyncCursor: %v", err)
-	}
+	require.NoError(t, db.UpsertSyncCursor(ctx, cursor))
 
 	got, err := db.GetSyncCursor(ctx, "org1", "repo1", "main")
-	if err != nil {
-		t.Fatalf("GetSyncCursor: %v", err)
-	}
-	if got == nil {
-		t.Fatal("expected non-nil cursor")
-	}
-	if got.Org != "org1" || got.Repo != "repo1" || got.Branch != "main" {
-		t.Errorf("unexpected cursor: %+v", got)
-	}
-	if !got.LastDate.Equal(cursor.LastDate) {
-		t.Errorf("expected LastDate %v, got %v", cursor.LastDate, got.LastDate)
-	}
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "org1", got.Org)
+	assert.Equal(t, "repo1", got.Repo)
+	assert.Equal(t, "main", got.Branch)
+	assert.True(t, got.LastDate.Equal(cursor.LastDate))
 }
 
 func TestSyncCursorPerBranch(t *testing.T) {
@@ -433,28 +322,18 @@ func TestSyncCursorPerBranch(t *testing.T) {
 		LastDate: time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC),
 	}
 
-	if err := db.UpsertSyncCursor(ctx, mainCursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.UpsertSyncCursor(ctx, releaseCursor); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, db.UpsertSyncCursor(ctx, mainCursor))
+	require.NoError(t, db.UpsertSyncCursor(ctx, releaseCursor))
 
 	gotMain, err := db.GetSyncCursor(ctx, "org1", "repo1", "main")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if gotMain == nil || !gotMain.LastDate.Equal(mainCursor.LastDate) {
-		t.Errorf("main cursor mismatch: %+v", gotMain)
-	}
+	require.NoError(t, err)
+	require.NotNil(t, gotMain)
+	assert.True(t, gotMain.LastDate.Equal(mainCursor.LastDate))
 
 	gotRelease, err := db.GetSyncCursor(ctx, "org1", "repo1", "release/1.0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if gotRelease == nil || !gotRelease.LastDate.Equal(releaseCursor.LastDate) {
-		t.Errorf("release cursor mismatch: %+v", gotRelease)
-	}
+	require.NoError(t, err)
+	require.NotNil(t, gotRelease)
+	assert.True(t, gotRelease.LastDate.Equal(releaseCursor.LastDate))
 }
 
 func TestSyncCursorNotFound(t *testing.T) {
@@ -462,12 +341,8 @@ func TestSyncCursorNotFound(t *testing.T) {
 	ctx := context.Background()
 
 	got, err := db.GetSyncCursor(ctx, "nonexistent", "nope", "main")
-	if err != nil {
-		t.Fatalf("GetSyncCursor: %v", err)
-	}
-	if got != nil {
-		t.Fatalf("expected nil cursor, got %+v", got)
-	}
+	require.NoError(t, err)
+	require.Nil(t, got)
 }
 
 func TestUpsertCommitBranches(t *testing.T) {
@@ -475,21 +350,15 @@ func TestUpsertCommitBranches(t *testing.T) {
 	ctx := context.Background()
 
 	err := db.UpsertCommitBranches(ctx, "org1", "repo1", []string{"sha1", "sha2"}, "main")
-	if err != nil {
-		t.Fatalf("UpsertCommitBranches: %v", err)
-	}
+	require.NoError(t, err)
 
 	// Upsert same commits to another branch
 	err = db.UpsertCommitBranches(ctx, "org1", "repo1", []string{"sha1"}, "release/1.0")
-	if err != nil {
-		t.Fatalf("UpsertCommitBranches: %v", err)
-	}
+	require.NoError(t, err)
 
 	// Idempotent: upsert again should not fail
 	err = db.UpsertCommitBranches(ctx, "org1", "repo1", []string{"sha1"}, "main")
-	if err != nil {
-		t.Fatalf("UpsertCommitBranches idempotent: %v", err)
-	}
+	require.NoError(t, err)
 }
 
 func TestEnumColumnsAcceptValidValues(t *testing.T) {
@@ -505,25 +374,18 @@ func TestEnumColumnsAcceptValidValues(t *testing.T) {
 			SubmittedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
 		},
 	}
-	if err := db.UpsertReviews(ctx, reviews); err != nil {
-		t.Fatalf("UpsertReviews with valid enum: %v", err)
-	}
+	require.NoError(t, db.UpsertReviews(ctx, reviews))
 
 	got, err := db.GetReviewsForPR(ctx, "org1", "repo1", 1)
-	if err != nil {
-		t.Fatalf("GetReviewsForPR: %v", err)
-	}
-	if len(got) != 1 || got[0].State != "APPROVED" {
-		t.Fatalf("expected state APPROVED, got %q", got[0].State)
-	}
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, "APPROVED", got[0].State)
 
 	// Inserting an invalid enum value should fail.
 	_, err = db.ExecContext(ctx,
 		`INSERT INTO reviews (org, repo, pr_number, review_id, state)
 		 VALUES ('org1', 'repo1', 2, 2, 'INVALID_STATE')`)
-	if err == nil {
-		t.Fatal("expected error inserting invalid review_state enum value, got nil")
-	}
+	require.Error(t, err)
 
 	// Verify check_runs accept arbitrary status/conclusion values (TEXT columns).
 	checkRuns := []model.CheckRun{
@@ -540,9 +402,7 @@ func TestEnumColumnsAcceptValidValues(t *testing.T) {
 			CompletedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
 		},
 	}
-	if err := db.UpsertCheckRuns(ctx, checkRuns); err != nil {
-		t.Fatalf("UpsertCheckRuns: %v", err)
-	}
+	require.NoError(t, db.UpsertCheckRuns(ctx, checkRuns))
 }
 
 func TestEmptyCommitStoredCorrectly(t *testing.T) {
@@ -558,18 +418,11 @@ func TestEmptyCommitStoredCorrectly(t *testing.T) {
 		},
 	}
 
-	if err := db.UpsertCommits(ctx, commits); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, db.UpsertCommits(ctx, commits))
 
 	got, err := db.GetCommitsBySHA(ctx, "org1", "repo1", []string{"empty"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("expected 1, got %d", len(got))
-	}
-	if got[0].Additions != 0 || got[0].Deletions != 0 {
-		t.Errorf("expected 0/0 additions/deletions, got %d/%d", got[0].Additions, got[0].Deletions)
-	}
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, 0, got[0].Additions)
+	assert.Equal(t, 0, got[0].Deletions)
 }

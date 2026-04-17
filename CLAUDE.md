@@ -1,5 +1,16 @@
 # CLAUDE.md
 
+## Architecture document
+
+`Architecture.md` is the high-level design reference. Keep it in sync when changing:
+- Audit detection logic (`internal/sync/audit.go`) — update the "What gh-audit detects" section
+- Sync pipeline phases (`internal/sync/pipeline.go`) — update the "Sync pipeline" section
+- REST endpoints called (`internal/github/client.go`) — update the "Enrich" phase
+- Database schema (`internal/db/schema.go`) — update the "Database schema" table
+- Report formats (`internal/report/`) — update the "Report layer" section
+- CLI commands (`cmd/`) — update "Package structure" if commands are added/removed
+- Token pool behaviour (`internal/github/tokenpool.go`) — update "Token pool" section
+
 ## Model diagram
 
 When types in `internal/model/types.go` change, update the Mermaid class diagram in `internal/model/README.md` to match.

@@ -7,6 +7,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDBWriterBasic(t *testing.T) {
@@ -18,12 +21,8 @@ func TestDBWriterBasic(t *testing.T) {
 		called = true
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !called {
-		t.Fatal("write function was not called")
-	}
+	require.NoError(t, err)
+	require.True(t, called, "write function was not called")
 }
 
 func TestDBWriterPropagatesError(t *testing.T) {
@@ -34,9 +33,7 @@ func TestDBWriterPropagatesError(t *testing.T) {
 	got := w.Write(context.Background(), func() error {
 		return want
 	})
-	if !errors.Is(got, want) {
-		t.Fatalf("got error %v, want %v", got, want)
-	}
+	require.ErrorIs(t, got, want)
 }
 
 func TestDBWriterSerializesWrites(t *testing.T) {
@@ -69,13 +66,10 @@ func TestDBWriterSerializesWrites(t *testing.T) {
 	wg.Wait()
 
 	// Verify serialization: pattern must be [1,2,1,2,...] — never [1,1,...]
-	if len(order) != 40 {
-		t.Fatalf("expected 40 entries, got %d", len(order))
-	}
+	require.Len(t, order, 40)
 	for i := 0; i < len(order); i += 2 {
-		if order[i] != 1 || order[i+1] != 2 {
-			t.Fatalf("writes were not serialized: order[%d]=%d, order[%d]=%d", i, order[i], i+1, order[i+1])
-		}
+		require.Equal(t, 1, order[i], "writes were not serialized at index %d", i)
+		require.Equal(t, 2, order[i+1], "writes were not serialized at index %d", i+1)
 	}
 }
 
@@ -94,16 +88,12 @@ func TestDBWriterConcurrentSubmit(t *testing.T) {
 				count.Add(1)
 				return nil
 			})
-			if err != nil {
-				t.Errorf("unexpected error: %v", err)
-			}
+			assert.NoError(t, err)
 		}()
 	}
 	wg.Wait()
 
-	if got := count.Load(); got != 100 {
-		t.Fatalf("expected 100 writes, got %d", got)
-	}
+	require.Equal(t, int64(100), count.Load())
 }
 
 func TestDBWriterContextCancelBeforeSubmit(t *testing.T) {
@@ -140,9 +130,7 @@ func TestDBWriterContextCancelBeforeSubmit(t *testing.T) {
 		t.Fatal("should not be called")
 		return nil
 	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context.Canceled, got %v", err)
-	}
+	require.ErrorIs(t, err, context.Canceled)
 
 	close(blocker)
 	wg.Wait()
@@ -193,9 +181,7 @@ func TestDBWriterCloseDrainsPending(t *testing.T) {
 	wg.Wait()
 	w.Close()
 
-	if got := count.Load(); got != 50 {
-		t.Fatalf("expected 50 writes drained, got %d", got)
-	}
+	require.Equal(t, int64(50), count.Load())
 }
 
 func TestDBWriterDefaultBufferSize(t *testing.T) {
@@ -203,7 +189,5 @@ func TestDBWriterDefaultBufferSize(t *testing.T) {
 	defer w.Close()
 
 	err := w.Write(context.Background(), func() error { return nil })
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 }

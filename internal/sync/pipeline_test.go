@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/stefanpenner/gh-audit/internal/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // --- Mock implementations (thread-safe for DBWriter goroutine) ---
@@ -25,6 +27,23 @@ func (m *mockSource) ListOrgRepos(_ context.Context, org string) ([]model.RepoIn
 		return nil, m.err
 	}
 	return m.repos[org], nil
+}
+
+func (m *mockSource) GetRepo(_ context.Context, org, repo string) (model.RepoInfo, error) {
+	if m.err != nil {
+		return model.RepoInfo{}, m.err
+	}
+	for _, r := range m.repos[org] {
+		if r.Name == repo {
+			return r, nil
+		}
+	}
+	return model.RepoInfo{
+		Org:           org,
+		Name:          repo,
+		FullName:      org + "/" + repo,
+		DefaultBranch: "main",
+	}, nil
 }
 
 func (m *mockSource) ListCommits(_ context.Context, org, repo, branch string, since, until time.Time) ([]model.Commit, error) {
@@ -197,9 +216,41 @@ func TestPipelineDiscoverRepos(t *testing.T) {
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
 	err := p.Run(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	require.NoError(t, err)
+}
+
+func TestPipelineExplicitReposFetchesDefaultBranch(t *testing.T) {
+	now := time.Now()
+	source := &mockSource{
+		repos: map[string][]model.RepoInfo{
+			"myorg": {
+				{Org: "myorg", Name: "repo1", FullName: "myorg/repo1", DefaultBranch: "develop"},
+			},
+		},
+		commits: map[string][]model.Commit{
+			"myorg/repo1/develop": {{Org: "myorg", Repo: "repo1", SHA: "aaa", CommittedAt: now, Additions: 1}},
+		},
 	}
+	store := newMockStore()
+	enricher := &mockEnricher{}
+
+	cfg := &SyncConfig{
+		Orgs:        []OrgConfig{{Name: "myorg", Repos: []string{"repo1"}}},
+		Concurrency: 1,
+	}
+
+	p := NewPipeline(source, enricher, store, cfg, slog.Default())
+	require.NoError(t, p.Run(context.Background()))
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	require.Len(t, store.commits, 1)
+	assert.Equal(t, "aaa", store.commits[0].SHA)
+
+	branches := store.commitBranches["myorg/repo1/aaa"]
+	require.NotEmpty(t, branches)
+	assert.Equal(t, "develop", branches[0])
 }
 
 func TestPipelineRespectsExcludeList(t *testing.T) {
@@ -225,16 +276,12 @@ func TestPipelineRespectsExcludeList(t *testing.T) {
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
 	err := p.Run(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	for _, c := range store.commits {
-		if c.Repo == "excluded-repo" {
-			t.Error("excluded repo commits should not be synced")
-		}
+		assert.NotEqual(t, "excluded-repo", c.Repo, "excluded repo commits should not be synced")
 	}
 }
 
@@ -259,9 +306,7 @@ func TestPipelineUsesStoredCursor(t *testing.T) {
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
 	err := p.Run(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 }
 
 func TestPipelineUsesInitialLookbackDays(t *testing.T) {
@@ -282,9 +327,7 @@ func TestPipelineUsesInitialLookbackDays(t *testing.T) {
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
 	err := p.Run(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 }
 
 func TestPipelineEnrichesInBatches(t *testing.T) {
@@ -315,15 +358,10 @@ func TestPipelineEnrichesInBatches(t *testing.T) {
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
 	err := p.Run(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 
 	// 30 commits / 25 batch size = 2 enricher calls
-	calls := enricher.calls.Load()
-	if calls != 2 {
-		t.Errorf("enricher called %d times, want 2", calls)
-	}
+	assert.Equal(t, int32(2), enricher.calls.Load())
 }
 
 func TestPipelineEnrichesInParallel(t *testing.T) {
@@ -364,14 +402,10 @@ func TestPipelineEnrichesInParallel(t *testing.T) {
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
 	err := p.Run(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 
 	// With 4 batches (100/25) and EnrichConcurrency=4, we should see >1 concurrent
-	if got := maxConcurrent.Load(); got <= 1 {
-		t.Errorf("max concurrent enrichment = %d, want >1 (parallel enrichment not working)", got)
-	}
+	assert.Greater(t, maxConcurrent.Load(), int32(1), "parallel enrichment not working")
 }
 
 type concurrencyTrackingEnricher struct {
@@ -430,21 +464,13 @@ func TestPipelineStoresEnrichmentData(t *testing.T) {
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
 	err := p.Run(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if len(store.prs) == 0 {
-		t.Error("expected PRs to be stored")
-	}
-	if len(store.reviews) == 0 {
-		t.Error("expected reviews to be stored")
-	}
-	if len(store.checkRuns) == 0 {
-		t.Error("expected check runs to be stored")
-	}
+	assert.NotEmpty(t, store.prs)
+	assert.NotEmpty(t, store.reviews)
+	assert.NotEmpty(t, store.checkRuns)
 }
 
 func TestPipelineEvaluatesAuditRules(t *testing.T) {
@@ -467,15 +493,11 @@ func TestPipelineEvaluatesAuditRules(t *testing.T) {
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
 	err := p.Run(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if len(store.auditResults) != 1 {
-		t.Fatalf("expected 1 audit result, got %d", len(store.auditResults))
-	}
+	require.Len(t, store.auditResults, 1)
 }
 
 func TestPipelineUpdatesCursorAfterSync(t *testing.T) {
@@ -498,22 +520,14 @@ func TestPipelineUpdatesCursorAfterSync(t *testing.T) {
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
 	err := p.Run(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	cursor := store.cursors["myorg/repo1/main"]
-	if cursor == nil {
-		t.Fatal("expected cursor to be set")
-	}
-	if !cursor.LastDate.Equal(now) {
-		t.Errorf("cursor.LastDate = %v, want %v", cursor.LastDate, now)
-	}
-	if cursor.Branch != "main" {
-		t.Errorf("cursor.Branch = %q, want %q", cursor.Branch, "main")
-	}
+	require.NotNil(t, cursor)
+	assert.True(t, cursor.LastDate.Equal(now), "cursor.LastDate = %v, want %v", cursor.LastDate, now)
+	assert.Equal(t, "main", cursor.Branch)
 }
 
 func TestPipelineHandlesEmptyRepo(t *testing.T) {
@@ -533,15 +547,11 @@ func TestPipelineHandlesEmptyRepo(t *testing.T) {
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
 	err := p.Run(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if len(store.commits) != 0 {
-		t.Error("expected no commits for empty repo")
-	}
+	assert.Empty(t, store.commits)
 }
 
 func TestPipelineRespectsContextCancellation(t *testing.T) {
@@ -589,9 +599,7 @@ func TestPipelineContinuesWhenOneRepoFails(t *testing.T) {
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
 	err := p.Run(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -601,9 +609,7 @@ func TestPipelineContinuesWhenOneRepoFails(t *testing.T) {
 			found = true
 		}
 	}
-	if !found {
-		t.Error("repo2 commits should still be synced even if repo1 had issues")
-	}
+	assert.True(t, found, "repo2 commits should still be synced even if repo1 had issues")
 }
 
 func TestFilterRepos(t *testing.T) {
@@ -639,13 +645,9 @@ func TestFilterRepos(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := filterRepos(repos, tt.cfg)
-			if len(got) != len(tt.want) {
-				t.Fatalf("got %d repos, want %d", len(got), len(tt.want))
-			}
+			require.Len(t, got, len(tt.want))
 			for i, r := range got {
-				if r.Name != tt.want[i] {
-					t.Errorf("repo[%d] = %s, want %s", i, r.Name, tt.want[i])
-				}
+				assert.Equal(t, tt.want[i], r.Name, "repo[%d]", i)
 			}
 		})
 	}
@@ -672,34 +674,18 @@ func TestPipelineMultiBranchSync(t *testing.T) {
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
 	err := p.Run(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
-	if len(store.commits) != 2 {
-		t.Fatalf("expected 2 commits, got %d", len(store.commits))
-	}
+	require.Len(t, store.commits, 2)
 
-	mainCursor := store.cursors["myorg/repo1/main"]
-	if mainCursor == nil {
-		t.Fatal("expected cursor for main branch")
-	}
-	relCursor := store.cursors["myorg/repo1/release/1"]
-	if relCursor == nil {
-		t.Fatal("expected cursor for release/1 branch")
-	}
+	require.NotNil(t, store.cursors["myorg/repo1/main"])
+	require.NotNil(t, store.cursors["myorg/repo1/release/1"])
 
-	mainBranches := store.commitBranches["myorg/repo1/aaa"]
-	if len(mainBranches) != 1 || mainBranches[0] != "main" {
-		t.Errorf("expected commit aaa to be on main branch, got %v", mainBranches)
-	}
-	relBranches := store.commitBranches["myorg/repo1/bbb"]
-	if len(relBranches) != 1 || relBranches[0] != "release/1" {
-		t.Errorf("expected commit bbb to be on release/1 branch, got %v", relBranches)
-	}
+	assert.Equal(t, []string{"main"}, store.commitBranches["myorg/repo1/aaa"])
+	assert.Equal(t, []string{"release/1"}, store.commitBranches["myorg/repo1/bbb"])
 }
 
 func TestPipelineNoBranchesUsesDefault(t *testing.T) {
@@ -722,19 +708,13 @@ func TestPipelineNoBranchesUsesDefault(t *testing.T) {
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
 	err := p.Run(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	cursor := store.cursors["myorg/repo1/develop"]
-	if cursor == nil {
-		t.Fatal("expected cursor for develop branch (the default branch)")
-	}
-	if cursor.Branch != "develop" {
-		t.Errorf("cursor.Branch = %q, want %q", cursor.Branch, "develop")
-	}
+	require.NotNil(t, cursor)
+	assert.Equal(t, "develop", cursor.Branch)
 }
 
 func TestPipelineDifferentCursorsPerBranch(t *testing.T) {
@@ -767,28 +747,18 @@ func TestPipelineDifferentCursorsPerBranch(t *testing.T) {
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
 	err := p.Run(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
 	mainCursor := store.cursors["myorg/repo1/main"]
-	if mainCursor == nil {
-		t.Fatal("expected cursor for main branch")
-	}
-	if !mainCursor.LastDate.Equal(now) {
-		t.Errorf("main cursor LastDate = %v, want %v", mainCursor.LastDate, now)
-	}
+	require.NotNil(t, mainCursor)
+	assert.True(t, mainCursor.LastDate.Equal(now), "main cursor LastDate = %v, want %v", mainCursor.LastDate, now)
 
 	relCursor := store.cursors["myorg/repo1/release/1"]
-	if relCursor == nil {
-		t.Fatal("expected cursor for release/1 branch")
-	}
-	if !relCursor.LastDate.Equal(now) {
-		t.Errorf("release/1 cursor LastDate = %v, want %v", relCursor.LastDate, now)
-	}
+	require.NotNil(t, relCursor)
+	assert.True(t, relCursor.LastDate.Equal(now), "release/1 cursor LastDate = %v, want %v", relCursor.LastDate, now)
 }
 
 func TestPipelineConcurrentRepoSync(t *testing.T) {
@@ -817,19 +787,13 @@ func TestPipelineConcurrentRepoSync(t *testing.T) {
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
 	err := p.Run(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
-	if len(store.commits) != 3 {
-		t.Fatalf("expected 3 commits, got %d", len(store.commits))
-	}
-	if len(store.auditResults) != 3 {
-		t.Fatalf("expected 3 audit results, got %d", len(store.auditResults))
-	}
+	require.Len(t, store.commits, 3)
+	require.Len(t, store.auditResults, 3)
 }
 
 func TestPipelineRealisticMix(t *testing.T) {
@@ -911,16 +875,12 @@ func TestPipelineRealisticMix(t *testing.T) {
 	}
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
-	if err := p.Run(context.Background()); err != nil {
-		t.Fatalf("pipeline run: %v", err)
-	}
+	require.NoError(t, p.Run(context.Background()))
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
-	if len(store.auditResults) != 8 {
-		t.Fatalf("expected 8 audit results, got %d", len(store.auditResults))
-	}
+	require.Len(t, store.auditResults, 8)
 
 	resultMap := make(map[string]model.AuditResult)
 	for _, r := range store.auditResults {
@@ -952,27 +912,13 @@ func TestPipelineRealisticMix(t *testing.T) {
 	for _, exp := range expectations {
 		t.Run(exp.desc, func(t *testing.T) {
 			r, ok := resultMap[exp.sha]
-			if !ok {
-				t.Fatalf("missing audit result for %s", exp.sha)
-			}
-			if r.IsCompliant != exp.compliant {
-				t.Errorf("IsCompliant: got %v, want %v (reasons: %v)", r.IsCompliant, exp.compliant, r.Reasons)
-			}
-			if r.IsBot != exp.isBot {
-				t.Errorf("IsBot: got %v, want %v", r.IsBot, exp.isBot)
-			}
-			if r.IsExemptAuthor != exp.isExempt {
-				t.Errorf("IsExemptAuthor: got %v, want %v", r.IsExemptAuthor, exp.isExempt)
-			}
-			if r.IsEmptyCommit != exp.isEmpty {
-				t.Errorf("IsEmptyCommit: got %v, want %v", r.IsEmptyCommit, exp.isEmpty)
-			}
-			if r.IsSelfApproved != exp.isSelfApproved {
-				t.Errorf("IsSelfApproved: got %v, want %v", r.IsSelfApproved, exp.isSelfApproved)
-			}
-			if r.HasPR != exp.hasPR {
-				t.Errorf("HasPR: got %v, want %v", r.HasPR, exp.hasPR)
-			}
+			require.True(t, ok, "missing audit result for %s", exp.sha)
+			assert.Equal(t, exp.compliant, r.IsCompliant, "IsCompliant (reasons: %v)", r.Reasons)
+			assert.Equal(t, exp.isBot, r.IsBot, "IsBot")
+			assert.Equal(t, exp.isExempt, r.IsExemptAuthor, "IsExemptAuthor")
+			assert.Equal(t, exp.isEmpty, r.IsEmptyCommit, "IsEmptyCommit")
+			assert.Equal(t, exp.isSelfApproved, r.IsSelfApproved, "IsSelfApproved")
+			assert.Equal(t, exp.hasPR, r.HasPR, "HasPR")
 		})
 	}
 
@@ -998,22 +944,10 @@ func TestPipelineRealisticMix(t *testing.T) {
 		}
 	}
 
-	if compliant != 4 {
-		t.Errorf("compliant: got %d, want 4", compliant)
-	}
-	if nonCompliant != 4 {
-		t.Errorf("non-compliant: got %d, want 4", nonCompliant)
-	}
-	if bots != 2 {
-		t.Errorf("bots: got %d, want 2", bots)
-	}
-	if exempt != 1 {
-		t.Errorf("exempt: got %d, want 1", exempt)
-	}
-	if empty != 1 {
-		t.Errorf("empty: got %d, want 1", empty)
-	}
-	if selfApproved != 1 {
-		t.Errorf("self-approved: got %d, want 1", selfApproved)
-	}
+	assert.Equal(t, 4, compliant, "compliant")
+	assert.Equal(t, 4, nonCompliant, "non-compliant")
+	assert.Equal(t, 2, bots, "bots")
+	assert.Equal(t, 1, exempt, "exempt")
+	assert.Equal(t, 1, empty, "empty")
+	assert.Equal(t, 1, selfApproved, "self-approved")
 }

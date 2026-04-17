@@ -59,6 +59,13 @@ func NewTokenPool(logger *slog.Logger) *TokenPool {
 	}
 }
 
+// Len returns the number of tokens in the pool.
+func (p *TokenPool) Len() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.tokens)
+}
+
 // bearerTransport adds a Bearer authorization header to every request.
 type bearerTransport struct {
 	token string
@@ -119,12 +126,15 @@ func (p *TokenPool) AddAppToken(id string, appID, installationID int64, privateK
 }
 
 // scopeMatches checks if a token's scopes cover the given org/repo.
+// A nil or empty scopes list matches all orgs/repos (wildcard).
 func scopeMatches(scopes []OrgScope, org, repo string) bool {
+	if len(scopes) == 0 {
+		return true
+	}
 	for _, s := range scopes {
 		if !strings.EqualFold(s.Org, org) {
 			continue
 		}
-		// Empty repos list means all repos in org.
 		if len(s.Repos) == 0 {
 			return true
 		}

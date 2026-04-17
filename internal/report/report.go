@@ -223,11 +223,11 @@ func (r *Reporter) FormatTable(w io.Writer, summary []SummaryRow, details []Deta
 
 	// Summary section
 	fmt.Fprintln(tw, "=== SUMMARY ===")
-	fmt.Fprintln(tw, "Org\tRepo\tTotal\tCompliant\tNon-Compliant\tBots\tEmpty\tCompliance %")
+	fmt.Fprintln(tw, "Org\tRepo\tTotal\tCompliant\tNon-Compliant\tCompliance %\tBots\tExempt\tEmpty\tSelf-Approved")
 	for _, s := range summary {
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%.1f%%\n",
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%.1f%%\t%d\t%d\t%d\t%d\n",
 			s.Org, s.Repo, s.TotalCommits, s.CompliantCount, s.NonCompliantCount,
-			s.BotCount, s.EmptyCount, s.CompliancePct)
+			s.CompliancePct, s.BotCount, s.ExemptCount, s.EmptyCount, s.SelfApprovedCount)
 	}
 	fmt.Fprintln(tw)
 

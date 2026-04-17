@@ -11,6 +11,7 @@ classDiagram
     class RepoInfo {
         Org string
         Name string
+        FullName string
         DefaultBranch string
         Archived bool
     }
@@ -18,6 +19,7 @@ classDiagram
     class SyncCursor {
         Org string
         Repo string
+        Branch string
         LastDate time.Time
     }
 
@@ -31,30 +33,17 @@ classDiagram
         Org string
         Repo string
         SHA string
-        TreeSHA string
-        ParentSHAs []string
         AuthorLogin string
-        AuthorEmail string
-        AuthorName string
         CommitterLogin string
-        CommitterEmail string
-        CommitterName string
         CoAuthors []CoAuthor
         CommittedAt time.Time
         Message string
-        IsVerified bool
-        SignatureType string
         ParentCount int
         Additions int
         Deletions int
-        IsGitHubGenerated bool
-    }
-
-    class CommitPullRequest {
-        Org string
-        Repo string
-        SHA string
-        PRNumber int
+        Branch string
+        IsDefaultBranch bool
+        Href string
     }
 
     class PullRequest {
@@ -66,23 +55,28 @@ classDiagram
         HeadSHA string
         MergeCommitSHA string
         AuthorLogin string
+        MergedByLogin string
         MergedAt time.Time
+        Href string
     }
 
     class Review {
         Org string
         Repo string
         PRNumber int
+        ReviewID int64
         ReviewerLogin string
         State string
         CommitID string
         SubmittedAt time.Time
+        Href string
     }
 
     class CheckRun {
         Org string
         Repo string
         CommitSHA string
+        CheckRunID int64
         CheckName string
         Status string
         Conclusion string
@@ -101,17 +95,23 @@ classDiagram
         Repo string
         SHA string
         IsCompliant bool
+        IsBot bool
+        IsExemptAuthor bool
+        IsEmptyCommit bool
+        IsSelfApproved bool
         HasPR bool
+        PRNumber int
         HasFinalApproval bool
         ApproverLogins []string
+        OwnerApprovalCheck string
         Reasons []string
-        AuditedAt time.Time
+        CommitHref string
+        PRHref string
     }
 
     RepoInfo "1" --o "*" Commit : contains
     RepoInfo "1" --o "1" SyncCursor : tracks
-    Commit "*" --o "*" CommitPullRequest : joins
-    CommitPullRequest "*" o-- "*" PullRequest : joins
+    Commit "*" --o "*" PullRequest : associated via
     PullRequest "1" --o "*" Review : has
     Commit "1" --o "*" CheckRun : has
     EnrichmentResult "1" --> "1" Commit : wraps

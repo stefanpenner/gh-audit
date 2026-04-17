@@ -1,21 +1,18 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 	"github.com/stefanpenner/gh-audit/internal/config"
 	"github.com/stefanpenner/gh-audit/internal/db"
 	ghclient "github.com/stefanpenner/gh-audit/internal/github"
 	"github.com/stefanpenner/gh-audit/internal/sync"
-	"github.com/stefanpenner/gh-audit/internal/ui"
-	"golang.org/x/term"
 )
 
 func newSyncCmd() *cobra.Command {
@@ -25,17 +22,13 @@ func newSyncCmd() *cobra.Command {
 		since       string
 		until       string
 		concurrency int
-		noUI        bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "Sync commits and enrichment data from GitHub",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load(cfgFile)
-			if err != nil {
-				return fmt.Errorf("loading config: %w", err)
-			}
+			cfg := loadConfigOrDefault(cfgFile)
 
 			dbConn, err := db.Open(resolveDBPath(cfg))
 			if err != nil {
@@ -48,74 +41,19 @@ func newSyncCmd() *cobra.Command {
 				return err
 			}
 
+			if len(syncCfg.Orgs) == 0 {
+				return fmt.Errorf("no orgs to sync: use --org or --repo flags, or configure orgs in config file")
+			}
+
 			logger := slog.Default()
-
-			// Build token pool from config
-			pool := ghclient.NewTokenPool(logger)
-			for _, tokCfg := range cfg.Tokens {
-				switch tokCfg.Kind {
-				case "pat":
-					token := os.Getenv(tokCfg.Env)
-					if token == "" {
-						return fmt.Errorf("token env var %s is not set", tokCfg.Env)
-					}
-					scopes := convertScopes(tokCfg.Scopes)
-					pool.AddPATToken(tokCfg.Env, token, scopes)
-				case "app":
-					var keyBytes []byte
-					if tokCfg.PrivateKeyPath != "" {
-						keyBytes, err = os.ReadFile(tokCfg.PrivateKeyPath)
-						if err != nil {
-							return fmt.Errorf("reading private key from %s: %w", tokCfg.PrivateKeyPath, err)
-						}
-					} else {
-						keyBytes = []byte(os.Getenv(tokCfg.PrivateKeyEnv))
-					}
-					scopes := convertScopes(tokCfg.Scopes)
-					if err := pool.AddAppToken(tokCfg.Env, tokCfg.AppID, tokCfg.InstallationID, keyBytes, scopes); err != nil {
-						return fmt.Errorf("adding app token %s: %w", tokCfg.Env, err)
-					}
-				}
+			pool, err := buildTokenPool(cfg, logger)
+			if err != nil {
+				return err
 			}
 
-			source := ghclient.NewClient(pool, logger)
-			enricher := ghclient.NewGraphQLClient(pool, logger)
-
-			pipeline := sync.NewPipeline(source, enricher, dbConn, syncCfg, logger)
-
-			isTTY := term.IsTerminal(int(os.Stdout.Fd()))
-			if !isTTY || noUI {
-				return pipeline.Run(cmd.Context())
-			}
-
-			ctx, cancel := context.WithCancel(cmd.Context())
-			defer cancel()
-
-			uiModel := ui.NewSyncModel(0)
-			prog := tea.NewProgram(uiModel, tea.WithAltScreen())
-
-			pipeline.SetProgressCallback(uiModel.ProgressCallback(prog))
-
-			var syncErr error
-			syncDone := make(chan struct{})
-			go func() {
-				defer close(syncDone)
-				syncErr = pipeline.Run(ctx)
-				prog.Send(ui.DoneMsg{Err: syncErr})
-			}()
-
-			if _, err := prog.Run(); err != nil {
-				cancel()
-				<-syncDone
-				return fmt.Errorf("UI error: %w", err)
-			}
-			if uiModel.Quitting() {
-				cancel()
-				<-syncDone
-				return nil
-			}
-			<-syncDone
-			return syncErr
+			client := ghclient.NewClient(pool, logger)
+			pipeline := sync.NewPipeline(client, client, dbConn, syncCfg, logger)
+			return pipeline.Run(cmd.Context())
 		},
 	}
 
@@ -124,9 +62,78 @@ func newSyncCmd() *cobra.Command {
 	cmd.Flags().StringVar(&since, "since", "", "sync since date (ISO 8601)")
 	cmd.Flags().StringVar(&until, "until", "", "sync until date (ISO 8601)")
 	cmd.Flags().IntVar(&concurrency, "concurrency", 0, "max concurrent repo syncs (default from config)")
-	cmd.Flags().BoolVar(&noUI, "no-ui", false, "disable interactive progress UI")
 
 	return cmd
+}
+
+// loadConfigOrDefault loads config from file, or returns a usable default if the file doesn't exist.
+func loadConfigOrDefault(path string) *config.Config {
+	cfg, err := config.Load(path)
+	if err == nil {
+		return cfg
+	}
+	return config.Default()
+}
+
+// buildTokenPool creates a token pool from config tokens, falling back to auto-detected tokens.
+func buildTokenPool(cfg *config.Config, logger *slog.Logger) (*ghclient.TokenPool, error) {
+	pool := ghclient.NewTokenPool(logger)
+
+	for _, tokCfg := range cfg.Tokens {
+		switch tokCfg.Kind {
+		case "pat":
+			token := os.Getenv(tokCfg.Env)
+			if token == "" {
+				continue
+			}
+			scopes := convertScopes(tokCfg.Scopes)
+			pool.AddPATToken(tokCfg.Env, token, scopes)
+		case "app":
+			var keyBytes []byte
+			var err error
+			if tokCfg.PrivateKeyPath != "" {
+				keyBytes, err = os.ReadFile(tokCfg.PrivateKeyPath)
+				if err != nil {
+					return nil, fmt.Errorf("reading private key from %s: %w", tokCfg.PrivateKeyPath, err)
+				}
+			} else {
+				keyBytes = []byte(os.Getenv(tokCfg.PrivateKeyEnv))
+			}
+			scopes := convertScopes(tokCfg.Scopes)
+			if err := pool.AddAppToken(tokCfg.Env, tokCfg.AppID, tokCfg.InstallationID, keyBytes, scopes); err != nil {
+				return nil, fmt.Errorf("adding app token %s: %w", tokCfg.Env, err)
+			}
+		}
+	}
+
+	if pool.Len() > 0 {
+		return pool, nil
+	}
+
+	// Auto-detect: GH_TOKEN, GITHUB_TOKEN, then gh auth token
+	token := detectToken()
+	if token == "" {
+		return nil, fmt.Errorf("no token: set GH_TOKEN or GITHUB_TOKEN, run 'gh auth login', or configure tokens in config file")
+	}
+	pool.AddPATToken("auto", token, nil) // nil scopes = wildcard (all orgs)
+	return pool, nil
+}
+
+// detectToken tries GH_TOKEN, GITHUB_TOKEN, then `gh auth token`.
+func detectToken() string {
+	if t := os.Getenv("GH_TOKEN"); t != "" {
+		return t
+	}
+	if t := os.Getenv("GITHUB_TOKEN"); t != "" {
+		return t
+	}
+	out, err := exec.Command("gh", "auth", "token").Output()
+	if err == nil {
+		if t := strings.TrimSpace(string(out)); t != "" {
+			return t
+		}
+	}
+	return ""
 }
 
 func resolveDBPath(cfg *config.Config) string {
@@ -147,7 +154,6 @@ func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until stri
 		ExemptAuthors:       cfg.Exemptions.Authors,
 	}
 
-	// Map required checks from config
 	for _, rc := range cfg.AuditRules.RequiredChecks {
 		syncCfg.RequiredChecks = append(syncCfg.RequiredChecks, sync.RequiredCheck{
 			Name:       rc.Name,
@@ -155,9 +161,7 @@ func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until stri
 		})
 	}
 
-	// Override orgs from flags
 	if len(repos) > 0 {
-		// --repo flag: group by org extracted from "org/repo" format
 		orgRepos := make(map[string][]string)
 		for _, r := range repos {
 			parts := strings.SplitN(r, "/", 2)
@@ -187,7 +191,6 @@ func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until stri
 		}
 	}
 
-	// Parse since/until
 	if since != "" {
 		if t, err := time.Parse(time.RFC3339, since); err == nil {
 			syncCfg.Since = t
@@ -214,7 +217,6 @@ func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until stri
 	return syncCfg, nil
 }
 
-// convertScopes converts config.OrgScope to github.OrgScope.
 func convertScopes(cfgScopes []config.OrgScope) []ghclient.OrgScope {
 	scopes := make([]ghclient.OrgScope, len(cfgScopes))
 	for i, s := range cfgScopes {

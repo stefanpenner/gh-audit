@@ -3,8 +3,10 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestLoad(t *testing.T) {
@@ -188,60 +190,37 @@ tokens:
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
 			p := filepath.Join(dir, "config.yaml")
-			if err := os.WriteFile(p, []byte(tt.yaml), 0o644); err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, os.WriteFile(p, []byte(tt.yaml), 0o644))
+
 			cfg, err := Load(p)
 			if tt.wantErr != "" {
-				if err == nil {
-					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
-				}
-				if !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("expected error containing %q, got: %v", tt.wantErr, err)
-				}
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
 				return
 			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			require.NoError(t, err)
 
-			// Check defaults for the "default values" test case
 			if tt.name == "default values applied correctly" {
-				if cfg.Database != DefaultDBPath() {
-					t.Errorf("expected default db path %q, got %q", DefaultDBPath(), cfg.Database)
-				}
-				if cfg.Sync.Concurrency != 10 {
-					t.Errorf("expected default concurrency 10, got %d", cfg.Sync.Concurrency)
-				}
-				if cfg.Sync.InitialLookbackDays != 90 {
-					t.Errorf("expected default lookback 90, got %d", cfg.Sync.InitialLookbackDays)
-				}
+				assert.Equal(t, DefaultDBPath(), cfg.Database)
+				assert.Equal(t, 10, cfg.Sync.Concurrency)
+				assert.Equal(t, 90, cfg.Sync.InitialLookbackDays)
 			}
 		})
 	}
 
 	t.Run("config file not found", func(t *testing.T) {
 		_, err := Load("/nonexistent/path/config.yaml")
-		if err == nil {
-			t.Fatal("expected error for missing file")
-		}
-		if !strings.Contains(err.Error(), "reading config") {
-			t.Fatalf("expected 'reading config' error, got: %v", err)
-		}
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "reading config")
 	})
 
 	t.Run("invalid YAML", func(t *testing.T) {
 		dir := t.TempDir()
 		p := filepath.Join(dir, "bad.yaml")
-		if err := os.WriteFile(p, []byte("{{{{not yaml"), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.WriteFile(p, []byte("{{{{not yaml"), 0o644))
+
 		_, err := Load(p)
-		if err == nil {
-			t.Fatal("expected error for invalid YAML")
-		}
-		if !strings.Contains(err.Error(), "parsing config") {
-			t.Fatalf("expected 'parsing config' error, got: %v", err)
-		}
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "parsing config")
 	})
 }

@@ -7,9 +7,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func testLogger() *slog.Logger {
@@ -111,24 +114,15 @@ func TestTokenPool_Pick(t *testing.T) {
 
 			client, err := pool.Pick(context.Background(), tt.org, tt.repo)
 			if tt.wantErr {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
+				require.Error(t, err)
 				return
 			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if client == nil {
-				t.Fatal("expected non-nil client")
-			}
+			require.NoError(t, err)
+			require.NotNil(t, client)
 
-			// Verify correct token was picked by checking the transport chain.
 			if tt.wantToken != "" {
 				transport := client.Transport.(*rateLimitTransport)
-				if transport.token.ID != tt.wantToken {
-					t.Errorf("expected token %q, got %q", tt.wantToken, transport.token.ID)
-				}
+				assert.Equal(t, tt.wantToken, transport.token.ID)
 			}
 		})
 	}
@@ -147,12 +141,8 @@ func TestTokenPool_Pick_WaitsWhenAllExhausted(t *testing.T) {
 	client, err := pool.Pick(ctx, "myorg", "repo")
 	elapsed := time.Since(start)
 
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if client == nil {
-		t.Fatal("expected non-nil client")
-	}
+	require.NoError(t, err)
+	require.NotNil(t, client)
 	// Should have waited at least a short time (reset was 200ms in future).
 	// Be lenient since time.Unix has second precision.
 	if elapsed < 100*time.Millisecond {
@@ -170,9 +160,7 @@ func TestTokenPool_Pick_RespectsContextCancellation(t *testing.T) {
 	defer cancel()
 
 	_, err := pool.Pick(ctx, "myorg", "repo")
-	if err == nil {
-		t.Fatal("expected error due to context cancellation")
-	}
+	require.Error(t, err)
 }
 
 func TestTokenPool_MarkDisabled(t *testing.T) {
@@ -183,13 +171,9 @@ func TestTokenPool_MarkDisabled(t *testing.T) {
 	pool.MarkDisabled("tok1")
 
 	client, err := pool.Pick(context.Background(), "myorg", "repo")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 	transport := client.Transport.(*rateLimitTransport)
-	if transport.token.ID != "tok2" {
-		t.Errorf("expected tok2 after disabling tok1, got %s", transport.token.ID)
-	}
+	assert.Equal(t, "tok2", transport.token.ID)
 }
 
 func TestRateLimitTransport_UpdatesHeaders(t *testing.T) {
@@ -211,20 +195,12 @@ func TestRateLimitTransport_UpdatesHeaders(t *testing.T) {
 
 	client := &http.Client{Transport: transport}
 	resp, err := client.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 	resp.Body.Close()
 
-	if got := token.rateRemaining.Load(); got != 4321 {
-		t.Errorf("rateRemaining = %d, want 4321", got)
-	}
-	if got := token.rateLimit.Load(); got != 5000 {
-		t.Errorf("rateLimit = %d, want 5000", got)
-	}
-	if got := token.rateResetAt.Load(); got != 1700000000 {
-		t.Errorf("rateResetAt = %d, want 1700000000", got)
-	}
+	assert.Equal(t, int64(4321), token.rateRemaining.Load())
+	assert.Equal(t, int64(5000), token.rateLimit.Load())
+	assert.Equal(t, int64(1700000000), token.rateResetAt.Load())
 }
 
 func TestRateLimitTransport_Handles429(t *testing.T) {
@@ -253,17 +229,11 @@ func TestRateLimitTransport_Handles429(t *testing.T) {
 
 	client := &http.Client{Transport: transport}
 	resp, err := client.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 	resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		t.Errorf("expected 200 after retry, got %d", resp.StatusCode)
-	}
-	if callCount != 2 {
-		t.Errorf("expected 2 calls (original + retry), got %d", callCount)
-	}
+	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(t, 2, callCount)
 }
 
 func TestAddPATToken(t *testing.T) {
@@ -273,19 +243,12 @@ func TestAddPATToken(t *testing.T) {
 	pool.mu.RLock()
 	defer pool.mu.RUnlock()
 
-	if len(pool.tokens) != 1 {
-		t.Fatalf("expected 1 token, got %d", len(pool.tokens))
-	}
+	require.Len(t, pool.tokens, 1)
 	tok := pool.tokens[0]
-	if tok.ID != "pat1" {
-		t.Errorf("expected ID pat1, got %s", tok.ID)
-	}
-	if tok.Kind != TokenKindPAT {
-		t.Errorf("expected kind PAT, got %s", tok.Kind)
-	}
-	if len(tok.scopes) != 1 || tok.scopes[0].Org != "org1" {
-		t.Errorf("unexpected scopes: %+v", tok.scopes)
-	}
+	assert.Equal(t, "pat1", tok.ID)
+	assert.Equal(t, TokenKindPAT, tok.Kind)
+	require.Len(t, tok.scopes, 1)
+	assert.Equal(t, "org1", tok.scopes[0].Org)
 }
 
 func TestRateLimitTransport_Handles403Abuse(t *testing.T) {
@@ -306,34 +269,13 @@ func TestRateLimitTransport_Handles403Abuse(t *testing.T) {
 
 	client := &http.Client{Transport: transport}
 	_, err := client.Get(srv.URL)
-	if err == nil {
-		t.Fatal("expected error for abuse detection")
-	}
+	require.Error(t, err)
 
-	// The error should be wrapped - check the underlying type.
-	// http.Client wraps transport errors.
-	if _, ok := err.(*SecondaryRateLimitError); ok {
-		// Direct type match.
-	} else {
-		// http.Client wraps it in url.Error.
-		errMsg := err.Error()
-		if !contains(errMsg, "secondary rate limit") && !contains(errMsg, "abuse") {
-			t.Errorf("expected abuse/secondary rate limit error, got: %v", err)
-		}
-	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchString(s, substr)
-}
-
-func searchString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
+	errMsg := err.Error()
+	assert.True(t,
+		strings.Contains(errMsg, "secondary rate limit") || strings.Contains(errMsg, "abuse"),
+		"expected abuse/secondary rate limit error, got: %v", err,
+	)
 }
 
 func TestParseRetryAfter(t *testing.T) {
@@ -347,10 +289,7 @@ func TestParseRetryAfter(t *testing.T) {
 		{"120", 120 * time.Second},
 	}
 	for _, tt := range tests {
-		got := parseRetryAfter(tt.input)
-		if got != tt.want {
-			t.Errorf("parseRetryAfter(%q) = %v, want %v", tt.input, got, tt.want)
-		}
+		assert.Equal(t, tt.want, parseRetryAfter(tt.input), "parseRetryAfter(%q)", tt.input)
 	}
 }
 
@@ -400,20 +339,7 @@ func TestScopeMatches(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := scopeMatches(tt.scopes, tt.org, tt.repo)
-			if got != tt.want {
-				t.Errorf("scopeMatches = %v, want %v", got, tt.want)
-			}
+			assert.Equal(t, tt.want, scopeMatches(tt.scopes, tt.org, tt.repo))
 		})
 	}
-}
-
-// helper to create a test server that returns valid rate limit headers.
-func newRateLimitServer(remaining, limit int, resetAt int64) *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("x-ratelimit-remaining", strconv.Itoa(remaining))
-		w.Header().Set("x-ratelimit-limit", strconv.Itoa(limit))
-		w.Header().Set("x-ratelimit-reset", strconv.FormatInt(resetAt, 10))
-		w.WriteHeader(200)
-	}))
 }

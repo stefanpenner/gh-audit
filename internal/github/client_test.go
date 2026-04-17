@@ -10,6 +10,8 @@ import (
 	"time"
 
 	gogithub "github.com/google/go-github/v72/github"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // mockTokenPool creates a TokenPool with a single PAT token whose transport
@@ -113,17 +115,11 @@ func TestListOrgRepos(t *testing.T) {
 
 			repos, err := client.ListOrgRepos(context.Background(), "testorg")
 			if tt.wantErr {
-				if err == nil {
-					t.Fatal("expected error")
-				}
+				require.Error(t, err)
 				return
 			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if len(repos) != tt.wantCount {
-				t.Errorf("got %d repos, want %d", len(repos), tt.wantCount)
-			}
+			require.NoError(t, err)
+			assert.Len(t, repos, tt.wantCount)
 		})
 	}
 }
@@ -217,17 +213,11 @@ func TestListCommits(t *testing.T) {
 
 			commits, err := client.ListCommits(context.Background(), "testorg", "repo", "main", since, until)
 			if tt.wantErr {
-				if err == nil {
-					t.Fatal("expected error")
-				}
+				require.Error(t, err)
 				return
 			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if len(commits) != tt.wantCount {
-				t.Errorf("got %d commits, want %d", len(commits), tt.wantCount)
-			}
+			require.NoError(t, err)
+			assert.Len(t, commits, tt.wantCount)
 		})
 	}
 }
@@ -263,28 +253,111 @@ func TestGetCommitDetail(t *testing.T) {
 	client := NewClient(pool, testLogger())
 
 	commit, err := client.GetCommitDetail(context.Background(), "testorg", "repo", "abc123")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 
-	if commit.SHA != "abc123" {
-		t.Errorf("SHA = %q, want abc123", commit.SHA)
-	}
-	if commit.Additions != 42 {
-		t.Errorf("Additions = %d, want 42", commit.Additions)
-	}
-	if commit.Deletions != 13 {
-		t.Errorf("Deletions = %d, want 13", commit.Deletions)
-	}
-	if commit.AuthorLogin != "developer" {
-		t.Errorf("AuthorLogin = %q, want developer", commit.AuthorLogin)
-	}
-	if commit.Message != "feat: add feature" {
-		t.Errorf("Message = %q, want 'feat: add feature'", commit.Message)
-	}
-	if commit.ParentCount != 1 {
-		t.Errorf("ParentCount = %d, want 1", commit.ParentCount)
-	}
+	assert.Equal(t, "abc123", commit.SHA)
+	assert.Equal(t, 42, commit.Additions)
+	assert.Equal(t, 13, commit.Deletions)
+	assert.Equal(t, "developer", commit.AuthorLogin)
+	assert.Equal(t, "feat: add feature", commit.Message)
+	assert.Equal(t, 1, commit.ParentCount)
+}
+
+func TestListCommitsUsesCommitterDate(t *testing.T) {
+	authorDate := "2024-01-15T10:00:00Z"
+	committerDate := "2024-01-20T14:00:00Z"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		commits := []map[string]any{
+			{
+				"sha":      "abc123",
+				"html_url": "https://github.com/testorg/repo/commit/abc123",
+				"commit": map[string]any{
+					"message": "fix: something",
+					"author": map[string]any{
+						"email": "dev@example.com",
+						"date":  authorDate,
+					},
+					"committer": map[string]any{
+						"email": "merger@example.com",
+						"date":  committerDate,
+					},
+				},
+				"author":  map[string]any{"login": "developer"},
+				"parents": []map[string]any{},
+			},
+		}
+		json.NewEncoder(w).Encode(commits)
+	}))
+	defer srv.Close()
+
+	pool := mockTokenPool(t, srv.URL)
+	client := NewClient(pool, testLogger())
+
+	since := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	until := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
+	commits, err := client.ListCommits(context.Background(), "testorg", "repo", "main", since, until)
+	require.NoError(t, err)
+	require.Len(t, commits, 1)
+	wantTime, _ := time.Parse(time.RFC3339, committerDate)
+	assert.True(t, commits[0].CommittedAt.Equal(wantTime), "CommittedAt = %v, want committer date %v (not author date %s)", commits[0].CommittedAt, wantTime, authorDate)
+}
+
+func TestGetCommitDetailUsesCommitterDate(t *testing.T) {
+	authorDate := "2024-01-15T10:00:00Z"
+	committerDate := "2024-01-20T14:00:00Z"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		commit := map[string]any{
+			"sha":      "abc123",
+			"html_url": "https://github.com/testorg/repo/commit/abc123",
+			"commit": map[string]any{
+				"message": "feat: add feature",
+				"author": map[string]any{
+					"email": "dev@example.com",
+					"date":  authorDate,
+				},
+				"committer": map[string]any{
+					"email": "merger@example.com",
+					"date":  committerDate,
+				},
+			},
+			"author":    map[string]any{"login": "developer"},
+			"committer": map[string]any{"login": "merger"},
+			"parents":   []map[string]any{{"sha": "parent1"}},
+			"stats":     map[string]any{"additions": 10, "deletions": 5},
+		}
+		json.NewEncoder(w).Encode(commit)
+	}))
+	defer srv.Close()
+
+	pool := mockTokenPool(t, srv.URL)
+	client := NewClient(pool, testLogger())
+
+	commit, err := client.GetCommitDetail(context.Background(), "testorg", "repo", "abc123")
+	require.NoError(t, err)
+	wantTime, _ := time.Parse(time.RFC3339, committerDate)
+	assert.True(t, commit.CommittedAt.Equal(wantTime), "CommittedAt = %v, want committer date %v (not author date %s)", commit.CommittedAt, wantTime, authorDate)
+}
+
+func TestGetRepo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		repo := map[string]any{
+			"name":           "myrepo",
+			"full_name":      "testorg/myrepo",
+			"default_branch": "develop",
+			"archived":       false,
+		}
+		json.NewEncoder(w).Encode(repo)
+	}))
+	defer srv.Close()
+
+	pool := mockTokenPool(t, srv.URL)
+	client := NewClient(pool, testLogger())
+
+	info, err := client.GetRepo(context.Background(), "testorg", "myrepo")
+	require.NoError(t, err)
+	assert.Equal(t, "myrepo", info.Name)
+	assert.Equal(t, "develop", info.DefaultBranch)
+	assert.False(t, info.Archived)
 }
 
 func TestParseCoAuthors(t *testing.T) {
@@ -326,15 +399,13 @@ func TestParseCoAuthors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := parseCoAuthors(tt.message)
-			if len(got) != tt.want {
-				t.Fatalf("parseCoAuthors() returned %d, want %d", len(got), tt.want)
-			}
+			require.Len(t, got, tt.want)
 			for i, ca := range got {
-				if i < len(tt.names) && ca.Name != tt.names[i] {
-					t.Errorf("co-author[%d].Name = %q, want %q", i, ca.Name, tt.names[i])
+				if i < len(tt.names) {
+					assert.Equal(t, tt.names[i], ca.Name, "co-author[%d].Name", i)
 				}
-				if i < len(tt.emails) && ca.Email != tt.emails[i] {
-					t.Errorf("co-author[%d].Email = %q, want %q", i, ca.Email, tt.emails[i])
+				if i < len(tt.emails) {
+					assert.Equal(t, tt.emails[i], ca.Email, "co-author[%d].Email", i)
 				}
 			}
 		})

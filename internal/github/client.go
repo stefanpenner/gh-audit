@@ -78,6 +78,30 @@ func (c *Client) ListOrgRepos(ctx context.Context, org string) ([]model.RepoInfo
 	return allRepos, nil
 }
 
+// GetRepo returns metadata for a single repository.
+func (c *Client) GetRepo(ctx context.Context, org, repo string) (model.RepoInfo, error) {
+	gh, err := c.ghClient(ctx, org, repo)
+	if err != nil {
+		return model.RepoInfo{}, err
+	}
+
+	r, _, err := gh.Repositories.Get(ctx, org, repo)
+	if err != nil {
+		return model.RepoInfo{}, fmt.Errorf("getting repo %s/%s: %w", org, repo, err)
+	}
+
+	info := model.RepoInfo{
+		Org:      org,
+		Name:     r.GetName(),
+		FullName: r.GetFullName(),
+		Archived: r.GetArchived(),
+	}
+	if r.DefaultBranch != nil {
+		info.DefaultBranch = r.GetDefaultBranch()
+	}
+	return info, nil
+}
+
 // ListCommits returns all commits on the specified branch within the time range, paginating.
 // The branch parameter is passed as the SHA field in the GitHub API to filter by branch.
 func (c *Client) ListCommits(ctx context.Context, org, repo, branch string, since, until time.Time) ([]model.Commit, error) {
@@ -117,7 +141,9 @@ func (c *Client) ListCommits(ctx context.Context, org, repo, branch string, sinc
 				commit.Message = rc.GetCommit().GetMessage()
 				if rc.GetCommit().GetAuthor() != nil {
 					commit.AuthorEmail = rc.GetCommit().GetAuthor().GetEmail()
-					commit.CommittedAt = rc.GetCommit().GetAuthor().GetDate().Time
+				}
+				if rc.GetCommit().GetCommitter() != nil {
+					commit.CommittedAt = rc.GetCommit().GetCommitter().GetDate().Time
 				}
 			}
 			commit.ParentCount = len(rc.Parents)
@@ -163,7 +189,9 @@ func (c *Client) GetCommitDetail(ctx context.Context, org, repo, sha string) (*m
 		commit.Message = rc.GetCommit().GetMessage()
 		if rc.GetCommit().GetAuthor() != nil {
 			commit.AuthorEmail = rc.GetCommit().GetAuthor().GetEmail()
-			commit.CommittedAt = rc.GetCommit().GetAuthor().GetDate().Time
+		}
+		if rc.GetCommit().GetCommitter() != nil {
+			commit.CommittedAt = rc.GetCommit().GetCommitter().GetDate().Time
 		}
 	}
 	commit.ParentCount = len(rc.Parents)
@@ -174,6 +202,198 @@ func (c *Client) GetCommitDetail(ctx context.Context, org, repo, sha string) (*m
 	}
 
 	return commit, nil
+}
+
+// ListCommitPullRequests returns merged PRs associated with a commit.
+func (c *Client) ListCommitPullRequests(ctx context.Context, org, repo, sha string) ([]model.PullRequest, error) {
+	var allPRs []model.PullRequest
+	opts := &gogithub.ListOptions{PerPage: 100}
+
+	for {
+		gh, err := c.ghClient(ctx, org, repo)
+		if err != nil {
+			return nil, err
+		}
+
+		prs, resp, err := gh.PullRequests.ListPullRequestsWithCommit(ctx, org, repo, sha, opts)
+		if err != nil {
+			return nil, fmt.Errorf("listing PRs for commit %s/%s@%s page %d: %w", org, repo, sha, opts.Page, err)
+		}
+
+		for _, pr := range prs {
+			if !pr.GetMerged() {
+				continue
+			}
+			p := model.PullRequest{
+				Org:     org,
+				Repo:    repo,
+				Number:  pr.GetNumber(),
+				Title:   pr.GetTitle(),
+				Merged:  true,
+				HeadSHA: pr.GetHead().GetSHA(),
+				Href:    pr.GetHTMLURL(),
+			}
+			if pr.GetMergeCommitSHA() != "" {
+				p.MergeCommitSHA = pr.GetMergeCommitSHA()
+			}
+			if pr.GetUser() != nil {
+				p.AuthorLogin = pr.GetUser().GetLogin()
+			}
+			if pr.GetMergedBy() != nil {
+				p.MergedByLogin = pr.GetMergedBy().GetLogin()
+			}
+			if pr.MergedAt != nil {
+				p.MergedAt = pr.MergedAt.Time
+			}
+			allPRs = append(allPRs, p)
+		}
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	return allPRs, nil
+}
+
+// ListReviews returns all reviews for a PR, fully paginated.
+func (c *Client) ListReviews(ctx context.Context, org, repo string, prNumber int) ([]model.Review, error) {
+	var allReviews []model.Review
+	opts := &gogithub.ListOptions{PerPage: 100}
+
+	for {
+		gh, err := c.ghClient(ctx, org, repo)
+		if err != nil {
+			return nil, err
+		}
+
+		reviews, resp, err := gh.PullRequests.ListReviews(ctx, org, repo, prNumber, opts)
+		if err != nil {
+			return nil, fmt.Errorf("listing reviews for %s/%s#%d page %d: %w", org, repo, prNumber, opts.Page, err)
+		}
+
+		for _, r := range reviews {
+			review := model.Review{
+				Org:      org,
+				Repo:     repo,
+				PRNumber: prNumber,
+				ReviewID: r.GetID(),
+				State:    r.GetState(),
+			}
+			if r.User != nil {
+				review.ReviewerLogin = r.User.GetLogin()
+			}
+			if r.CommitID != nil {
+				review.CommitID = r.GetCommitID()
+			}
+			if r.SubmittedAt != nil {
+				review.SubmittedAt = r.SubmittedAt.Time
+			}
+			if r.HTMLURL != nil {
+				review.Href = r.GetHTMLURL()
+			}
+			allReviews = append(allReviews, review)
+		}
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	return allReviews, nil
+}
+
+// ListCheckRunsForRef returns all check runs for a git ref (SHA), fully paginated.
+func (c *Client) ListCheckRunsForRef(ctx context.Context, org, repo, ref string) ([]model.CheckRun, error) {
+	var allRuns []model.CheckRun
+	opts := &gogithub.ListCheckRunsOptions{
+		ListOptions: gogithub.ListOptions{PerPage: 100},
+	}
+
+	for {
+		gh, err := c.ghClient(ctx, org, repo)
+		if err != nil {
+			return nil, err
+		}
+
+		result, resp, err := gh.Checks.ListCheckRunsForRef(ctx, org, repo, ref, opts)
+		if err != nil {
+			return nil, fmt.Errorf("listing check runs for %s/%s@%s page %d: %w", org, repo, ref, opts.Page, err)
+		}
+
+		for _, cr := range result.CheckRuns {
+			run := model.CheckRun{
+				Org:        org,
+				Repo:       repo,
+				CommitSHA:  ref,
+				CheckRunID: cr.GetID(),
+				CheckName:  cr.GetName(),
+				Status:     cr.GetStatus(),
+				Conclusion: cr.GetConclusion(),
+			}
+			if cr.CompletedAt != nil {
+				run.CompletedAt = cr.CompletedAt.Time
+			}
+			allRuns = append(allRuns, run)
+		}
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	return allRuns, nil
+}
+
+// EnrichCommits fetches PRs, reviews, and check runs for a batch of commits via REST.
+// Each commit triggers: GET commit (stats), GET commit PRs, GET reviews per PR, GET check runs per PR head.
+func (c *Client) EnrichCommits(ctx context.Context, org, repo string, shas []string) ([]model.EnrichmentResult, error) {
+	results := make([]model.EnrichmentResult, len(shas))
+
+	for i, sha := range shas {
+		detail, err := c.GetCommitDetail(ctx, org, repo, sha)
+		if err != nil {
+			return nil, fmt.Errorf("commit %s: %w", sha[:12], err)
+		}
+
+		prs, err := c.ListCommitPullRequests(ctx, org, repo, sha)
+		if err != nil {
+			return nil, fmt.Errorf("commit %s PRs: %w", sha[:12], err)
+		}
+
+		var allReviews []model.Review
+		var allCheckRuns []model.CheckRun
+		seenCheckRef := make(map[string]bool)
+
+		for _, pr := range prs {
+			reviews, err := c.ListReviews(ctx, org, repo, pr.Number)
+			if err != nil {
+				return nil, fmt.Errorf("commit %s PR #%d reviews: %w", sha[:12], pr.Number, err)
+			}
+			allReviews = append(allReviews, reviews...)
+
+			if pr.HeadSHA != "" && !seenCheckRef[pr.HeadSHA] {
+				seenCheckRef[pr.HeadSHA] = true
+				runs, err := c.ListCheckRunsForRef(ctx, org, repo, pr.HeadSHA)
+				if err != nil {
+					return nil, fmt.Errorf("commit %s PR #%d check runs: %w", sha[:12], pr.Number, err)
+				}
+				allCheckRuns = append(allCheckRuns, runs...)
+			}
+		}
+
+		results[i] = model.EnrichmentResult{
+			Commit:    *detail,
+			PRs:       prs,
+			Reviews:   allReviews,
+			CheckRuns: allCheckRuns,
+		}
+	}
+
+	return results, nil
 }
 
 // parseCoAuthors extracts co-authors from "Co-authored-by" trailers in commit messages.
