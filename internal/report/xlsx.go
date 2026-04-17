@@ -42,6 +42,10 @@ func (r *Reporter) GenerateXLSX(ctx context.Context, opts ReportOpts, outputPath
 	f := excelize.NewFile()
 	defer f.Close()
 
+	linkStyle, _ := f.NewStyle(&excelize.Style{
+		Font: &excelize.Font{Color: "0563C1", Underline: "single"},
+	})
+
 	// --- Sheet 1: Summary ---
 	summarySheet := "Summary"
 	f.SetSheetName("Sheet1", summarySheet)
@@ -55,7 +59,7 @@ func (r *Reporter) GenerateXLSX(ctx context.Context, opts ReportOpts, outputPath
 	if _, err := f.NewSheet(allSheet); err != nil {
 		return fmt.Errorf("creating all commits sheet: %w", err)
 	}
-	if err := writeAllCommitsSheet(f, allSheet, details); err != nil {
+	if err := writeAllCommitsSheet(f, allSheet, details, linkStyle); err != nil {
 		return fmt.Errorf("writing all commits sheet: %w", err)
 	}
 
@@ -68,7 +72,7 @@ func (r *Reporter) GenerateXLSX(ctx context.Context, opts ReportOpts, outputPath
 	sort.Slice(nonCompliant, func(i, j int) bool {
 		return nonCompliant[i].CommittedAt.After(nonCompliant[j].CommittedAt)
 	})
-	if err := writeNonCompliantSheet(f, ncSheet, nonCompliant); err != nil {
+	if err := writeNonCompliantSheet(f, ncSheet, nonCompliant, linkStyle); err != nil {
 		return fmt.Errorf("writing non-compliant sheet: %w", err)
 	}
 
@@ -77,7 +81,7 @@ func (r *Reporter) GenerateXLSX(ctx context.Context, opts ReportOpts, outputPath
 	if _, err := f.NewSheet(exSheet); err != nil {
 		return fmt.Errorf("creating exemptions sheet: %w", err)
 	}
-	if err := writeExemptionsSheet(f, exSheet, exemptions); err != nil {
+	if err := writeExemptionsSheet(f, exSheet, exemptions, linkStyle); err != nil {
 		return fmt.Errorf("writing exemptions sheet: %w", err)
 	}
 
@@ -86,7 +90,7 @@ func (r *Reporter) GenerateXLSX(ctx context.Context, opts ReportOpts, outputPath
 	if _, err := f.NewSheet(saSheet); err != nil {
 		return fmt.Errorf("creating self-approved sheet: %w", err)
 	}
-	if err := writeSelfApprovedSheet(f, saSheet, selfApproved); err != nil {
+	if err := writeSelfApprovedSheet(f, saSheet, selfApproved, linkStyle); err != nil {
 		return fmt.Errorf("writing self-approved sheet: %w", err)
 	}
 
@@ -232,20 +236,14 @@ func detailHeaders() []string {
 	return []string{
 		"Org", "Repo", "SHA", "Author", "Committer", "Date", "Message",
 		"Branch", "PR #", "Merged By", "Approved?", "Approver", "Self-Approved?",
-		"Owner Approval", "Compliant?", "Reasons", "Commit Link", "PR Link",
+		"Owner Approval", "Compliant?", "Reasons",
 	}
 }
 
-// writeAllCommitsSheet uses StreamWriter for potentially large datasets.
-func writeAllCommitsSheet(f *excelize.File, sheet string, details []DetailRow) error {
+// writeAllCommitsSheet writes all commits with clickable hyperlinks on SHA and PR columns.
+func writeAllCommitsSheet(f *excelize.File, sheet string, details []DetailRow, linkStyle int) error {
 	headers := detailHeaders()
 
-	sw, err := f.NewStreamWriter(sheet)
-	if err != nil {
-		return fmt.Errorf("creating stream writer: %w", err)
-	}
-
-	// Header style
 	headerStyle, err := f.NewStyle(&excelize.Style{
 		Font:      &excelize.Font{Bold: true, Color: "FFFFFF"},
 		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"4472C4"}},
@@ -255,39 +253,21 @@ func writeAllCommitsSheet(f *excelize.File, sheet string, details []DetailRow) e
 		return err
 	}
 
-	// Write header row
-	headerRow := make([]any, len(headers))
-	for i, h := range headers {
-		headerRow[i] = excelize.Cell{StyleID: headerStyle, Value: h}
-	}
-	if err := sw.SetRow("A1", headerRow); err != nil {
-		return err
+	// Write headers
+	for col, h := range headers {
+		cell := cellName(col+1, 1)
+		f.SetCellValue(sheet, cell, h)
+		f.SetCellStyle(sheet, cell, cell, headerStyle)
 	}
 
-	// Write data rows
+	// Write data rows with hyperlinks
 	for i, d := range details {
-		row := i + 2
-		cellRef, _ := excelize.CoordinatesToCellName(1, row)
-
-		rowData := detailRowData(d)
-		if err := sw.SetRow(cellRef, rowData); err != nil {
-			return err
-		}
+		writeDetailRowWithHyperlinks(f, sheet, i+2, d, linkStyle)
 	}
 
-	if err := sw.Flush(); err != nil {
-		return err
-	}
-
-	// Auto-filter on all columns (must be after flush)
-	if len(details) > 0 {
-		lastCell := cellName(len(headers), len(details)+1)
-		f.AutoFilter(sheet, "A1:"+lastCell, nil)
-	} else {
-		// Empty data: still add auto-filter on header
-		lastCell := cellName(len(headers), 1)
-		f.AutoFilter(sheet, "A1:"+lastCell, nil)
-	}
+	// Auto-filter
+	lastCell := cellName(len(headers), max(len(details)+1, 1))
+	f.AutoFilter(sheet, "A1:"+lastCell, nil)
 
 	// Freeze header row
 	f.SetPanes(sheet, &excelize.Panes{
@@ -305,7 +285,7 @@ func writeAllCommitsSheet(f *excelize.File, sheet string, details []DetailRow) e
 }
 
 // writeNonCompliantSheet writes non-compliant rows with red header and a Resolution column.
-func writeNonCompliantSheet(f *excelize.File, sheet string, details []DetailRow) error {
+func writeNonCompliantSheet(f *excelize.File, sheet string, details []DetailRow, linkStyle int) error {
 	headers := append(detailHeaders(), "Resolution")
 
 	headerStyle, err := f.NewStyle(&excelize.Style{
@@ -327,7 +307,7 @@ func writeNonCompliantSheet(f *excelize.File, sheet string, details []DetailRow)
 	// Write data rows with hyperlinks
 	for i, d := range details {
 		row := i + 2
-		writeDetailRowWithHyperlinks(f, sheet, row, d)
+		writeDetailRowWithHyperlinks(f, sheet, row, d, linkStyle)
 		// Resolution column is empty (for auditor notes)
 		f.SetCellValue(sheet, cellName(len(headers), row), "")
 	}
@@ -352,7 +332,7 @@ func writeNonCompliantSheet(f *excelize.File, sheet string, details []DetailRow)
 }
 
 // writeExemptionsSheet writes exempted rows (bots, empty commits) with green header.
-func writeExemptionsSheet(f *excelize.File, sheet string, details []DetailRow) error {
+func writeExemptionsSheet(f *excelize.File, sheet string, details []DetailRow, linkStyle int) error {
 	headers := append(detailHeaders(), "Exemption Reason")
 
 	headerStyle, err := f.NewStyle(&excelize.Style{
@@ -374,7 +354,7 @@ func writeExemptionsSheet(f *excelize.File, sheet string, details []DetailRow) e
 	// Write data rows
 	for i, d := range details {
 		row := i + 2
-		writeDetailRowWithHyperlinks(f, sheet, row, d)
+		writeDetailRowWithHyperlinks(f, sheet, row, d, linkStyle)
 
 		// Exemption reason
 		reason := ""
@@ -408,7 +388,7 @@ func writeExemptionsSheet(f *excelize.File, sheet string, details []DetailRow) e
 }
 
 // writeSelfApprovedSheet writes self-approved rows with orange/amber header.
-func writeSelfApprovedSheet(f *excelize.File, sheet string, details []DetailRow) error {
+func writeSelfApprovedSheet(f *excelize.File, sheet string, details []DetailRow, linkStyle int) error {
 	headers := []string{
 		"Org", "Repo", "SHA", "Author", "Reviewer", "Date", "PR #",
 		"Branch", "Message",
@@ -443,6 +423,7 @@ func writeSelfApprovedSheet(f *excelize.File, sheet string, details []DetailRow)
 		f.SetCellValue(sheet, shaCell, shaDisplay)
 		if d.CommitHref != "" {
 			f.SetCellHyperLink(sheet, shaCell, d.CommitHref, "External")
+			f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
 		}
 
 		f.SetCellValue(sheet, cellName(1, row), d.Org)
@@ -457,6 +438,7 @@ func writeSelfApprovedSheet(f *excelize.File, sheet string, details []DetailRow)
 			f.SetCellValue(sheet, prCell, d.PRNumber)
 			if d.PRHref != "" {
 				f.SetCellHyperLink(sheet, prCell, d.PRHref, "External")
+				f.SetCellStyle(sheet, prCell, prCell, linkStyle)
 			}
 		}
 
@@ -487,54 +469,9 @@ func writeSelfApprovedSheet(f *excelize.File, sheet string, details []DetailRow)
 	return nil
 }
 
-// detailRowData converts a DetailRow into a flat slice for StreamWriter.
-func detailRowData(d DetailRow) []any {
-	shaDisplay := d.SHA
-	if len(shaDisplay) > 8 {
-		shaDisplay = shaDisplay[:8]
-	}
-
-	msg := truncate(d.Message, 80)
-	dateStr := d.CommittedAt.Format("2006-01-02 15:04")
-
-	approvedStr := "No"
-	if d.HasFinalApproval {
-		approvedStr = "Yes"
-	}
-	compliantStr := "No"
-	if d.IsCompliant {
-		compliantStr = "Yes"
-	}
-	selfApprovedStr := "No"
-	if d.IsSelfApproved {
-		selfApprovedStr = "Yes"
-	}
-
-	return []any{
-		d.Org,
-		d.Repo,
-		shaDisplay,
-		d.AuthorLogin,
-		d.CommitterLogin,
-		dateStr,
-		msg,
-		d.BranchName,
-		d.PRNumber,
-		d.MergedByLogin,
-		approvedStr,
-		d.ApproverLogins,
-		selfApprovedStr,
-		d.OwnerApprovalCheck,
-		compliantStr,
-		d.Reasons,
-		d.CommitHref,
-		d.PRHref,
-	}
-}
-
 // writeDetailRowWithHyperlinks writes a single detail row using the normal (non-streaming)
 // writer, enabling hyperlinks on SHA and PR columns.
-func writeDetailRowWithHyperlinks(f *excelize.File, sheet string, row int, d DetailRow) {
+func writeDetailRowWithHyperlinks(f *excelize.File, sheet string, row int, d DetailRow, linkStyle int) {
 	shaDisplay := d.SHA
 	if len(shaDisplay) > 8 {
 		shaDisplay = shaDisplay[:8]
@@ -565,6 +502,7 @@ func writeDetailRowWithHyperlinks(f *excelize.File, sheet string, row int, d Det
 	f.SetCellValue(sheet, shaCell, shaDisplay)
 	if d.CommitHref != "" {
 		f.SetCellHyperLink(sheet, shaCell, d.CommitHref, "External")
+		f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
 	}
 
 	f.SetCellValue(sheet, cellName(4, row), d.AuthorLogin)
@@ -579,6 +517,7 @@ func writeDetailRowWithHyperlinks(f *excelize.File, sheet string, row int, d Det
 		f.SetCellValue(sheet, prCell, d.PRNumber)
 		if d.PRHref != "" {
 			f.SetCellHyperLink(sheet, prCell, d.PRHref, "External")
+			f.SetCellStyle(sheet, prCell, prCell, linkStyle)
 		}
 	}
 
@@ -589,12 +528,10 @@ func writeDetailRowWithHyperlinks(f *excelize.File, sheet string, row int, d Det
 	f.SetCellValue(sheet, cellName(14, row), d.OwnerApprovalCheck)
 	f.SetCellValue(sheet, cellName(15, row), compliantStr)
 	f.SetCellValue(sheet, cellName(16, row), d.Reasons)
-	f.SetCellValue(sheet, cellName(17, row), d.CommitHref)
-	f.SetCellValue(sheet, cellName(18, row), d.PRHref)
 }
 
 func setDetailColumnWidths(f *excelize.File, sheet string, numCols int) {
-	widths := []float64{12, 25, 12, 15, 15, 18, 40, 20, 8, 15, 10, 20, 14, 15, 10, 40, 40, 40}
+	widths := []float64{12, 25, 12, 15, 15, 18, 40, 20, 8, 15, 10, 20, 14, 15, 10, 40}
 	for i := 0; i < numCols && i < len(widths); i++ {
 		colName, _ := excelize.ColumnNumberToName(i + 1)
 		f.SetColWidth(sheet, colName, colName, widths[i])
