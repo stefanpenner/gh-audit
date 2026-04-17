@@ -116,6 +116,7 @@ const (
 		owner_approval_check owner_approval_check,
 		is_compliant         BOOLEAN,
 		reasons              TEXT[],
+		merge_strategy       TEXT,
 		commit_href          TEXT,
 		pr_href              TEXT,
 		audited_at           TIMESTAMP DEFAULT current_timestamp,
@@ -136,6 +137,7 @@ var addColumnMigrations = []string{
 	`ALTER TABLE commits ADD COLUMN committer_login TEXT`,
 	`ALTER TABLE audit_results ADD COLUMN has_stale_approval BOOLEAN DEFAULT false`,
 	`ALTER TABLE audit_results ADD COLUMN pr_count INTEGER DEFAULT 0`,
+	`ALTER TABLE audit_results ADD COLUMN merge_strategy TEXT`,
 }
 
 // allTables is the ordered list of DDL statements to run during migration.

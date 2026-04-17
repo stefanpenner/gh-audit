@@ -130,6 +130,7 @@ type AuditResult struct {
 	OwnerApprovalCheck string // success, failure, missing
 	IsCompliant        bool
 	Reasons            []string
+	MergeStrategy      string // merge, squash, direct-push, initial
 	CommitHref         string
 	PRHref             string
 	AuditedAt          time.Time

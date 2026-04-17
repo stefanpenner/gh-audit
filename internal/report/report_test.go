@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS audit_results (
 	commit_href          TEXT,
 	pr_href              TEXT,
 	is_self_approved     BOOLEAN,
+	merge_strategy       TEXT,
 	audited_at           TIMESTAMP DEFAULT current_timestamp,
 	PRIMARY KEY (org, repo, sha)
 );
@@ -566,14 +567,8 @@ func TestSelfApprovedSheetContainsOnlySelfApproved(t *testing.T) {
 	require.NoError(t, err, "getting Self-Approved rows")
 	require.Len(t, rows, 2) // 1 header + 1 data row
 
-	found := false
-	for _, cell := range rows[1] {
-		if cell == "selfaaa1" {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found, "expected self-approved SHA prefix 'selfaaa1' in row, got: %v", rows[1])
+	formula, _ := xf.GetCellFormula("Self-Approved", "C2")
+	assert.Contains(t, formula, "selfaaa1", "expected self-approved SHA in formula, got: %s", formula)
 }
 
 func TestSummarySelfApprovedCount(t *testing.T) {
@@ -610,16 +605,11 @@ func TestHyperlinksOnNonStreamingSheets(t *testing.T) {
 	require.NoError(t, err, "opening xlsx")
 	defer xf.Close()
 
-	// Non-Compliant sheet should have a hyperlink on SHA cell (C2)
-	val, err := xf.GetCellValue("Non-Compliant", "C2")
-	require.NoError(t, err, "getting cell C2")
-	assert.Equal(t, "abc12345", val)
-
-	// Check hyperlink exists
-	hasLink, target, err := xf.GetCellHyperLink("Non-Compliant", "C2")
-	require.NoError(t, err, "getting hyperlink")
-	assert.True(t, hasLink, "expected hyperlink on SHA cell C2 in Non-Compliant sheet")
-	assert.Equal(t, "https://github.com/org1/repo1/commit/abc12345678", target)
+	// Non-Compliant sheet should have a HYPERLINK formula on SHA cell (C2)
+	formula, err := xf.GetCellFormula("Non-Compliant", "C2")
+	require.NoError(t, err, "getting formula C2")
+	assert.Contains(t, formula, "abc12345", "expected SHA in HYPERLINK formula")
+	assert.Contains(t, formula, "https://github.com/org1/repo1/commit/abc12345678", "expected commit URL in HYPERLINK formula")
 }
 
 func TestEmptyNonCompliantSheetStillCreated(t *testing.T) {
@@ -794,14 +784,8 @@ func TestStaleApprovalsSheetContent(t *testing.T) {
 	require.NoError(t, err, "getting Stale Approvals rows")
 	require.Len(t, rows, 2, "expected 1 header + 1 data row")
 
-	found := false
-	for _, cell := range rows[1] {
-		if cell == "staleaaa" {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found, "expected stale SHA prefix in row, got: %v", rows[1])
+	formula, _ := xf.GetCellFormula("Stale Approvals", "C2")
+	assert.Contains(t, formula, "staleaaa", "expected stale SHA in formula, got: %s", formula)
 }
 
 func TestDetailRowHasStaleApprovalAndPRCount(t *testing.T) {

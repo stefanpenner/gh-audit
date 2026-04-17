@@ -278,9 +278,11 @@ func writeSummarySheet(f *excelize.File, sheet string, summary []SummaryRow, opt
 // detailHeaders returns the standard column headers for detail sheets.
 func detailHeaders() []string {
 	return []string{
-		"Org", "Repo", "SHA", "Author", "Committer", "Date", "Message",
-		"Branch", "PR #", "Merged By", "Approved?", "Approver", "Self-Approved?",
-		"Owner Approval", "Compliant?", "Reasons",
+		"Org", "Repo", "SHA", "PR #",
+		"Author", "Committer", "Merged By", "Approver",
+		"Approved?", "Self-Approved?", "Owner Approval",
+		"Compliant?", "Reasons", "Merge Strategy",
+		"Date", "Branch", "Message",
 		"No PR", "Stale Approval", "Self-Approved", "No Approval",
 	}
 }
@@ -459,16 +461,16 @@ func writeSelfApprovedSheet(f *excelize.File, sheet string, details []DetailRow,
 	for i, d := range details {
 		row := i + 2
 
-		// SHA with hyperlink
 		shaCell := cellName(3, row)
 		shaDisplay := d.SHA
 		if len(shaDisplay) > 8 {
 			shaDisplay = shaDisplay[:8]
 		}
-		f.SetCellValue(sheet, shaCell, shaDisplay)
 		if d.CommitHref != "" {
-			f.SetCellHyperLink(sheet, shaCell, d.CommitHref, "External")
+			f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, d.CommitHref, shaDisplay))
 			f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
+		} else {
+			f.SetCellValue(sheet, shaCell, shaDisplay)
 		}
 
 		f.SetCellValue(sheet, cellName(1, row), d.Org)
@@ -480,10 +482,11 @@ func writeSelfApprovedSheet(f *excelize.File, sheet string, details []DetailRow,
 		// PR # with hyperlink
 		prCell := cellName(7, row)
 		if d.PRNumber > 0 {
-			f.SetCellValue(sheet, prCell, d.PRNumber)
 			if d.PRHref != "" {
-				f.SetCellHyperLink(sheet, prCell, d.PRHref, "External")
+				f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, d.PRHref, d.PRNumber))
 				f.SetCellStyle(sheet, prCell, prCell, linkStyle)
+			} else {
+				f.SetCellValue(sheet, prCell, fmt.Sprintf("#%d", d.PRNumber))
 			}
 		}
 
@@ -538,47 +541,52 @@ func writeDetailRowWithHyperlinks(f *excelize.File, sheet string, row int, d Det
 		selfApprovedStr = "Yes"
 	}
 
-	// Org, Repo
+	// Location: Org, Repo, SHA, PR #
 	f.SetCellValue(sheet, cellName(1, row), d.Org)
 	f.SetCellValue(sheet, cellName(2, row), d.Repo)
-
-	// SHA with hyperlink
 	shaCell := cellName(3, row)
-	f.SetCellValue(sheet, shaCell, shaDisplay)
 	if d.CommitHref != "" {
-		f.SetCellHyperLink(sheet, shaCell, d.CommitHref, "External")
+		f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, d.CommitHref, shaDisplay))
 		f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
+	} else {
+		f.SetCellValue(sheet, shaCell, shaDisplay)
 	}
-
-	f.SetCellValue(sheet, cellName(4, row), d.AuthorLogin)
-	f.SetCellValue(sheet, cellName(5, row), d.CommitterLogin)
-	f.SetCellValue(sheet, cellName(6, row), dateStr)
-	f.SetCellValue(sheet, cellName(7, row), msg)
-	f.SetCellValue(sheet, cellName(8, row), d.BranchName)
-
-	// PR # with hyperlink
-	prCell := cellName(9, row)
+	prCell := cellName(4, row)
 	if d.PRNumber > 0 {
-		f.SetCellValue(sheet, prCell, d.PRNumber)
 		if d.PRHref != "" {
-			f.SetCellHyperLink(sheet, prCell, d.PRHref, "External")
+			f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, d.PRHref, d.PRNumber))
 			f.SetCellStyle(sheet, prCell, prCell, linkStyle)
+		} else {
+			f.SetCellValue(sheet, prCell, fmt.Sprintf("#%d", d.PRNumber))
 		}
 	}
 
-	f.SetCellValue(sheet, cellName(10, row), d.MergedByLogin)
-	f.SetCellValue(sheet, cellName(11, row), approvedStr)
-	f.SetCellValue(sheet, cellName(12, row), d.ApproverLogins)
-	f.SetCellValue(sheet, cellName(13, row), selfApprovedStr)
-	f.SetCellValue(sheet, cellName(14, row), d.OwnerApprovalCheck)
-	f.SetCellValue(sheet, cellName(15, row), compliantStr)
-	f.SetCellValue(sheet, cellName(16, row), d.Reasons)
+	// People: Author, Committer, Merged By, Approver
+	f.SetCellValue(sheet, cellName(5, row), d.AuthorLogin)
+	f.SetCellValue(sheet, cellName(6, row), d.CommitterLogin)
+	f.SetCellValue(sheet, cellName(7, row), d.MergedByLogin)
+	f.SetCellValue(sheet, cellName(8, row), d.ApproverLogins)
+
+	// Approval
+	f.SetCellValue(sheet, cellName(9, row), approvedStr)
+	f.SetCellValue(sheet, cellName(10, row), selfApprovedStr)
+	f.SetCellValue(sheet, cellName(11, row), d.OwnerApprovalCheck)
+
+	// Result
+	f.SetCellValue(sheet, cellName(12, row), compliantStr)
+	f.SetCellValue(sheet, cellName(13, row), d.Reasons)
+	f.SetCellValue(sheet, cellName(14, row), d.MergeStrategy)
+
+	// Context: Date, Branch, Message
+	f.SetCellValue(sheet, cellName(15, row), dateStr)
+	f.SetCellValue(sheet, cellName(16, row), d.BranchName)
+	f.SetCellValue(sheet, cellName(17, row), msg)
 
 	// Binary reason columns for filtering/sorting
-	f.SetCellValue(sheet, cellName(17, row), boolToYesNo(!d.HasPR))
-	f.SetCellValue(sheet, cellName(18, row), boolToYesNo(d.HasStaleApproval))
-	f.SetCellValue(sheet, cellName(19, row), boolToYesNo(d.IsSelfApproved))
-	f.SetCellValue(sheet, cellName(20, row), boolToYesNo(!d.HasFinalApproval && !d.IsSelfApproved))
+	f.SetCellValue(sheet, cellName(18, row), boolToYesNo(!d.HasPR))
+	f.SetCellValue(sheet, cellName(19, row), boolToYesNo(d.HasStaleApproval))
+	f.SetCellValue(sheet, cellName(20, row), boolToYesNo(d.IsSelfApproved))
+	f.SetCellValue(sheet, cellName(21, row), boolToYesNo(!d.HasFinalApproval && !d.IsSelfApproved))
 }
 
 // writeStaleApprovalsSheet writes commits where approval existed but was stale (pre-force-push).
@@ -611,10 +619,11 @@ func writeStaleApprovalsSheet(f *excelize.File, sheet string, details []DetailRo
 		if len(shaDisplay) > 8 {
 			shaDisplay = shaDisplay[:8]
 		}
-		f.SetCellValue(sheet, shaCell, shaDisplay)
 		if d.CommitHref != "" {
-			f.SetCellHyperLink(sheet, shaCell, d.CommitHref, "External")
+			f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, d.CommitHref, shaDisplay))
 			f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
+		} else {
+			f.SetCellValue(sheet, shaCell, shaDisplay)
 		}
 
 		f.SetCellValue(sheet, cellName(1, row), d.Org)
@@ -624,10 +633,11 @@ func writeStaleApprovalsSheet(f *excelize.File, sheet string, details []DetailRo
 
 		prCell := cellName(6, row)
 		if d.PRNumber > 0 {
-			f.SetCellValue(sheet, prCell, d.PRNumber)
 			if d.PRHref != "" {
-				f.SetCellHyperLink(sheet, prCell, d.PRHref, "External")
+				f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, d.PRHref, d.PRNumber))
 				f.SetCellStyle(sheet, prCell, prCell, linkStyle)
+			} else {
+				f.SetCellValue(sheet, prCell, fmt.Sprintf("#%d", d.PRNumber))
 			}
 		}
 
@@ -689,10 +699,11 @@ func writeMultiplePRsSheet(f *excelize.File, sheet string, rows []MultiplePRRow,
 		if len(shaDisplay) > 8 {
 			shaDisplay = shaDisplay[:8]
 		}
-		f.SetCellValue(sheet, shaCell, shaDisplay)
 		if m.CommitHref != "" {
-			f.SetCellHyperLink(sheet, shaCell, m.CommitHref, "External")
+			f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, m.CommitHref, shaDisplay))
 			f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
+		} else {
+			f.SetCellValue(sheet, shaCell, shaDisplay)
 		}
 
 		f.SetCellValue(sheet, cellName(1, row), m.Org)
@@ -702,10 +713,11 @@ func writeMultiplePRsSheet(f *excelize.File, sheet string, rows []MultiplePRRow,
 		f.SetCellValue(sheet, cellName(6, row), m.PRCount)
 
 		prCell := cellName(7, row)
-		f.SetCellValue(sheet, prCell, m.PRNumber)
 		if m.PRHref != "" {
-			f.SetCellHyperLink(sheet, prCell, m.PRHref, "External")
+			f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, m.PRHref, m.PRNumber))
 			f.SetCellStyle(sheet, prCell, prCell, linkStyle)
+		} else {
+			f.SetCellValue(sheet, prCell, fmt.Sprintf("#%d", m.PRNumber))
 		}
 
 		f.SetCellValue(sheet, cellName(8, row), truncate(m.PRTitle, 60))
@@ -736,7 +748,7 @@ func writeMultiplePRsSheet(f *excelize.File, sheet string, rows []MultiplePRRow,
 }
 
 func setDetailColumnWidths(f *excelize.File, sheet string, numCols int) {
-	widths := []float64{12, 25, 12, 15, 15, 18, 40, 20, 8, 15, 10, 20, 14, 15, 10, 40, 8, 14, 14, 13}
+	widths := []float64{12, 25, 12, 10, 15, 15, 15, 20, 10, 14, 15, 10, 40, 14, 18, 20, 40, 8, 14, 14, 13}
 	for i := 0; i < numCols && i < len(widths); i++ {
 		colName, _ := excelize.ColumnNumberToName(i + 1)
 		f.SetColWidth(sheet, colName, colName, widths[i])

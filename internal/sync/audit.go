@@ -33,6 +33,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 			result.IsExemptAuthor = true
 			result.IsCompliant = true
 			result.Reasons = []string{"exempt: configured author"}
+			result.MergeStrategy = classifyMergeStrategy(commit, false)
 			return result
 		}
 	}
@@ -42,6 +43,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		result.IsEmptyCommit = true
 		result.IsCompliant = true
 		result.Reasons = []string{"empty commit"}
+		result.MergeStrategy = classifyMergeStrategy(commit, false)
 		return result
 	}
 
@@ -50,6 +52,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		result.HasPR = false
 		result.IsCompliant = false
 		result.Reasons = []string{"no associated pull request"}
+		result.MergeStrategy = classifyMergeStrategy(commit, false)
 		return result
 	}
 
@@ -137,6 +140,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 			result.PRNumber = pr.Number
 			result.PRHref = pr.Href
 			result.Reasons = []string{"compliant"}
+			result.MergeStrategy = classifyMergeStrategy(commit, true)
 			return result
 		}
 
@@ -179,6 +183,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		result.OwnerApprovalCheck = ownerApprovalStatus
 	}
 	result.Reasons = bestReasons
+	result.MergeStrategy = classifyMergeStrategy(commit, true)
 	return result
 }
 
@@ -254,4 +259,17 @@ func isSelfApproval(review model.Review, commit model.Commit, pr model.PullReque
 	}
 
 	return false
+}
+
+func classifyMergeStrategy(c model.Commit, hasPR bool) string {
+	switch {
+	case c.ParentCount == 0:
+		return "initial"
+	case c.ParentCount > 1:
+		return "merge"
+	case hasPR:
+		return "squash"
+	default:
+		return "direct-push"
+	}
 }

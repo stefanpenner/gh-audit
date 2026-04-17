@@ -31,7 +31,7 @@ var auditResultColumns = []string{
 	"org", "repo", "sha", "is_empty_commit", "is_bot", "is_exempt_author",
 	"has_pr", "pr_number", "pr_count", "has_final_approval", "has_stale_approval",
 	"is_self_approved", "approver_logins", "owner_approval_check", "is_compliant",
-	"reasons", "commit_href", "pr_href",
+	"reasons", "merge_strategy", "commit_href", "pr_href",
 }
 
 // UpsertAuditResults batch-inserts audit results using the DuckDB Appender API
@@ -50,6 +50,7 @@ func (d *DB) UpsertAuditResults(ctx context.Context, results []model.AuditResult
 			toAnySlice(r.ApproverLogins),
 			nullIfEmpty(r.OwnerApprovalCheck), r.IsCompliant,
 			toAnySlice(r.Reasons),
+			nullIfEmpty(r.MergeStrategy),
 			r.CommitHref, r.PRHref,
 		}
 	}

@@ -73,6 +73,7 @@ type DetailRow struct {
 	OwnerApprovalCheck string    `json:"owner_approval_check"`
 	IsCompliant        bool      `json:"is_compliant"`
 	Reasons            string    `json:"reasons"`
+	MergeStrategy      string    `json:"merge_strategy"`
 	CommitHref         string    `json:"commit_href"`
 	BranchName         string    `json:"branch_name"`
 }
@@ -179,6 +180,7 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			COALESCE(a.owner_approval_check::TEXT, ''),
 			a.is_compliant,
 			COALESCE(array_to_string(a.reasons, ', '), ''),
+			COALESCE(a.merge_strategy, ''),
 			COALESCE(a.commit_href, ''),
 			COALESCE((SELECT cb.branch FROM commit_branches cb
 				WHERE cb.org = a.org AND cb.repo = a.repo AND cb.sha = a.sha
@@ -219,7 +221,7 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			&d.Message, &d.IsBot, &d.IsExemptAuthor, &d.IsEmptyCommit, &d.IsSelfApproved,
 			&d.HasStaleApproval, &d.HasPR, &d.PRNumber, &d.PRCount, &d.PRHref, &d.MergedByLogin,
 			&d.HasFinalApproval, &d.ApproverLogins,
-			&d.OwnerApprovalCheck, &d.IsCompliant, &d.Reasons, &d.CommitHref, &d.BranchName,
+			&d.OwnerApprovalCheck, &d.IsCompliant, &d.Reasons, &d.MergeStrategy, &d.CommitHref, &d.BranchName,
 		); err != nil {
 			return nil, fmt.Errorf("scan detail: %w", err)
 		}
@@ -268,11 +270,14 @@ func (r *Reporter) FormatCSV(w io.Writer, details []DetailRow) error {
 	cw := csv.NewWriter(w)
 
 	header := []string{
-		"Org", "Repo", "SHA", "Author", "Merged By", "Date", "Message",
-		"Is Bot", "Is Empty", "Has PR", "PR #", "PR Link",
-		"Approved", "Approvers", "Owner Approval",
-		"Compliant", "Reasons", "Commit Link",
-		"No PR", "Stale Approval", "Self-Approved", "No Approval",
+		"Org", "Repo", "SHA", "PR #", "PR Link",
+		"Author", "Committer", "Merged By", "Approvers",
+		"Approved", "Self-Approved", "Owner Approval",
+		"Compliant", "Reasons", "Merge Strategy",
+		"Date", "Branch", "Message",
+		"Is Bot", "Is Empty",
+		"No PR", "Stale Approval", "Self-Approved Flag", "No Approval",
+		"Commit Link",
 	}
 	if err := cw.Write(header); err != nil {
 		return err
@@ -280,24 +285,25 @@ func (r *Reporter) FormatCSV(w io.Writer, details []DetailRow) error {
 
 	for _, d := range details {
 		record := []string{
-			d.Org, d.Repo, d.SHA, d.AuthorLogin, d.MergedByLogin,
-			d.CommittedAt.Format("2006-01-02 15:04:05"),
-			d.Message,
-			fmt.Sprintf("%v", d.IsBot),
-			fmt.Sprintf("%v", d.IsEmptyCommit),
-			fmt.Sprintf("%v", d.HasPR),
-			fmt.Sprintf("%d", d.PRNumber),
-			d.PRHref,
+			d.Org, d.Repo, d.SHA,
+			fmt.Sprintf("%d", d.PRNumber), d.PRHref,
+			d.AuthorLogin, d.CommitterLogin, d.MergedByLogin, d.ApproverLogins,
 			fmt.Sprintf("%v", d.HasFinalApproval),
-			d.ApproverLogins,
+			fmt.Sprintf("%v", d.IsSelfApproved),
 			d.OwnerApprovalCheck,
 			fmt.Sprintf("%v", d.IsCompliant),
 			d.Reasons,
-			d.CommitHref,
+			d.MergeStrategy,
+			d.CommittedAt.Format("2006-01-02 15:04:05"),
+			d.BranchName,
+			d.Message,
+			fmt.Sprintf("%v", d.IsBot),
+			fmt.Sprintf("%v", d.IsEmptyCommit),
 			fmt.Sprintf("%v", !d.HasPR),
 			fmt.Sprintf("%v", d.HasStaleApproval),
 			fmt.Sprintf("%v", d.IsSelfApproved),
 			fmt.Sprintf("%v", !d.HasFinalApproval && !d.IsSelfApproved),
+			d.CommitHref,
 		}
 		if err := cw.Write(record); err != nil {
 			return err
