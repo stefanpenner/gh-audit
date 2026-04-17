@@ -52,8 +52,25 @@ func newSyncCmd() *cobra.Command {
 			}
 
 			client := ghclient.NewClient(pool, logger)
-			pipeline := sync.NewPipeline(client, client, dbConn, syncCfg, logger)
-			return pipeline.Run(cmd.Context())
+			enricher := ghclient.NewCachingEnricher(client, dbConn)
+			pipeline := sync.NewPipeline(client, enricher, dbConn, syncCfg, logger)
+			if err := pipeline.Run(cmd.Context()); err != nil {
+				return err
+			}
+
+			s := &enricher.Stats
+			logger.Info("API request stats",
+				"total_api", s.Total(),
+				"cache_hits", s.CacheHits.Load(),
+				"db_hits", s.DBHits.Load(),
+				"commit_detail", s.CommitDetail.Load(),
+				"commit_prs", s.CommitPRs.Load(),
+				"pr_detail", s.PRDetail.Load(),
+				"reviews", s.Reviews.Load(),
+				"check_runs", s.CheckRuns.Load(),
+				"pr_commits", s.PRCommits.Load(),
+			)
+			return nil
 		},
 	}
 

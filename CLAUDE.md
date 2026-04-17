@@ -15,6 +15,18 @@
 
 When types in `internal/model/types.go` change, update the Mermaid class diagram in `internal/model/README.md` to match.
 
+## Verification
+
+Run against test fixtures and real repos to verify sync + report:
+```bash
+rm -f examples/audit.db
+./gh-audit sync --repo stefanpenner/gh-audit-test-fixtures --repo stefanpenner/gh-audit --repo emberjs/ember.js --db examples/audit.db
+./gh-audit report --db examples/audit.db --format xlsx --output examples/audit-report.xlsx
+open examples/audit-report.xlsx
+```
+
+The `--repo` flag accepts multiple values in one invocation.
+
 ## Type doc comment style
 
 Use this format for type-level Go doc comments throughout the codebase:

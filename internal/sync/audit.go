@@ -148,13 +148,14 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		}
 
 		ownerApprovalStatus := evaluateRequiredChecks(enrichment.CheckRuns, pr.HeadSHA, requiredChecks)
+		ownerApprovalOK := ownerApprovalStatus == "" || ownerApprovalStatus == "success"
 
-		if ownerApprovalStatus != "success" {
+		if !ownerApprovalOK {
 			prReasons = append(prReasons, fmt.Sprintf("Owner Approval check missing/failed (PR #%d)", pr.Number))
 		}
 
 		// If this PR satisfies all checks, commit is compliant
-		if hasApprovalOnFinal && ownerApprovalStatus == "success" {
+		if hasApprovalOnFinal && ownerApprovalOK {
 			result.IsCompliant = true
 			result.HasFinalApproval = true
 			result.ApproverLogins = prApprovers
@@ -217,7 +218,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 // Returns "success" if all pass, "failure" if any found but failed, "missing" if not found.
 func evaluateRequiredChecks(checkRuns []model.CheckRun, headSHA string, requiredChecks []RequiredCheck) string {
 	if len(requiredChecks) == 0 {
-		return "success"
+		return ""
 	}
 	allPassed := true
 	anyFailed := false

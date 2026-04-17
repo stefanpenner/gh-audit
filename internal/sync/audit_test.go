@@ -681,7 +681,7 @@ func TestEvaluateRequiredChecks(t *testing.T) {
 			name:           "no required checks",
 			headSHA:        "head1",
 			requiredChecks: nil,
-			want:           "success",
+			want:           "",
 		},
 		{
 			name:    "single check passes",
