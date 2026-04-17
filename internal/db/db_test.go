@@ -426,3 +426,68 @@ func TestEmptyCommitStoredCorrectly(t *testing.T) {
 	assert.Equal(t, 0, got[0].Additions)
 	assert.Equal(t, 0, got[0].Deletions)
 }
+
+func TestUpsertAndLoadCoAuthors(t *testing.T) {
+	db := mustOpenMemory(t)
+	ctx := context.Background()
+
+	commits := []model.Commit{
+		{
+			Org: "org1", Repo: "repo1", SHA: "abc123",
+			AuthorLogin: "alice", AuthorEmail: "alice@example.com",
+			CommittedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+			Message:     "feat: add thing",
+			CoAuthors: []model.CoAuthor{
+				{Name: "Bob", Email: "bob@users.noreply.github.com", Login: "bob"},
+				{Name: "Carol", Email: "carol@example.com"},
+			},
+		},
+		{
+			Org: "org1", Repo: "repo1", SHA: "def456",
+			AuthorLogin: "dave", AuthorEmail: "dave@example.com",
+			CommittedAt: time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC),
+			Message:     "fix: something",
+		},
+	}
+
+	require.NoError(t, db.UpsertCommits(ctx, commits))
+	require.NoError(t, db.UpsertCoAuthors(ctx, commits))
+
+	// GetCommitsBySHA should load co-authors
+	got, err := db.GetCommitsBySHA(ctx, "org1", "repo1", []string{"abc123", "def456"})
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+
+	var withCo, withoutCo model.Commit
+	for _, c := range got {
+		if c.SHA == "abc123" {
+			withCo = c
+		} else {
+			withoutCo = c
+		}
+	}
+
+	require.Len(t, withCo.CoAuthors, 2)
+	assert.Equal(t, "bob@users.noreply.github.com", withCo.CoAuthors[0].Email)
+	assert.Equal(t, "bob", withCo.CoAuthors[0].Login)
+	assert.Equal(t, "carol@example.com", withCo.CoAuthors[1].Email)
+	assert.Empty(t, withCo.CoAuthors[1].Login)
+	assert.Empty(t, withoutCo.CoAuthors)
+
+	// GetUnauditedCommits should also load co-authors
+	unaudited, err := db.GetUnauditedCommits(ctx, "org1", "repo1")
+	require.NoError(t, err)
+	require.Len(t, unaudited, 2)
+
+	for _, c := range unaudited {
+		if c.SHA == "abc123" {
+			require.Len(t, c.CoAuthors, 2)
+		}
+	}
+
+	// Idempotent upsert
+	require.NoError(t, db.UpsertCoAuthors(ctx, commits))
+	cas, err := db.GetCoAuthors(ctx, "org1", "repo1", "abc123")
+	require.NoError(t, err)
+	assert.Len(t, cas, 2)
+}

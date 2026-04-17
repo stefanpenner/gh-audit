@@ -133,7 +133,14 @@ func (d *DB) GetCommitsForPR(ctx context.Context, org, repo string, prNumber int
 	}
 	defer rows.Close()
 
-	return scanCommits(rows)
+	commits, err := scanCommits(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.loadCoAuthorsForCommits(ctx, commits); err != nil {
+		return nil, err
+	}
+	return commits, nil
 }
 
 // GetReviewsForPR retrieves reviews for a specific pull request.

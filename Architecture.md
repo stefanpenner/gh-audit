@@ -102,7 +102,7 @@ isSelfApproval (audit.go) checks against four identities:
       ├── pr.author_login            ← SOT: GET /commits/{sha}/pulls
       ├── commit.author_login        ← SOT: GET /commits/{sha} (skip if parent_count > 1)
       ├── commit.committer_login     ← SOT: GET /commits/{sha} (skip "web-flow", "github", skip if parent_count > 1)
-      └── commit.co_authors[].login  ← SOT: parsed from "Co-authored-by:" trailers
+      └── commit.co_authors[].login  ← SOT: co_authors table (persisted from "Co-authored-by:" trailers)
       │
       ▼
 All approvals are self?
@@ -254,12 +254,13 @@ The sync cursor is updated to the latest commit date, so the next sync picks up 
 
 ## Database schema
 
-DuckDB with 8 tables:
+DuckDB with 9 tables:
 
 | Table | Primary Key | Purpose |
 |---|---|---|
 | `sync_cursors` | (org, repo, branch) | Incremental sync progress |
 | `commits` | (org, repo, sha) | Git commits from GitHub |
+| `co_authors` | (org, repo, sha, email) | Co-authors parsed from "Co-authored-by:" trailers |
 | `commit_branches` | (org, repo, sha, branch) | Which branches a commit appears on |
 | `commit_prs` | (org, repo, sha, pr_number) | Commit → PR associations |
 | `pull_requests` | (org, repo, number) | GitHub pull requests |

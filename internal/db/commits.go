@@ -64,7 +64,14 @@ func (d *DB) GetUnauditedCommits(ctx context.Context, org, repo string) ([]model
 	}
 	defer rows.Close()
 
-	return scanCommits(rows)
+	commits, err := scanCommits(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.loadCoAuthorsForCommits(ctx, commits); err != nil {
+		return nil, err
+	}
+	return commits, nil
 }
 
 // GetAllCommits returns all commits for an org/repo.
@@ -80,7 +87,14 @@ func (d *DB) GetAllCommits(ctx context.Context, org, repo string) ([]model.Commi
 	}
 	defer rows.Close()
 
-	return scanCommits(rows)
+	commits, err := scanCommits(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.loadCoAuthorsForCommits(ctx, commits); err != nil {
+		return nil, err
+	}
+	return commits, nil
 }
 
 // UpdateCommitStats updates the additions and deletions for a commit.
@@ -119,7 +133,99 @@ func (d *DB) GetCommitsBySHA(ctx context.Context, org, repo string, shas []strin
 	}
 	defer rows.Close()
 
-	return scanCommits(rows)
+	commits, err := scanCommits(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.loadCoAuthorsForCommits(ctx, commits); err != nil {
+		return nil, err
+	}
+	return commits, nil
+}
+
+var coAuthorColumns = []string{"org", "repo", "sha", "name", "email", "login"}
+
+// UpsertCoAuthors batch-inserts co-authors for a set of commits.
+func (d *DB) UpsertCoAuthors(ctx context.Context, commits []model.Commit) error {
+	var rows [][]driver.Value
+	for _, c := range commits {
+		for _, ca := range c.CoAuthors {
+			rows = append(rows, []driver.Value{
+				c.Org, c.Repo, c.SHA,
+				ca.Name, ca.Email, nullIfEmptyStr(ca.Login),
+			})
+		}
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	return d.bulkUpsert(ctx, "co_authors", coAuthorColumns, rows)
+}
+
+func nullIfEmptyStr(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// GetCoAuthors returns co-authors for a single commit.
+func (d *DB) GetCoAuthors(ctx context.Context, org, repo, sha string) ([]model.CoAuthor, error) {
+	rows, err := d.DB.QueryContext(ctx,
+		`SELECT COALESCE(name, ''), email, COALESCE(login, '') FROM co_authors WHERE org = ? AND repo = ? AND sha = ?`,
+		org, repo, sha)
+	if err != nil {
+		return nil, fmt.Errorf("query co-authors: %w", err)
+	}
+	defer rows.Close()
+
+	var result []model.CoAuthor
+	for rows.Next() {
+		var ca model.CoAuthor
+		if err := rows.Scan(&ca.Name, &ca.Email, &ca.Login); err != nil {
+			return nil, fmt.Errorf("scan co-author: %w", err)
+		}
+		result = append(result, ca)
+	}
+	return result, rows.Err()
+}
+
+// loadCoAuthorsForCommits bulk-loads co-authors for a set of commits and attaches them.
+func (d *DB) loadCoAuthorsForCommits(ctx context.Context, commits []model.Commit) error {
+	if len(commits) == 0 {
+		return nil
+	}
+
+	org := commits[0].Org
+	repo := commits[0].Repo
+
+	rows, err := d.DB.QueryContext(ctx,
+		`SELECT sha, COALESCE(name, ''), email, COALESCE(login, '') FROM co_authors WHERE org = ? AND repo = ?`,
+		org, repo)
+	if err != nil {
+		return fmt.Errorf("query co-authors for %s/%s: %w", org, repo, err)
+	}
+	defer rows.Close()
+
+	bySHA := make(map[string][]model.CoAuthor)
+	for rows.Next() {
+		var sha string
+		var ca model.CoAuthor
+		if err := rows.Scan(&sha, &ca.Name, &ca.Email, &ca.Login); err != nil {
+			return fmt.Errorf("scan co-author: %w", err)
+		}
+		bySHA[sha] = append(bySHA[sha], ca)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for i := range commits {
+		if cas, ok := bySHA[commits[i].SHA]; ok {
+			commits[i].CoAuthors = cas
+		}
+	}
+	return nil
 }
 
 func scanCommits(rows interface {
@@ -134,7 +240,6 @@ func scanCommits(rows interface {
 			&c.CommittedAt, &c.Message, &c.ParentCount, &c.Additions, &c.Deletions, &c.Href); err != nil {
 			return nil, fmt.Errorf("scan commit: %w", err)
 		}
-		c.CoAuthors = model.ParseCoAuthors(c.Message)
 		result = append(result, c)
 	}
 	return result, rows.Err()

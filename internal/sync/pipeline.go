@@ -31,6 +31,7 @@ type Store interface {
 	GetSyncCursor(ctx context.Context, org, repo, branch string) (*model.SyncCursor, error)
 	UpsertSyncCursor(ctx context.Context, cursor model.SyncCursor) error
 	UpsertCommits(ctx context.Context, commits []model.Commit) error
+	UpsertCoAuthors(ctx context.Context, commits []model.Commit) error
 	UpsertCommitBranches(ctx context.Context, org, repo string, shas []string, branch string) error
 	UpsertPullRequests(ctx context.Context, prs []model.PullRequest) error
 	UpsertReviews(ctx context.Context, reviews []model.Review) error
@@ -220,7 +221,10 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 
 	// Write commits through single writer
 	if err := writer.Write(ctx, func() error {
-		return p.store.UpsertCommits(ctx, commits)
+		if err := p.store.UpsertCommits(ctx, commits); err != nil {
+			return err
+		}
+		return p.store.UpsertCoAuthors(ctx, commits)
 	}); err != nil {
 		return fmt.Errorf("upserting commits: %w", err)
 	}
@@ -352,6 +356,9 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 		if len(allBranchCommits) > 0 {
 			if err := p.store.UpsertCommits(ctx, allBranchCommits); err != nil {
 				return fmt.Errorf("upserting PR branch commits: %w", err)
+			}
+			if err := p.store.UpsertCoAuthors(ctx, allBranchCommits); err != nil {
+				return fmt.Errorf("upserting PR branch co-authors: %w", err)
 			}
 		}
 		for _, bl := range allBranchLinks {

@@ -142,6 +142,10 @@ func (m *mockStore) UpsertCommits(_ context.Context, commits []model.Commit) err
 	return nil
 }
 
+func (m *mockStore) UpsertCoAuthors(_ context.Context, _ []model.Commit) error {
+	return nil
+}
+
 func (m *mockStore) UpsertCommitBranches(_ context.Context, org, repo string, shas []string, branch string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

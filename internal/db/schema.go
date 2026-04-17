@@ -40,6 +40,16 @@ const (
 		PRIMARY KEY (org, repo, sha)
 	)`
 
+	createCoAuthors = `CREATE TABLE IF NOT EXISTS co_authors (
+		org    TEXT NOT NULL,
+		repo   TEXT NOT NULL,
+		sha    TEXT NOT NULL,
+		name   TEXT,
+		email  TEXT NOT NULL,
+		login  TEXT,
+		PRIMARY KEY (org, repo, sha, email)
+	)`
+
 	createCommitPRs = `CREATE TABLE IF NOT EXISTS commit_prs (
 		org       TEXT NOT NULL,
 		repo      TEXT NOT NULL,
@@ -148,6 +158,7 @@ var addColumnMigrations = []string{
 var allTables = []string{
 	createSyncCursors,
 	createCommits,
+	createCoAuthors,
 	createCommitPRs,
 	createCommitBranches,
 	createPullRequests,
