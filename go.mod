@@ -10,7 +10,6 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/xuri/excelize/v2 v2.10.1
 	golang.org/x/sync v0.19.0
-	golang.org/x/time v0.15.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

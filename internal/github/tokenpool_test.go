@@ -299,50 +299,6 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
-func TestGlobalLimiterPacesRequests(t *testing.T) {
-	pool := NewTokenPool(testLogger())
-	pool.AddPATToken("t1", "token1", nil)
-	pool.AddPATToken("t2", "token2", nil)
-
-	// Each token defaults to 5000 rate limit, so total = 10000
-	// Expected sustainable rate = 10000 / 3600 * 0.9 ≈ 2.5 req/s
-	expectedRate := 10000.0 / 3600.0 * 0.9
-	actualRate := float64(pool.limiter.Limit())
-	assert.InDelta(t, expectedRate, actualRate, 0.01, "limiter rate should be 90%% of sustainable hourly rate")
-
-	burst := pool.limiter.Burst()
-	assert.GreaterOrEqual(t, burst, 5, "burst should be at least 5")
-}
-
-func TestLimiterRecalcOnHeaderUpdate(t *testing.T) {
-	pool := NewTokenPool(testLogger())
-	pool.AddPATToken("t1", "token1", nil)
-
-	// Initial rate based on assumed 5000 limit
-	initialRate := float64(pool.limiter.Limit())
-
-	// Simulate a response with higher rate limit
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("x-ratelimit-remaining", "14000")
-		w.Header().Set("x-ratelimit-limit", "15000")
-		w.Header().Set("x-ratelimit-reset", "1700000000")
-		w.WriteHeader(200)
-	}))
-	defer srv.Close()
-
-	client, err := pool.Pick(context.Background(), "", "")
-	require.NoError(t, err)
-	resp, err := client.Get(srv.URL)
-	require.NoError(t, err)
-	resp.Body.Close()
-
-	newRate := float64(pool.limiter.Limit())
-	assert.Greater(t, newRate, initialRate, "rate should increase after seeing higher limit header")
-
-	expectedRate := 15000.0 / 3600.0 * 0.9
-	assert.InDelta(t, expectedRate, newRate, 0.01)
-}
-
 func TestSecondaryRateLimitRetry(t *testing.T) {
 	callCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

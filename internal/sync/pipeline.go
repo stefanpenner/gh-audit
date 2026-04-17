@@ -399,14 +399,25 @@ func (p *Pipeline) writeEnrichmentBatch(ctx context.Context, org, repo string, e
 	var allLinks []commitPRLink
 	var allBranchLinks []branchCommitLink
 
+	seenPR := make(map[int]bool)
+	seenReview := make(map[int64]bool)
+	seenCheckRun := make(map[int64]bool)
+	seenCommit := make(map[string]bool)
+
 	for _, e := range enrichments {
 		for _, pr := range e.PRs {
-			allPRs = append(allPRs, pr)
+			if !seenPR[pr.Number] {
+				seenPR[pr.Number] = true
+				allPRs = append(allPRs, pr)
+			}
 
 			if commits, ok := e.PRBranchCommits[pr.Number]; ok {
 				var branchSHAs []string
 				for _, c := range commits {
-					allBranchCommits = append(allBranchCommits, c)
+					if !seenCommit[c.SHA] {
+						seenCommit[c.SHA] = true
+						allBranchCommits = append(allBranchCommits, c)
+					}
 					branchSHAs = append(branchSHAs, c.SHA)
 				}
 				if len(branchSHAs) > 0 {
@@ -418,8 +429,18 @@ func (p *Pipeline) writeEnrichmentBatch(ctx context.Context, org, repo string, e
 				}
 			}
 		}
-		allReviews = append(allReviews, e.Reviews...)
-		allCheckRuns = append(allCheckRuns, e.CheckRuns...)
+		for _, r := range e.Reviews {
+			if !seenReview[r.ReviewID] {
+				seenReview[r.ReviewID] = true
+				allReviews = append(allReviews, r)
+			}
+		}
+		for _, cr := range e.CheckRuns {
+			if !seenCheckRun[cr.CheckRunID] {
+				seenCheckRun[cr.CheckRunID] = true
+				allCheckRuns = append(allCheckRuns, cr)
+			}
+		}
 
 		prNums := make([]int, len(e.PRs))
 		for j, pr := range e.PRs {
