@@ -318,6 +318,31 @@ func (t *rateLimitTransport) RoundTrip(req *http.Request) (*http.Response, error
 		resp.Body.Close()
 
 		return t.base.RoundTrip(req)
+
+	case 500, 502, 503, 504:
+		resp.Body.Close()
+		for attempt := 1; attempt <= 3; attempt++ {
+			delay := time.Duration(attempt) * 2 * time.Second
+			timer := time.NewTimer(delay)
+			select {
+			case <-req.Context().Done():
+				timer.Stop()
+				return nil, req.Context().Err()
+			case <-timer.C:
+			}
+			retry, retryErr := t.base.RoundTrip(req)
+			if retryErr != nil {
+				if attempt == 3 {
+					return nil, retryErr
+				}
+				continue
+			}
+			if retry.StatusCode < 500 {
+				return retry, nil
+			}
+			retry.Body.Close()
+		}
+		return nil, fmt.Errorf("GET %s: server error after 3 retries", req.URL)
 	}
 
 	return resp, nil

@@ -221,17 +221,20 @@ func (c *Client) ListCommitPullRequests(ctx context.Context, org, repo, sha stri
 		}
 
 		for _, pr := range prs {
-			if !pr.GetMerged() {
+			// The /commits/{sha}/pulls endpoint does not populate the
+			// "merged" boolean — it's always null. Use merged_at instead.
+			if pr.MergedAt == nil {
 				continue
 			}
 			p := model.PullRequest{
-				Org:     org,
-				Repo:    repo,
-				Number:  pr.GetNumber(),
-				Title:   pr.GetTitle(),
-				Merged:  true,
-				HeadSHA: pr.GetHead().GetSHA(),
-				Href:    pr.GetHTMLURL(),
+				Org:      org,
+				Repo:     repo,
+				Number:   pr.GetNumber(),
+				Title:    pr.GetTitle(),
+				Merged:   true,
+				HeadSHA:  pr.GetHead().GetSHA(),
+				MergedAt: pr.MergedAt.Time,
+				Href:     pr.GetHTMLURL(),
 			}
 			if pr.GetMergeCommitSHA() != "" {
 				p.MergeCommitSHA = pr.GetMergeCommitSHA()
@@ -241,9 +244,6 @@ func (c *Client) ListCommitPullRequests(ctx context.Context, org, repo, sha stri
 			}
 			if pr.GetMergedBy() != nil {
 				p.MergedByLogin = pr.GetMergedBy().GetLogin()
-			}
-			if pr.MergedAt != nil {
-				p.MergedAt = pr.MergedAt.Time
 			}
 			allPRs = append(allPRs, p)
 		}

@@ -63,18 +63,19 @@ func TestEvaluateCommit(t *testing.T) {
 	}
 
 	tests := []struct {
-		name             string
-		commit           model.Commit
-		enrichment       model.EnrichmentResult
-		exemptAuthors    []string
-		requiredChecks   []RequiredCheck
-		wantCompliant    bool
-		wantBot          bool
-		wantExempt       bool
-		wantEmpty        bool
-		wantHasPR        bool
-		wantSelfApproved bool
-		wantReasons      []string
+		name              string
+		commit            model.Commit
+		enrichment        model.EnrichmentResult
+		exemptAuthors     []string
+		requiredChecks    []RequiredCheck
+		wantCompliant     bool
+		wantBot           bool
+		wantExempt        bool
+		wantEmpty         bool
+		wantHasPR         bool
+		wantSelfApproved  bool
+		wantStaleApproval bool
+		wantReasons       []string
 	}{
 		{
 			name:   "normal compliant commit",
@@ -165,10 +166,11 @@ func TestEvaluateCommit(t *testing.T) {
 				},
 				CheckRuns: []model.CheckRun{ownerApprovalCheck},
 			},
-			requiredChecks: requiredChecks,
-			wantCompliant:  false,
-			wantHasPR:      true,
-			wantReasons:    []string{"approval is stale \u2014 not on final commit (PR #42)"},
+			requiredChecks:    requiredChecks,
+			wantCompliant:     false,
+			wantHasPR:         true,
+			wantStaleApproval: true,
+			wantReasons:       []string{"approval is stale \u2014 not on final commit (PR #42)"},
 		},
 		{
 			name:   "approved on final but Owner Approval missing",
@@ -401,10 +403,11 @@ func TestEvaluateCommit(t *testing.T) {
 				},
 				CheckRuns: []model.CheckRun{ownerApprovalCheck},
 			},
-			requiredChecks: requiredChecks,
-			wantCompliant:  false,
-			wantHasPR:      true,
-			wantReasons:    []string{"approval is stale \u2014 not on final commit (PR #42)"},
+			requiredChecks:    requiredChecks,
+			wantCompliant:     false,
+			wantHasPR:         true,
+			wantStaleApproval: true,
+			wantReasons:       []string{"approval is stale \u2014 not on final commit (PR #42)"},
 		},
 		{
 			name:   "stale approval from one reviewer fresh approval from another",
@@ -433,10 +436,11 @@ func TestEvaluateCommit(t *testing.T) {
 				},
 				CheckRuns: []model.CheckRun{ownerApprovalCheck},
 			},
-			requiredChecks: requiredChecks,
-			wantCompliant:  false,
-			wantHasPR:      true,
-			wantReasons:    []string{"approval is stale \u2014 not on final commit (PR #42)"},
+			requiredChecks:    requiredChecks,
+			wantCompliant:     false,
+			wantHasPR:         true,
+			wantStaleApproval: true,
+			wantReasons:       []string{"approval is stale \u2014 not on final commit (PR #42)"},
 		},
 		{
 			name:   "re-approval after force-push same reviewer",
@@ -558,6 +562,21 @@ func TestEvaluateCommit(t *testing.T) {
 			wantReasons:   []string{"Owner Approval check missing/failed (PR #42)"},
 		},
 		{
+			name:   "only self-approval on old SHA is not flagged as stale",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{basePR},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "developer", State: "APPROVED", CommitID: "old-sha", SubmittedAt: now.Add(-time.Hour)},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks: requiredChecks,
+			wantCompliant:  false,
+			wantHasPR:      true,
+			wantReasons:    []string{"no approval on final commit (PR #42)"},
+		},
+		{
 			name: "multiple reviewers one self one legitimate is compliant",
 			commit: model.Commit{
 				Org: "myorg", Repo: "myrepo", SHA: "abc123",
@@ -591,6 +610,7 @@ func TestEvaluateCommit(t *testing.T) {
 			assert.Equal(t, tt.wantEmpty, result.IsEmptyCommit, "IsEmptyCommit")
 			assert.Equal(t, tt.wantHasPR, result.HasPR, "HasPR")
 			assert.Equal(t, tt.wantSelfApproved, result.IsSelfApproved, "IsSelfApproved")
+			assert.Equal(t, tt.wantStaleApproval, result.HasStaleApproval, "HasStaleApproval")
 			if tt.wantReasons != nil {
 				require.Equal(t, tt.wantReasons, result.Reasons, "Reasons")
 			}

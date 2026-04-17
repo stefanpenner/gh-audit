@@ -412,5 +412,164 @@ func TestParseCoAuthors(t *testing.T) {
 	}
 }
 
+func TestListCommitPullRequests(t *testing.T) {
+	tests := []struct {
+		name      string
+		handler   http.HandlerFunc
+		wantCount int
+		wantErr   bool
+	}{
+		{
+			name: "merged_at null is skipped (not merged)",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				prs := []map[string]any{
+					{
+						"number":    42,
+						"title":     "Open PR",
+						"state":     "open",
+						"merged_at": nil,
+						"head":      map[string]any{"sha": "head123"},
+						"html_url":  "https://github.com/testorg/repo/pull/42",
+					},
+				}
+				json.NewEncoder(w).Encode(prs)
+			},
+			wantCount: 0,
+		},
+		{
+			name: "merged_at set means PR is merged even if merged field is null",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				prs := []map[string]any{
+					{
+						"number":           99,
+						"title":            "Merged PR",
+						"state":            "closed",
+						"merged_at":        "2026-04-10T12:00:00Z",
+						"merge_commit_sha": "merge123",
+						"head":             map[string]any{"sha": "head456"},
+						"user":             map[string]any{"login": "author1"},
+						"html_url":         "https://github.com/testorg/repo/pull/99",
+					},
+				}
+				json.NewEncoder(w).Encode(prs)
+			},
+			wantCount: 1,
+		},
+		{
+			name: "multiple PRs filters to only merged",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				prs := []map[string]any{
+					{
+						"number":           10,
+						"title":            "Merged",
+						"state":            "closed",
+						"merged_at":        "2026-04-10T12:00:00Z",
+						"merge_commit_sha": "m1",
+						"head":             map[string]any{"sha": "h1"},
+						"user":             map[string]any{"login": "dev"},
+						"html_url":         "https://github.com/testorg/repo/pull/10",
+					},
+					{
+						"number":    20,
+						"title":     "Not merged",
+						"state":     "closed",
+						"merged_at": nil,
+						"head":      map[string]any{"sha": "h2"},
+						"html_url":  "https://github.com/testorg/repo/pull/20",
+					},
+					{
+						"number":           30,
+						"title":            "Also merged",
+						"state":            "closed",
+						"merged_at":        "2026-04-11T12:00:00Z",
+						"merge_commit_sha": "m3",
+						"head":             map[string]any{"sha": "h3"},
+						"user":             map[string]any{"login": "dev2"},
+						"html_url":         "https://github.com/testorg/repo/pull/30",
+					},
+				}
+				json.NewEncoder(w).Encode(prs)
+			},
+			wantCount: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(tt.handler)
+			defer srv.Close()
+
+			pool := mockTokenPool(t, srv.URL)
+			client := NewClient(pool, testLogger())
+
+			prs, err := client.ListCommitPullRequests(context.Background(), "testorg", "repo", "abc123")
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Len(t, prs, tt.wantCount)
+			for _, pr := range prs {
+				assert.True(t, pr.Merged)
+				assert.False(t, pr.MergedAt.IsZero())
+			}
+		})
+	}
+}
+
+func TestRateLimitTransport_Retries5xx(t *testing.T) {
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount <= 2 {
+			w.WriteHeader(502)
+			return
+		}
+		w.Header().Set("x-ratelimit-remaining", "4999")
+		w.WriteHeader(200)
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	token := &ManagedToken{ID: "test"}
+	token.rateRemaining.Store(5000)
+
+	transport := &rateLimitTransport{
+		base:  &overrideURLTransport{base: http.DefaultTransport, baseURL: srv.URL},
+		token: token,
+	}
+
+	client := &http.Client{Transport: transport}
+	resp, err := client.Get("http://api.github.com/test")
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(t, 3, callCount)
+}
+
+func TestRateLimitTransport_5xxExhaustsRetries(t *testing.T) {
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.WriteHeader(504)
+	}))
+	defer srv.Close()
+
+	token := &ManagedToken{ID: "test"}
+	token.rateRemaining.Store(5000)
+
+	transport := &rateLimitTransport{
+		base:  &overrideURLTransport{base: http.DefaultTransport, baseURL: srv.URL},
+		token: token,
+	}
+
+	client := &http.Client{Transport: transport}
+	_, err := client.Get("http://api.github.com/test")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "server error after 3 retries")
+	assert.Equal(t, 4, callCount) // 1 initial + 3 retries
+}
+
 // Ensure go-github is used (compile check).
 var _ = (*gogithub.Client)(nil)
