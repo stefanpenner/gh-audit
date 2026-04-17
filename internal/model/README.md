@@ -21,17 +21,40 @@ classDiagram
         LastDate time.Time
     }
 
+    class CoAuthor {
+        Login string
+        Email string
+        Name string
+    }
+
     class Commit {
         Org string
         Repo string
         SHA string
+        TreeSHA string
+        ParentSHAs []string
         AuthorLogin string
         AuthorEmail string
+        AuthorName string
+        CommitterLogin string
+        CommitterEmail string
+        CommitterName string
+        CoAuthors []CoAuthor
         CommittedAt time.Time
         Message string
+        IsVerified bool
+        SignatureType string
         ParentCount int
         Additions int
         Deletions int
+        IsGitHubGenerated bool
+    }
+
+    class CommitPullRequest {
+        Org string
+        Repo string
+        SHA string
+        PRNumber int
     }
 
     class PullRequest {
@@ -87,12 +110,14 @@ classDiagram
 
     RepoInfo "1" --o "*" Commit : contains
     RepoInfo "1" --o "1" SyncCursor : tracks
-    Commit "1" --o "*" PullRequest : linked via SHA
+    Commit "*" --o "*" CommitPullRequest : joins
+    CommitPullRequest "*" o-- "*" PullRequest : joins
     PullRequest "1" --o "*" Review : has
     Commit "1" --o "*" CheckRun : has
     EnrichmentResult "1" --> "1" Commit : wraps
     EnrichmentResult "1" --> "*" PullRequest
     EnrichmentResult "1" --> "*" Review
     EnrichmentResult "1" --> "*" CheckRun
+    Commit "1" --> "*" CoAuthor : has
     Commit "1" --> "1" AuditResult : produces
 ```

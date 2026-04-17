@@ -5,17 +5,40 @@ package model
 import "time"
 
 type Commit struct {
-	Org            string
-	Repo           string
-	SHA            string
-	AuthorLogin    string
-	AuthorEmail    string
-	CommittedAt    time.Time
-	Message        string
-	ParentCount    int
-	Additions      int
-	Deletions      int
-	Href           string
+	Org               string
+	Repo              string
+	SHA               string
+	TreeSHA           string
+	ParentSHAs        []string
+	AuthorLogin       string
+	AuthorEmail       string
+	AuthorName        string
+	CommitterLogin    string
+	CommitterEmail    string
+	CommitterName     string
+	CoAuthors         []CoAuthor
+	CommittedAt       time.Time
+	Message           string
+	IsVerified        bool
+	SignatureType      string // gpg, ssh, smime, unsigned
+	ParentCount       int
+	Additions         int
+	Deletions         int
+	IsGitHubGenerated bool // merge commits, reverts, squashes created by GitHub
+	Href              string
+}
+
+type CoAuthor struct {
+	Login string
+	Email string
+	Name  string
+}
+
+type CommitPullRequest struct {
+	Org      string
+	Repo     string
+	SHA      string
+	PRNumber int
 }
 
 type PullRequest struct {
