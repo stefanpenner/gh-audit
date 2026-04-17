@@ -13,6 +13,10 @@ import (
 
 // graphqlFixture builds a realistic GraphQL response for the given SHAs.
 func graphqlFixture(shas []string, withPRs bool) map[string]any {
+	return graphqlFixtureWithPageInfo(shas, withPRs, false, false, false)
+}
+
+func graphqlFixtureWithPageInfo(shas []string, withPRs bool, reviewsHasNext, checkRunsHasNext, checkSuitesHasNext bool) map[string]any {
 	repo := map[string]any{}
 
 	for i, sha := range shas {
@@ -21,7 +25,8 @@ func graphqlFixture(shas []string, withPRs bool) map[string]any {
 			repo[alias] = map[string]any{
 				"oid": sha,
 				"associatedPullRequests": map[string]any{
-					"nodes": []any{},
+					"nodes":    []any{},
+					"pageInfo": map[string]any{"hasNextPage": false},
 				},
 			}
 			continue
@@ -30,6 +35,7 @@ func graphqlFixture(shas []string, withPRs bool) map[string]any {
 		repo[alias] = map[string]any{
 			"oid": sha,
 			"associatedPullRequests": map[string]any{
+				"pageInfo": map[string]any{"hasNextPage": false},
 				"nodes": []any{
 					map[string]any{
 						"number":     100 + i,
@@ -51,15 +57,19 @@ func graphqlFixture(shas []string, withPRs bool) map[string]any {
 									"url":         fmt.Sprintf("https://github.com/testorg/repo/pull/%d#pullrequestreview-%d", 100+i, 200+i),
 								},
 							},
+							"pageInfo": map[string]any{"hasNextPage": reviewsHasNext, "endCursor": "cursor123"},
 						},
 						"commits": map[string]any{
 							"nodes": []any{
 								map[string]any{
 									"commit": map[string]any{
 										"checkSuites": map[string]any{
+											"pageInfo": map[string]any{"hasNextPage": checkSuitesHasNext},
 											"nodes": []any{
 												map[string]any{
+													"pageInfo": map[string]any{"hasNextPage": false},
 													"checkRuns": map[string]any{
+														"pageInfo": map[string]any{"hasNextPage": checkRunsHasNext},
 														"nodes": []any{
 															map[string]any{
 																"databaseId":  int64(300 + i),
@@ -256,30 +266,31 @@ func TestEnrichCommits_MultiplePRs(t *testing.T) {
 					"c0": map[string]any{
 						"oid": sha,
 						"associatedPullRequests": map[string]any{
+							"pageInfo": map[string]any{"hasNextPage": false},
 							"nodes": []any{
 								map[string]any{
-									"number":     10,
-									"title":      "First PR",
-									"merged":     true,
-									"mergeCommit": map[string]any{"oid": sha},
-									"headRefOid": "head1",
-									"author":     map[string]any{"login": "dev1"},
-									"mergedAt":   "2024-01-15T10:00:00Z",
-									"url":        "https://github.com/testorg/repo/pull/10",
-									"reviews":    map[string]any{"nodes": []any{}},
-									"commits":    map[string]any{"nodes": []any{}},
+									"number":      10,
+									"title":       "First PR",
+									"merged":      true,
+									"mergeCommit":  map[string]any{"oid": sha},
+									"headRefOid":  "head1",
+									"author":      map[string]any{"login": "dev1"},
+									"mergedAt":    "2024-01-15T10:00:00Z",
+									"url":         "https://github.com/testorg/repo/pull/10",
+									"reviews":     map[string]any{"nodes": []any{}, "pageInfo": map[string]any{"hasNextPage": false}},
+									"commits":     map[string]any{"nodes": []any{}},
 								},
 								map[string]any{
-									"number":     11,
-									"title":      "Second PR",
-									"merged":     true,
-									"mergeCommit": map[string]any{"oid": sha},
-									"headRefOid": "head2",
-									"author":     map[string]any{"login": "dev2"},
-									"mergedAt":   "2024-01-16T10:00:00Z",
-									"url":        "https://github.com/testorg/repo/pull/11",
-									"reviews":    map[string]any{"nodes": []any{}},
-									"commits":    map[string]any{"nodes": []any{}},
+									"number":      11,
+									"title":       "Second PR",
+									"merged":      true,
+									"mergeCommit":  map[string]any{"oid": sha},
+									"headRefOid":  "head2",
+									"author":      map[string]any{"login": "dev2"},
+									"mergedAt":    "2024-01-16T10:00:00Z",
+									"url":         "https://github.com/testorg/repo/pull/11",
+									"reviews":     map[string]any{"nodes": []any{}, "pageInfo": map[string]any{"hasNextPage": false}},
+									"commits":     map[string]any{"nodes": []any{}},
 								},
 							},
 						},
@@ -361,6 +372,7 @@ func TestEnrichCommits_ResponseParsing(t *testing.T) {
 					"c0": map[string]any{
 						"oid": sha,
 						"associatedPullRequests": map[string]any{
+							"pageInfo": map[string]any{"hasNextPage": false},
 							"nodes": []any{
 								map[string]any{
 									"number":      42,
@@ -372,6 +384,7 @@ func TestEnrichCommits_ResponseParsing(t *testing.T) {
 									"mergedAt":    "2024-03-20T15:30:00Z",
 									"url":         "https://github.com/testorg/repo/pull/42",
 									"reviews": map[string]any{
+										"pageInfo": map[string]any{"hasNextPage": false},
 										"nodes": []any{
 											map[string]any{
 												"databaseId":  int64(999),
@@ -396,9 +409,12 @@ func TestEnrichCommits_ResponseParsing(t *testing.T) {
 											map[string]any{
 												"commit": map[string]any{
 													"checkSuites": map[string]any{
+														"pageInfo": map[string]any{"hasNextPage": false},
 														"nodes": []any{
 															map[string]any{
+																"pageInfo": map[string]any{"hasNextPage": false},
 																"checkRuns": map[string]any{
+																	"pageInfo": map[string]any{"hasNextPage": false},
 																	"nodes": []any{
 																		map[string]any{
 																			"databaseId":  int64(501),
@@ -525,6 +541,185 @@ func (t *graphqlOverrideTransport) RoundTrip(req *http.Request) (*http.Response,
 	req2 := req.Clone(req.Context())
 	req2.URL.Scheme = "http"
 	req2.URL.Host = t.baseURL[len("http://"):]
-	req2.URL.Path = "/graphql"
+	// Preserve path for REST API calls; rewrite to /graphql for GraphQL.
+	if req.URL.Host == "api.github.com" && req.URL.Path == "/graphql" {
+		req2.URL.Path = "/graphql"
+	}
+	// For REST API calls (e.g. /repos/...), preserve the original path.
 	return t.base.RoundTrip(req2)
+}
+
+func TestEnrichCommits_Pagination(t *testing.T) {
+	sha := "abc1234567890abc1234567890abc1234567890ab"
+
+	tests := []struct {
+		name              string
+		reviewsHasNext    bool
+		checkRunsHasNext  bool
+		checkSuitesHasNext bool
+		restReviews       []map[string]any // REST API reviews to return (nil = no REST handler)
+		wantReviewCount   int
+		wantCheckRunCount int
+		wantRESTCalls     int
+	}{
+		{
+			name:              "no pagination needed",
+			reviewsHasNext:    false,
+			checkRunsHasNext:  false,
+			checkSuitesHasNext: false,
+			wantReviewCount:   1,
+			wantCheckRunCount: 1,
+			wantRESTCalls:     0,
+		},
+		{
+			name:             "reviews hasNextPage triggers REST fallback",
+			reviewsHasNext:   true,
+			checkRunsHasNext: false,
+			restReviews: []map[string]any{
+				{"id": 200, "state": "APPROVED", "user": map[string]any{"login": "reviewer1"}, "commit_id": sha, "submitted_at": "2024-01-14T10:00:00Z", "html_url": "https://github.com/testorg/repo/pull/100#pullrequestreview-200"},
+				{"id": 201, "state": "CHANGES_REQUESTED", "user": map[string]any{"login": "reviewer2"}, "commit_id": sha, "submitted_at": "2024-01-14T11:00:00Z", "html_url": "https://github.com/testorg/repo/pull/100#pullrequestreview-201"},
+				{"id": 202, "state": "APPROVED", "user": map[string]any{"login": "reviewer3"}, "commit_id": sha, "submitted_at": "2024-01-14T12:00:00Z", "html_url": "https://github.com/testorg/repo/pull/100#pullrequestreview-202"},
+			},
+			wantReviewCount:   3,
+			wantCheckRunCount: 1,
+			wantRESTCalls:     1,
+		},
+		{
+			name:              "checkRuns hasNextPage logs warning only",
+			reviewsHasNext:    false,
+			checkRunsHasNext:  true,
+			checkSuitesHasNext: false,
+			wantReviewCount:   1,
+			wantCheckRunCount: 1,
+			wantRESTCalls:     0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			restCalls := 0
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/graphql" {
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(graphqlFixtureWithPageInfo(
+						[]string{sha}, true,
+						tt.reviewsHasNext, tt.checkRunsHasNext, tt.checkSuitesHasNext,
+					))
+					return
+				}
+
+				// REST API handler for reviews.
+				if strings.Contains(r.URL.Path, "/reviews") {
+					restCalls++
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(tt.restReviews)
+					return
+				}
+
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			defer srv.Close()
+
+			pool := mockGraphQLPool(t, srv.URL)
+			client := NewGraphQLClient(pool, testLogger())
+
+			results, err := client.EnrichCommits(context.Background(), "testorg", "repo", []string{sha})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if len(results) != 1 {
+				t.Fatalf("expected 1 result, got %d", len(results))
+			}
+
+			r := results[0]
+			if len(r.Reviews) != tt.wantReviewCount {
+				t.Errorf("review count = %d, want %d", len(r.Reviews), tt.wantReviewCount)
+			}
+			if len(r.CheckRuns) != tt.wantCheckRunCount {
+				t.Errorf("check run count = %d, want %d", len(r.CheckRuns), tt.wantCheckRunCount)
+			}
+			if restCalls != tt.wantRESTCalls {
+				t.Errorf("REST calls = %d, want %d", restCalls, tt.wantRESTCalls)
+			}
+		})
+	}
+}
+
+func TestEnrichCommits_ReviewsPaginationMultiplePages(t *testing.T) {
+	sha := "abc1234567890abc1234567890abc1234567890ab"
+
+	// Simulate 150 reviews: GraphQL returns first 100 (with hasNextPage=true),
+	// REST returns all 150 across 2 pages.
+	allRESTReviews := make([]map[string]any, 150)
+	for i := range 150 {
+		allRESTReviews[i] = map[string]any{
+			"id":           int64(1000 + i),
+			"state":        "APPROVED",
+			"user":         map[string]any{"login": fmt.Sprintf("reviewer%d", i)},
+			"commit_id":    sha,
+			"submitted_at": "2024-01-14T10:00:00Z",
+			"html_url":     fmt.Sprintf("https://github.com/testorg/repo/pull/100#pullrequestreview-%d", 1000+i),
+		}
+	}
+
+	restCalls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/graphql" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(graphqlFixtureWithPageInfo(
+				[]string{sha}, true, true, false, false,
+			))
+			return
+		}
+
+		// REST API handler for reviews with pagination.
+		if strings.Contains(r.URL.Path, "/reviews") {
+			restCalls++
+			page := r.URL.Query().Get("page")
+			w.Header().Set("Content-Type", "application/json")
+
+			if page == "" || page == "1" {
+				// Return first 100 with a Link header for page 2.
+				nextURL := fmt.Sprintf("<%s%s?per_page=100&page=2>; rel=\"next\"", "http://"+r.Host, r.URL.Path)
+				w.Header().Set("Link", nextURL)
+				json.NewEncoder(w).Encode(allRESTReviews[:100])
+			} else {
+				// Return remaining 50 with no next link.
+				json.NewEncoder(w).Encode(allRESTReviews[100:])
+			}
+			return
+		}
+
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	pool := mockGraphQLPool(t, srv.URL)
+	client := NewGraphQLClient(pool, testLogger())
+
+	results, err := client.EnrichCommits(context.Background(), "testorg", "repo", []string{sha})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	r := results[0]
+	if len(r.Reviews) != 150 {
+		t.Errorf("review count = %d, want 150", len(r.Reviews))
+	}
+	if restCalls != 2 {
+		t.Errorf("REST calls = %d, want 2", restCalls)
+	}
+
+	// Verify first and last review data.
+	if r.Reviews[0].ReviewID != 1000 {
+		t.Errorf("first review ID = %d, want 1000", r.Reviews[0].ReviewID)
+	}
+	if r.Reviews[149].ReviewID != 1149 {
+		t.Errorf("last review ID = %d, want 1149", r.Reviews[149].ReviewID)
+	}
+	if r.Reviews[0].ReviewerLogin != "reviewer0" {
+		t.Errorf("first reviewer = %q, want reviewer0", r.Reviews[0].ReviewerLogin)
+	}
 }

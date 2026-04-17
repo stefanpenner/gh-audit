@@ -94,6 +94,7 @@ const (
 		has_pr               BOOLEAN,
 		pr_number            INTEGER,
 		has_final_approval   BOOLEAN,
+		is_self_approved     BOOLEAN,
 		approver_logins      TEXT[],
 		owner_approval_check TEXT,
 		is_compliant         BOOLEAN,

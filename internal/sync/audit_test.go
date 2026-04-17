@@ -61,16 +61,17 @@ func TestEvaluateCommit(t *testing.T) {
 	}
 
 	tests := []struct {
-		name           string
-		commit         model.Commit
-		enrichment     model.EnrichmentResult
-		exemptAuthors  []string
-		requiredChecks []RequiredCheck
-		wantCompliant  bool
-		wantBot        bool
-		wantEmpty      bool
-		wantHasPR      bool
-		wantReasons    []string
+		name             string
+		commit           model.Commit
+		enrichment       model.EnrichmentResult
+		exemptAuthors    []string
+		requiredChecks   []RequiredCheck
+		wantCompliant    bool
+		wantBot          bool
+		wantEmpty        bool
+		wantHasPR        bool
+		wantSelfApproved bool
+		wantReasons      []string
 	}{
 		{
 			name:   "normal compliant commit",
@@ -236,6 +237,150 @@ func TestEvaluateCommit(t *testing.T) {
 			wantHasPR:      true,
 			wantReasons:    []string{"compliant"},
 		},
+		{
+			name:   "PR author == reviewer is self-approval",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{basePR},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "developer", State: "APPROVED", CommitID: "head123", SubmittedAt: now},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks:   requiredChecks,
+			wantCompliant:    false,
+			wantHasPR:        true,
+			wantSelfApproved: true,
+			wantReasons:      []string{"self-approved (reviewer is code author) (PR #42)"},
+		},
+		{
+			name: "commit author == reviewer is self-approval",
+			commit: model.Commit{
+				Org: "myorg", Repo: "myrepo", SHA: "abc123",
+				AuthorLogin: "coder", Additions: 10, Deletions: 5,
+				Href: "https://github.com/myorg/myrepo/commit/abc123",
+			},
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{
+					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "abc123", AuthorLogin: "prauthor", Href: "https://github.com/myorg/myrepo/pull/42"},
+				},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "coder", State: "APPROVED", CommitID: "head123", SubmittedAt: now},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks:   requiredChecks,
+			wantCompliant:    false,
+			wantHasPR:        true,
+			wantSelfApproved: true,
+			wantReasons:      []string{"self-approved (reviewer is code author) (PR #42)"},
+		},
+		{
+			name: "co-author == reviewer is self-approval",
+			commit: model.Commit{
+				Org: "myorg", Repo: "myrepo", SHA: "abc123",
+				AuthorLogin: "maindev", Additions: 10, Deletions: 5,
+				CoAuthors: []model.CoAuthor{{Login: "codev", Email: "codev@example.com"}},
+				Href:      "https://github.com/myorg/myrepo/commit/abc123",
+			},
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{
+					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "abc123", AuthorLogin: "maindev", Href: "https://github.com/myorg/myrepo/pull/42"},
+				},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "codev", State: "APPROVED", CommitID: "head123", SubmittedAt: now},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks:   requiredChecks,
+			wantCompliant:    false,
+			wantHasPR:        true,
+			wantSelfApproved: true,
+			wantReasons:      []string{"self-approved (reviewer is code author) (PR #42)"},
+		},
+		{
+			name: "committer == reviewer (non-bot) is self-approval",
+			commit: model.Commit{
+				Org: "myorg", Repo: "myrepo", SHA: "abc123",
+				AuthorLogin: "maindev", CommitterLogin: "deployer",
+				Additions: 10, Deletions: 5,
+				Href: "https://github.com/myorg/myrepo/commit/abc123",
+			},
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{
+					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "abc123", AuthorLogin: "maindev", Href: "https://github.com/myorg/myrepo/pull/42"},
+				},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "deployer", State: "APPROVED", CommitID: "head123", SubmittedAt: now},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks:   requiredChecks,
+			wantCompliant:    false,
+			wantHasPR:        true,
+			wantSelfApproved: true,
+			wantReasons:      []string{"self-approved (reviewer is code author) (PR #42)"},
+		},
+		{
+			name: "committer is web-flow and matches reviewer is NOT self-approval",
+			commit: model.Commit{
+				Org: "myorg", Repo: "myrepo", SHA: "abc123",
+				AuthorLogin: "maindev", CommitterLogin: "web-flow",
+				Additions: 10, Deletions: 5,
+				Href: "https://github.com/myorg/myrepo/commit/abc123",
+			},
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{
+					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "abc123", AuthorLogin: "maindev", Href: "https://github.com/myorg/myrepo/pull/42"},
+				},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "web-flow", State: "APPROVED", CommitID: "head123", SubmittedAt: now},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks: requiredChecks,
+			wantCompliant:  true,
+			wantHasPR:      true,
+			wantReasons:    []string{"compliant"},
+		},
+		{
+			name:   "self-approval exists but another non-self approval also exists is compliant",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{basePR},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "developer", State: "APPROVED", CommitID: "head123", SubmittedAt: now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "independent-reviewer", State: "APPROVED", CommitID: "head123", SubmittedAt: now},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks: requiredChecks,
+			wantCompliant:  true,
+			wantHasPR:      true,
+			wantReasons:    []string{"compliant"},
+		},
+		{
+			name: "multiple reviewers one self one legitimate is compliant",
+			commit: model.Commit{
+				Org: "myorg", Repo: "myrepo", SHA: "abc123",
+				AuthorLogin: "developer", CommitterLogin: "deployer",
+				Additions: 10, Deletions: 5,
+				CoAuthors: []model.CoAuthor{{Login: "codev"}},
+				Href:      "https://github.com/myorg/myrepo/commit/abc123",
+			},
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{basePR},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "codev", State: "APPROVED", CommitID: "head123", SubmittedAt: now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "external-reviewer", State: "APPROVED", CommitID: "head123", SubmittedAt: now},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks: requiredChecks,
+			wantCompliant:  true,
+			wantHasPR:      true,
+			wantReasons:    []string{"compliant"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -253,6 +398,9 @@ func TestEvaluateCommit(t *testing.T) {
 			}
 			if result.HasPR != tt.wantHasPR {
 				t.Errorf("HasPR = %v, want %v", result.HasPR, tt.wantHasPR)
+			}
+			if result.IsSelfApproved != tt.wantSelfApproved {
+				t.Errorf("IsSelfApproved = %v, want %v", result.IsSelfApproved, tt.wantSelfApproved)
 			}
 			if tt.wantReasons != nil {
 				if len(result.Reasons) != len(tt.wantReasons) {

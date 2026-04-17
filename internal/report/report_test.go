@@ -13,6 +13,7 @@ import (
 	"time"
 
 	_ "github.com/marcboeker/go-duckdb"
+	"github.com/xuri/excelize/v2"
 )
 
 const schemaDDL = `
@@ -46,6 +47,14 @@ CREATE TABLE IF NOT EXISTS commit_prs (
 	sha       TEXT NOT NULL,
 	pr_number INTEGER NOT NULL,
 	PRIMARY KEY (org, repo, sha, pr_number)
+);
+
+CREATE TABLE IF NOT EXISTS commit_branches (
+	org    TEXT NOT NULL,
+	repo   TEXT NOT NULL,
+	sha    TEXT NOT NULL,
+	branch TEXT NOT NULL,
+	PRIMARY KEY (org, repo, sha, branch)
 );
 
 CREATE TABLE IF NOT EXISTS pull_requests (
@@ -105,6 +114,7 @@ CREATE TABLE IF NOT EXISTS audit_results (
 	reasons              TEXT[],
 	commit_href          TEXT,
 	pr_href              TEXT,
+	is_self_approved     BOOLEAN,
 	audited_at           TIMESTAMP DEFAULT current_timestamp,
 	PRIMARY KEY (org, repo, sha)
 );
@@ -144,6 +154,11 @@ func insertCommit(t *testing.T, db *sql.DB, org, repo, sha, author string, commi
 
 func insertAuditResult(t *testing.T, db *sql.DB, org, repo, sha string, isBot, isEmpty, hasPR, hasApproval, isCompliant bool, prNumber int, approvers []string, reasons []string) {
 	t.Helper()
+	insertAuditResultFull(t, db, org, repo, sha, isBot, isEmpty, hasPR, hasApproval, isCompliant, false, prNumber, approvers, reasons)
+}
+
+func insertAuditResultFull(t *testing.T, db *sql.DB, org, repo, sha string, isBot, isEmpty, hasPR, hasApproval, isCompliant, isSelfApproved bool, prNumber int, approvers []string, reasons []string) {
+	t.Helper()
 
 	approverExpr := "list_value()"
 	if len(approvers) > 0 {
@@ -163,16 +178,26 @@ func insertAuditResult(t *testing.T, db *sql.DB, org, repo, sha string, isBot, i
 		reasonExpr = fmt.Sprintf("list_value(%s)", strings.Join(quoted, ", "))
 	}
 
-	q := fmt.Sprintf(`INSERT INTO audit_results (org, repo, sha, is_empty_commit, is_bot, has_pr, pr_number, has_final_approval, approver_logins, owner_approval_check, is_compliant, reasons, commit_href, pr_href)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, %s, ?, ?, %s, ?, ?)`, approverExpr, reasonExpr)
+	q := fmt.Sprintf(`INSERT INTO audit_results (org, repo, sha, is_empty_commit, is_bot, has_pr, pr_number, has_final_approval, approver_logins, owner_approval_check, is_compliant, reasons, commit_href, pr_href, is_self_approved)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, %s, ?, ?, %s, ?, ?, ?)`, approverExpr, reasonExpr)
 
 	_, err := db.Exec(q,
 		org, repo, sha, isEmpty, isBot, hasPR, prNumber, hasApproval,
 		"success", isCompliant,
 		fmt.Sprintf("https://github.com/%s/%s/commit/%s", org, repo, sha),
-		fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, prNumber))
+		fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, prNumber),
+		isSelfApproved)
 	if err != nil {
 		t.Fatalf("insert audit result: %v", err)
+	}
+}
+
+func insertCommitBranch(t *testing.T, db *sql.DB, org, repo, sha, branch string) {
+	t.Helper()
+	_, err := db.Exec(`INSERT INTO commit_branches (org, repo, sha, branch) VALUES (?, ?, ?, ?)`,
+		org, repo, sha, branch)
+	if err != nil {
+		t.Fatalf("insert commit branch: %v", err)
 	}
 }
 
@@ -467,5 +492,226 @@ func TestGenerateXLSXLargeDataset(t *testing.T) {
 	}
 	if info.Size() == 0 {
 		t.Error("file is empty")
+	}
+}
+
+func TestGenerateXLSXHasFiveSheets(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	insertCommit(t, db, "org1", "repo1", "aaa111aaa", "dev1", now, 10, 5)
+	insertCommit(t, db, "org1", "repo1", "bbb222bbb", "dev2", now, 10, 5)
+	insertCommit(t, db, "org1", "repo1", "ccc333ccc", "bot1", now, 0, 0)
+	insertCommitBranch(t, db, "org1", "repo1", "aaa111aaa", "main")
+
+	insertAuditResultFull(t, db, "org1", "repo1", "aaa111aaa", false, false, true, true, true, true, 1, []string{"dev1"}, []string{"compliant"})
+	insertAuditResult(t, db, "org1", "repo1", "bbb222bbb", false, false, false, false, false, 0, nil, []string{"no associated pull request"})
+	insertAuditResult(t, db, "org1", "repo1", "ccc333ccc", false, true, false, false, true, 0, nil, []string{"empty commit"})
+
+	r := New(db)
+
+	tmpFile := t.TempDir() + "/test-five-sheets.xlsx"
+	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
+	if err != nil {
+		t.Fatalf("GenerateXLSX: %v", err)
+	}
+
+	xf, err := excelize.OpenFile(tmpFile)
+	if err != nil {
+		t.Fatalf("opening xlsx: %v", err)
+	}
+	defer xf.Close()
+
+	sheets := xf.GetSheetList()
+	expected := []string{"Summary", "All Commits", "Non-Compliant", "Exemptions", "Self-Approved"}
+	if len(sheets) != len(expected) {
+		t.Fatalf("expected %d sheets, got %d: %v", len(expected), len(sheets), sheets)
+	}
+	for i, name := range expected {
+		if sheets[i] != name {
+			t.Errorf("sheet %d: expected %q, got %q", i, name, sheets[i])
+		}
+	}
+}
+
+func TestSelfApprovedSheetContainsOnlySelfApproved(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	insertCommit(t, db, "org1", "repo1", "selfaaa11", "dev1", now, 10, 5)
+	insertCommit(t, db, "org1", "repo1", "normalbbb", "dev2", now, 10, 5)
+
+	// Self-approved commit
+	insertAuditResultFull(t, db, "org1", "repo1", "selfaaa11", false, false, true, true, true, true, 1, []string{"dev1"}, []string{"self-approved"})
+	// Normal commit
+	insertAuditResultFull(t, db, "org1", "repo1", "normalbbb", false, false, true, true, true, false, 2, []string{"reviewer1"}, []string{"compliant"})
+
+	r := New(db)
+
+	tmpFile := t.TempDir() + "/test-self-approved.xlsx"
+	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
+	if err != nil {
+		t.Fatalf("GenerateXLSX: %v", err)
+	}
+
+	xf, err := excelize.OpenFile(tmpFile)
+	if err != nil {
+		t.Fatalf("opening xlsx: %v", err)
+	}
+	defer xf.Close()
+
+	rows, err := xf.GetRows("Self-Approved")
+	if err != nil {
+		t.Fatalf("getting Self-Approved rows: %v", err)
+	}
+
+	// 1 header + 1 data row
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows (header + 1 data), got %d", len(rows))
+	}
+
+	// Check that the self-approved commit SHA prefix is present
+	found := false
+	for _, cell := range rows[1] {
+		if cell == "selfaaa1" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected self-approved SHA prefix 'selfaaa1' in row, got: %v", rows[1])
+	}
+}
+
+func TestSummarySelfApprovedCount(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	insertCommit(t, db, "org1", "repo1", "aaa111aaa", "dev1", now, 10, 5)
+	insertCommit(t, db, "org1", "repo1", "bbb222bbb", "dev2", now, 10, 5)
+
+	insertAuditResultFull(t, db, "org1", "repo1", "aaa111aaa", false, false, true, true, true, true, 1, []string{"dev1"}, []string{"compliant"})
+	insertAuditResultFull(t, db, "org1", "repo1", "bbb222bbb", false, false, true, true, true, false, 2, []string{"reviewer1"}, []string{"compliant"})
+
+	r := New(db)
+	summary, err := r.GetSummary(context.Background(), ReportOpts{})
+	if err != nil {
+		t.Fatalf("GetSummary: %v", err)
+	}
+
+	if len(summary) != 1 {
+		t.Fatalf("expected 1 summary row, got %d", len(summary))
+	}
+	if summary[0].SelfApprovedCount != 1 {
+		t.Errorf("expected SelfApprovedCount=1, got %d", summary[0].SelfApprovedCount)
+	}
+}
+
+func TestHyperlinksOnNonStreamingSheets(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	insertCommit(t, db, "org1", "repo1", "abc12345678", "dev1", now, 10, 5)
+	insertAuditResult(t, db, "org1", "repo1", "abc12345678", false, false, false, false, false, 0, nil, []string{"no associated pull request"})
+
+	r := New(db)
+
+	tmpFile := t.TempDir() + "/test-hyperlinks.xlsx"
+	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
+	if err != nil {
+		t.Fatalf("GenerateXLSX: %v", err)
+	}
+
+	xf, err := excelize.OpenFile(tmpFile)
+	if err != nil {
+		t.Fatalf("opening xlsx: %v", err)
+	}
+	defer xf.Close()
+
+	// Non-Compliant sheet should have a hyperlink on SHA cell (C2)
+	val, err := xf.GetCellValue("Non-Compliant", "C2")
+	if err != nil {
+		t.Fatalf("getting cell C2: %v", err)
+	}
+	if val != "abc12345" {
+		t.Errorf("expected SHA display 'abc12345', got %q", val)
+	}
+
+	// Check hyperlink exists
+	hasLink, target, err := xf.GetCellHyperLink("Non-Compliant", "C2")
+	if err != nil {
+		t.Fatalf("getting hyperlink: %v", err)
+	}
+	if !hasLink {
+		t.Error("expected hyperlink on SHA cell C2 in Non-Compliant sheet")
+	}
+	if target != "https://github.com/org1/repo1/commit/abc12345678" {
+		t.Errorf("unexpected hyperlink target: %s", target)
+	}
+}
+
+func TestEmptyNonCompliantSheetStillCreated(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	// All commits are compliant
+	insertCommit(t, db, "org1", "repo1", "aaa111aaa", "dev1", now, 10, 5)
+	insertAuditResult(t, db, "org1", "repo1", "aaa111aaa", false, false, true, true, true, 1, []string{"reviewer1"}, []string{"compliant"})
+
+	r := New(db)
+
+	tmpFile := t.TempDir() + "/test-empty-nc.xlsx"
+	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
+	if err != nil {
+		t.Fatalf("GenerateXLSX: %v", err)
+	}
+
+	xf, err := excelize.OpenFile(tmpFile)
+	if err != nil {
+		t.Fatalf("opening xlsx: %v", err)
+	}
+	defer xf.Close()
+
+	sheets := xf.GetSheetList()
+	found := false
+	for _, s := range sheets {
+		if s == "Non-Compliant" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Non-Compliant sheet should exist even with zero non-compliant rows")
+	}
+
+	// Should have header row only
+	rows, err := xf.GetRows("Non-Compliant")
+	if err != nil {
+		t.Fatalf("getting Non-Compliant rows: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("expected 1 row (header only) in empty Non-Compliant sheet, got %d", len(rows))
+	}
+}
+
+func TestDetailRowBranchName(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	insertCommit(t, db, "org1", "repo1", "aaa111aaa", "dev1", now, 10, 5)
+	insertCommitBranch(t, db, "org1", "repo1", "aaa111aaa", "main")
+	insertAuditResult(t, db, "org1", "repo1", "aaa111aaa", false, false, true, true, true, 1, []string{"reviewer1"}, []string{"compliant"})
+
+	r := New(db)
+	details, err := r.GetDetails(context.Background(), ReportOpts{})
+	if err != nil {
+		t.Fatalf("GetDetails: %v", err)
+	}
+
+	if len(details) != 1 {
+		t.Fatalf("expected 1 detail row, got %d", len(details))
+	}
+	if details[0].BranchName != "main" {
+		t.Errorf("expected BranchName='main', got %q", details[0].BranchName)
 	}
 }

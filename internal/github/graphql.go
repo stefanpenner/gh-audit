@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/go-github/v72/github"
 	"github.com/stefanpenner/gh-audit/internal/model"
 )
 
@@ -85,7 +86,7 @@ func (c *GraphQLClient) enrichBatch(ctx context.Context, org, repo string, shas 
 		return nil, fmt.Errorf("graphql request returned status %d: %s", resp.StatusCode, string(body))
 	}
 
-	return parseGraphQLResponse(body, org, repo, shas)
+	return c.parseGraphQLResponse(ctx, body, org, repo, shas)
 }
 
 func buildBatchQuery(org, repo string, shas []string) string {
@@ -97,7 +98,7 @@ func buildBatchQuery(org, repo string, shas []string) string {
 		buf.WriteString(fmt.Sprintf("    c%d: object(oid: %q) {\n", i, sha))
 		buf.WriteString("      ... on Commit {\n")
 		buf.WriteString("        oid\n")
-		buf.WriteString("        associatedPullRequests(first: 5, states: MERGED) {\n")
+		buf.WriteString("        associatedPullRequests(first: 10, states: MERGED) {\n")
 		buf.WriteString("          nodes {\n")
 		buf.WriteString("            number\n")
 		buf.WriteString("            title\n")
@@ -107,7 +108,7 @@ func buildBatchQuery(org, repo string, shas []string) string {
 		buf.WriteString("            author { login }\n")
 		buf.WriteString("            mergedAt\n")
 		buf.WriteString("            url\n")
-		buf.WriteString("            reviews(first: 30) {\n")
+		buf.WriteString("            reviews(first: 100) {\n")
 		buf.WriteString("              nodes {\n")
 		buf.WriteString("                databaseId\n")
 		buf.WriteString("                state\n")
@@ -116,13 +117,14 @@ func buildBatchQuery(org, repo string, shas []string) string {
 		buf.WriteString("                submittedAt\n")
 		buf.WriteString("                url\n")
 		buf.WriteString("              }\n")
+		buf.WriteString("              pageInfo { hasNextPage endCursor }\n")
 		buf.WriteString("            }\n")
 		buf.WriteString("            commits(last: 1) {\n")
 		buf.WriteString("              nodes {\n")
 		buf.WriteString("                commit {\n")
-		buf.WriteString("                  checkSuites(first: 10) {\n")
+		buf.WriteString("                  checkSuites(first: 20) {\n")
 		buf.WriteString("                    nodes {\n")
-		buf.WriteString("                      checkRuns(first: 50) {\n")
+		buf.WriteString("                      checkRuns(first: 100) {\n")
 		buf.WriteString("                        nodes {\n")
 		buf.WriteString("                          databaseId\n")
 		buf.WriteString("                          name\n")
@@ -130,13 +132,16 @@ func buildBatchQuery(org, repo string, shas []string) string {
 		buf.WriteString("                          conclusion\n")
 		buf.WriteString("                          completedAt\n")
 		buf.WriteString("                        }\n")
+		buf.WriteString("                        pageInfo { hasNextPage }\n")
 		buf.WriteString("                      }\n")
+		buf.WriteString("                      pageInfo { hasNextPage }\n")
 		buf.WriteString("                    }\n")
 		buf.WriteString("                  }\n")
 		buf.WriteString("                }\n")
 		buf.WriteString("              }\n")
 		buf.WriteString("            }\n")
 		buf.WriteString("          }\n")
+		buf.WriteString("          pageInfo { hasNextPage }\n")
 		buf.WriteString("        }\n")
 		buf.WriteString("      }\n")
 		buf.WriteString("    }\n")
@@ -157,7 +162,13 @@ type graphqlError struct {
 	Message string `json:"message"`
 }
 
-func parseGraphQLResponse(body []byte, org, repo string, shas []string) ([]model.EnrichmentResult, error) {
+// gqlPageInfo represents the GraphQL PageInfo object.
+type gqlPageInfo struct {
+	HasNextPage bool   `json:"hasNextPage"`
+	EndCursor   string `json:"endCursor"`
+}
+
+func (c *GraphQLClient) parseGraphQLResponse(ctx context.Context, body []byte, org, repo string, shas []string) ([]model.EnrichmentResult, error) {
 	var resp graphqlResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("unmarshaling graphql response: %w", err)
@@ -197,7 +208,7 @@ func parseGraphQLResponse(body []byte, org, repo string, shas []string) ([]model
 			continue
 		}
 
-		prs, reviews, checkRuns, err := parseCommitObject(commitData, org, repo)
+		prs, reviews, checkRuns, err := c.parseCommitObject(ctx, commitData, org, repo, sha)
 		if err != nil {
 			return nil, fmt.Errorf("parsing commit %s: %w", sha, err)
 		}
@@ -211,14 +222,21 @@ func parseGraphQLResponse(body []byte, org, repo string, shas []string) ([]model
 	return results, nil
 }
 
-func parseCommitObject(data json.RawMessage, org, repo string) ([]model.PullRequest, []model.Review, []model.CheckRun, error) {
+func (c *GraphQLClient) parseCommitObject(ctx context.Context, data json.RawMessage, org, repo, sha string) ([]model.PullRequest, []model.Review, []model.CheckRun, error) {
 	var obj struct {
 		AssociatedPullRequests struct {
-			Nodes []json.RawMessage `json:"nodes"`
+			Nodes    []json.RawMessage `json:"nodes"`
+			PageInfo gqlPageInfo       `json:"pageInfo"`
 		} `json:"associatedPullRequests"`
 	}
 	if err := json.Unmarshal(data, &obj); err != nil {
 		return nil, nil, nil, fmt.Errorf("unmarshaling commit object: %w", err)
+	}
+
+	if obj.AssociatedPullRequests.PageInfo.HasNextPage {
+		c.logger.Warn("pagination truncated: associatedPullRequests",
+			"org", org, "repo", repo, "sha", sha,
+			"field", "associatedPullRequests")
 	}
 
 	var prs []model.PullRequest
@@ -226,7 +244,7 @@ func parseCommitObject(data json.RawMessage, org, repo string) ([]model.PullRequ
 	var checkRuns []model.CheckRun
 
 	for _, prRaw := range obj.AssociatedPullRequests.Nodes {
-		pr, prReviews, prCheckRuns, err := parsePRNode(prRaw, org, repo)
+		pr, prReviews, prCheckRuns, err := c.parsePRNode(ctx, prRaw, org, repo, sha)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -261,8 +279,9 @@ type gqlPRNode struct {
 	} `json:"author"`
 	MergedAt string `json:"mergedAt"`
 	URL      string `json:"url"`
-	Reviews  struct {
-		Nodes []gqlReviewNode `json:"nodes"`
+	Reviews struct {
+		Nodes    []gqlReviewNode `json:"nodes"`
+		PageInfo gqlPageInfo     `json:"pageInfo"`
 	} `json:"reviews"`
 	Commits struct {
 		Nodes []struct {
@@ -270,9 +289,12 @@ type gqlPRNode struct {
 				CheckSuites struct {
 					Nodes []struct {
 						CheckRuns struct {
-							Nodes []gqlCheckRunNode `json:"nodes"`
+							Nodes    []gqlCheckRunNode `json:"nodes"`
+							PageInfo gqlPageInfo       `json:"pageInfo"`
 						} `json:"checkRuns"`
+						PageInfo gqlPageInfo `json:"pageInfo"`
 					} `json:"nodes"`
+					PageInfo gqlPageInfo `json:"pageInfo"`
 				} `json:"checkSuites"`
 			} `json:"commit"`
 		} `json:"nodes"`
@@ -300,7 +322,7 @@ type gqlCheckRunNode struct {
 	CompletedAt string `json:"completedAt"`
 }
 
-func parsePRNode(data json.RawMessage, org, repo string) (model.PullRequest, []model.Review, []model.CheckRun, error) {
+func (c *GraphQLClient) parsePRNode(ctx context.Context, data json.RawMessage, org, repo, sha string) (model.PullRequest, []model.Review, []model.CheckRun, error) {
 	var node gqlPRNode
 	if err := json.Unmarshal(data, &node); err != nil {
 		return model.PullRequest{}, nil, nil, fmt.Errorf("unmarshaling PR node: %w", err)
@@ -329,33 +351,44 @@ func parsePRNode(data json.RawMessage, org, repo string) (model.PullRequest, []m
 
 	// Parse reviews.
 	var reviews []model.Review
-	for _, rn := range node.Reviews.Nodes {
-		review := model.Review{
-			Org:      org,
-			Repo:     repo,
-			PRNumber: node.Number,
-			ReviewID: rn.DatabaseID,
-			State:    rn.State,
-			Href:     rn.URL,
+
+	if node.Reviews.PageInfo.HasNextPage {
+		c.logger.Warn("pagination truncated: reviews, falling back to REST",
+			"org", org, "repo", repo, "sha", sha,
+			"field", "reviews", "pr", node.Number)
+		// Fetch ALL reviews via REST API.
+		restReviews, err := c.fetchAllReviews(ctx, org, repo, node.Number)
+		if err != nil {
+			c.logger.Error("REST fallback for reviews failed, using partial GraphQL data",
+				"org", org, "repo", repo, "pr", node.Number, "error", err)
+			// Fall back to partial data from GraphQL.
+			reviews = convertGQLReviews(node.Reviews.Nodes, org, repo, node.Number)
+		} else {
+			reviews = restReviews
 		}
-		if rn.Author != nil {
-			review.ReviewerLogin = rn.Author.Login
-		}
-		if rn.Commit != nil {
-			review.CommitID = rn.Commit.OID
-		}
-		if rn.SubmittedAt != "" {
-			if t, err := time.Parse(time.RFC3339, rn.SubmittedAt); err == nil {
-				review.SubmittedAt = t
-			}
-		}
-		reviews = append(reviews, review)
+	} else {
+		reviews = convertGQLReviews(node.Reviews.Nodes, org, repo, node.Number)
 	}
 
 	// Parse check runs from the last commit in the PR.
 	var checkRuns []model.CheckRun
 	for _, commitNode := range node.Commits.Nodes {
+		if commitNode.Commit.CheckSuites.PageInfo.HasNextPage {
+			c.logger.Warn("pagination truncated: checkSuites",
+				"org", org, "repo", repo, "sha", sha,
+				"field", "checkSuites", "pr", node.Number)
+		}
 		for _, suite := range commitNode.Commit.CheckSuites.Nodes {
+			if suite.CheckRuns.PageInfo.HasNextPage {
+				c.logger.Warn("pagination truncated: checkRuns",
+					"org", org, "repo", repo, "sha", sha,
+					"field", "checkRuns", "pr", node.Number)
+			}
+			if suite.PageInfo.HasNextPage {
+				c.logger.Warn("pagination truncated: checkSuites inner",
+					"org", org, "repo", repo, "sha", sha,
+					"field", "checkSuites", "pr", node.Number)
+			}
 			for _, cr := range suite.CheckRuns.Nodes {
 				checkRun := model.CheckRun{
 					Org:        org,
@@ -379,4 +412,82 @@ func parsePRNode(data json.RawMessage, org, repo string) (model.PullRequest, []m
 	}
 
 	return pr, reviews, checkRuns, nil
+}
+
+// convertGQLReviews converts GraphQL review nodes to model.Review objects.
+func convertGQLReviews(nodes []gqlReviewNode, org, repo string, prNumber int) []model.Review {
+	var reviews []model.Review
+	for _, rn := range nodes {
+		review := model.Review{
+			Org:      org,
+			Repo:     repo,
+			PRNumber: prNumber,
+			ReviewID: rn.DatabaseID,
+			State:    rn.State,
+			Href:     rn.URL,
+		}
+		if rn.Author != nil {
+			review.ReviewerLogin = rn.Author.Login
+		}
+		if rn.Commit != nil {
+			review.CommitID = rn.Commit.OID
+		}
+		if rn.SubmittedAt != "" {
+			if t, err := time.Parse(time.RFC3339, rn.SubmittedAt); err == nil {
+				review.SubmittedAt = t
+			}
+		}
+		reviews = append(reviews, review)
+	}
+	return reviews
+}
+
+// fetchAllReviews fetches all reviews for a PR via the REST API, handling pagination.
+func (c *GraphQLClient) fetchAllReviews(ctx context.Context, org, repo string, prNumber int) ([]model.Review, error) {
+	httpClient, err := c.pool.Pick(ctx, org, repo)
+	if err != nil {
+		return nil, fmt.Errorf("picking token for REST reviews: %w", err)
+	}
+
+	ghClient := github.NewClient(httpClient)
+
+	var allReviews []model.Review
+	opts := &github.ListOptions{Page: 1, PerPage: 100}
+
+	for {
+		ghReviews, resp, err := ghClient.PullRequests.ListReviews(ctx, org, repo, prNumber, opts)
+		if err != nil {
+			return nil, fmt.Errorf("listing reviews for %s/%s#%d page %d: %w", org, repo, prNumber, opts.Page, err)
+		}
+
+		for _, r := range ghReviews {
+			review := model.Review{
+				Org:      org,
+				Repo:     repo,
+				PRNumber: prNumber,
+				ReviewID: r.GetID(),
+				State:    r.GetState(),
+			}
+			if r.User != nil {
+				review.ReviewerLogin = r.User.GetLogin()
+			}
+			if r.CommitID != nil {
+				review.CommitID = r.GetCommitID()
+			}
+			if r.SubmittedAt != nil {
+				review.SubmittedAt = r.SubmittedAt.Time
+			}
+			if r.HTMLURL != nil {
+				review.Href = r.GetHTMLURL()
+			}
+			allReviews = append(allReviews, review)
+		}
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	return allReviews, nil
 }

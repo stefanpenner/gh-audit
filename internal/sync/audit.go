@@ -54,23 +54,33 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	var bestPR *model.PullRequest
 	var bestReasons []string
 	var bestApprovers []string
+	var bestSelfApproved bool
 
 	for i := range enrichment.PRs {
 		pr := &enrichment.PRs[i]
 		prReasons := []string{}
 		prApprovers := []string{}
 
-		// Check for approval on final commit
+		// Check for approval on final commit, filtering out self-approvals
 		hasApprovalOnFinal := false
+		hasSelfApproval := false
 		for _, review := range enrichment.Reviews {
 			if review.PRNumber == pr.Number && review.State == "APPROVED" && review.CommitID == pr.HeadSHA {
-				hasApprovalOnFinal = true
-				prApprovers = append(prApprovers, review.ReviewerLogin)
+				if isSelfApproval(review, commit, *pr) {
+					hasSelfApproval = true
+				} else {
+					hasApprovalOnFinal = true
+					prApprovers = append(prApprovers, review.ReviewerLogin)
+				}
 			}
 		}
 
 		if !hasApprovalOnFinal {
-			prReasons = append(prReasons, fmt.Sprintf("no approval on final commit (PR #%d)", pr.Number))
+			if hasSelfApproval {
+				prReasons = append(prReasons, fmt.Sprintf("self-approved (reviewer is code author) (PR #%d)", pr.Number))
+			} else {
+				prReasons = append(prReasons, fmt.Sprintf("no approval on final commit (PR #%d)", pr.Number))
+			}
 		}
 
 		// Check Owner Approval (required checks on PR's head commit)
@@ -113,11 +123,13 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 			bestPR = pr
 			bestReasons = prReasons
 			bestApprovers = prApprovers
+			bestSelfApproved = hasSelfApproval && !hasApprovalOnFinal
 		}
 	}
 
 	// No PR satisfied all checks
 	result.IsCompliant = false
+	result.IsSelfApproved = bestSelfApproved
 	if bestPR != nil {
 		result.PRNumber = bestPR.Number
 		result.PRHref = bestPR.Href
@@ -149,4 +161,41 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	}
 	result.Reasons = bestReasons
 	return result
+}
+
+// isSelfApproval checks whether a review's author is the same person who
+// contributed code to the commit or PR. GitHub's merge bot logins
+// ("web-flow", "github") are excluded from the committer check.
+func isSelfApproval(review model.Review, commit model.Commit, pr model.PullRequest) bool {
+	reviewer := strings.ToLower(review.ReviewerLogin)
+
+	// Ignore empty reviewer
+	if reviewer == "" {
+		return false
+	}
+
+	// Check against PR author
+	if strings.EqualFold(pr.AuthorLogin, reviewer) {
+		return true
+	}
+
+	// Check against commit author
+	if strings.EqualFold(commit.AuthorLogin, reviewer) {
+		return true
+	}
+
+	// Check against committer (but skip GitHub's merge bot)
+	committer := strings.ToLower(commit.CommitterLogin)
+	if committer != "" && committer != "web-flow" && committer != "github" && committer == reviewer {
+		return true
+	}
+
+	// Check against co-authors
+	for _, ca := range commit.CoAuthors {
+		if strings.EqualFold(ca.Login, reviewer) {
+			return true
+		}
+	}
+
+	return false
 }

@@ -121,6 +121,7 @@ type AuditResult struct {
 	HasPR              bool
 	PRNumber           int
 	HasFinalApproval   bool
+	IsSelfApproved     bool // true if only approvals are from code contributors
 	ApproverLogins     []string
 	OwnerApprovalCheck string // success, failure, missing
 	IsCompliant        bool

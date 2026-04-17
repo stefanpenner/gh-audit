@@ -48,13 +48,13 @@ func (d *DB) upsertAuditBatch(ctx context.Context, results []model.AuditResult) 
 	defer tx.Rollback()
 
 	placeholders := make([]string, len(results))
-	args := make([]any, 0, len(results)*14)
+	args := make([]any, 0, len(results)*15)
 	for i, r := range results {
-		placeholders[i] = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+		placeholders[i] = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 		args = append(args,
 			r.Org, r.Repo, r.SHA,
 			r.IsEmptyCommit, r.IsBot, r.HasPR, r.PRNumber,
-			r.HasFinalApproval,
+			r.HasFinalApproval, r.IsSelfApproved,
 			toDuckDBList(r.ApproverLogins),
 			r.OwnerApprovalCheck, r.IsCompliant,
 			toDuckDBList(r.Reasons),
@@ -64,7 +64,7 @@ func (d *DB) upsertAuditBatch(ctx context.Context, results []model.AuditResult) 
 
 	q := fmt.Sprintf(`INSERT OR REPLACE INTO audit_results
 		(org, repo, sha, is_empty_commit, is_bot, has_pr, pr_number,
-		 has_final_approval, approver_logins, owner_approval_check, is_compliant,
+		 has_final_approval, is_self_approved, approver_logins, owner_approval_check, is_compliant,
 		 reasons, commit_href, pr_href)
 		VALUES %s`, strings.Join(placeholders, ", "))
 
@@ -160,7 +160,7 @@ func (d *DB) GetAuditResults(ctx context.Context, opts AuditQueryOpts) ([]AuditR
 
 	q := fmt.Sprintf(`
 		SELECT a.org, a.repo, a.sha, a.is_empty_commit, a.is_bot, a.has_pr, a.pr_number,
-		       a.has_final_approval, a.approver_logins, a.owner_approval_check, a.is_compliant,
+		       a.has_final_approval, a.is_self_approved, a.approver_logins, a.owner_approval_check, a.is_compliant,
 		       a.reasons, a.commit_href, a.pr_href, a.audited_at,
 		       COALESCE(c.author_login, ''), COALESCE(c.committed_at, '1970-01-01'::TIMESTAMP), COALESCE(c.message, '')
 		FROM audit_results a
@@ -181,7 +181,7 @@ func (d *DB) GetAuditResults(ctx context.Context, opts AuditQueryOpts) ([]AuditR
 		if err := rows.Scan(
 			&row.Org, &row.Repo, &row.SHA,
 			&row.IsEmptyCommit, &row.IsBot, &row.HasPR, &row.PRNumber,
-			&row.HasFinalApproval, &approvers, &row.OwnerApprovalCheck,
+			&row.HasFinalApproval, &row.IsSelfApproved, &approvers, &row.OwnerApprovalCheck,
 			&row.IsCompliant, &reasons, &row.CommitHref, &row.PRHref, &row.AuditedAt,
 			&row.AuthorLogin, &row.CommittedAt, &row.Message,
 		); err != nil {

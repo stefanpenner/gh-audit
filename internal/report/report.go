@@ -35,6 +35,7 @@ type SummaryRow struct {
 	NonCompliantCount int     `json:"non_compliant_count"`
 	BotCount          int     `json:"bot_count"`
 	EmptyCount        int     `json:"empty_count"`
+	SelfApprovedCount int     `json:"self_approved_count"`
 	CompliancePct     float64 `json:"compliance_pct"`
 }
 
@@ -44,10 +45,12 @@ type DetailRow struct {
 	Repo               string    `json:"repo"`
 	SHA                string    `json:"sha"`
 	AuthorLogin        string    `json:"author_login"`
+	CommitterLogin     string    `json:"committer_login"`
 	CommittedAt        time.Time `json:"committed_at"`
 	Message            string    `json:"message"`
 	IsBot              bool      `json:"is_bot"`
 	IsEmptyCommit      bool      `json:"is_empty_commit"`
+	IsSelfApproved     bool      `json:"is_self_approved"`
 	HasPR              bool      `json:"has_pr"`
 	PRNumber           int       `json:"pr_number"`
 	PRHref             string    `json:"pr_href"`
@@ -57,6 +60,7 @@ type DetailRow struct {
 	IsCompliant        bool      `json:"is_compliant"`
 	Reasons            string    `json:"reasons"`
 	CommitHref         string    `json:"commit_href"`
+	BranchName         string    `json:"branch_name"`
 }
 
 // New creates a new Reporter.
@@ -74,7 +78,8 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 			COUNT(*) FILTER (WHERE a.is_compliant = true) AS compliant_count,
 			COUNT(*) FILTER (WHERE a.is_compliant = false) AS non_compliant_count,
 			COUNT(*) FILTER (WHERE a.is_bot = true) AS bot_count,
-			COUNT(*) FILTER (WHERE a.is_empty_commit = true) AS empty_count
+			COUNT(*) FILTER (WHERE a.is_empty_commit = true) AS empty_count,
+			COUNT(*) FILTER (WHERE a.is_self_approved = true) AS self_approved_count
 		FROM audit_results a
 		JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
 		WHERE 1=1
@@ -110,7 +115,7 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 	for rows.Next() {
 		var s SummaryRow
 		if err := rows.Scan(&s.Org, &s.Repo, &s.TotalCommits,
-			&s.CompliantCount, &s.NonCompliantCount, &s.BotCount, &s.EmptyCount); err != nil {
+			&s.CompliantCount, &s.NonCompliantCount, &s.BotCount, &s.EmptyCount, &s.SelfApprovedCount); err != nil {
 			return nil, fmt.Errorf("scan summary: %w", err)
 		}
 		if s.TotalCommits > 0 {
@@ -129,10 +134,12 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			a.repo,
 			a.sha,
 			COALESCE(c.author_login, ''),
+			COALESCE(c.author_login, ''),
 			COALESCE(c.committed_at, '1970-01-01'::TIMESTAMP),
 			COALESCE(c.message, ''),
 			a.is_bot,
 			a.is_empty_commit,
+			COALESCE(a.is_self_approved, false),
 			a.has_pr,
 			COALESCE(a.pr_number, 0),
 			COALESCE(a.pr_href, ''),
@@ -141,9 +148,11 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			COALESCE(a.owner_approval_check, ''),
 			a.is_compliant,
 			COALESCE(array_to_string(a.reasons, ', '), ''),
-			COALESCE(a.commit_href, '')
+			COALESCE(a.commit_href, ''),
+			COALESCE(cb.branch, '')
 		FROM audit_results a
 		JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
+		LEFT JOIN commit_branches cb ON a.org = cb.org AND a.repo = cb.repo AND a.sha = cb.sha
 		WHERE 1=1
 	`
 
@@ -180,10 +189,10 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 	for rows.Next() {
 		var d DetailRow
 		if err := rows.Scan(
-			&d.Org, &d.Repo, &d.SHA, &d.AuthorLogin, &d.CommittedAt,
-			&d.Message, &d.IsBot, &d.IsEmptyCommit, &d.HasPR, &d.PRNumber,
+			&d.Org, &d.Repo, &d.SHA, &d.AuthorLogin, &d.CommitterLogin, &d.CommittedAt,
+			&d.Message, &d.IsBot, &d.IsEmptyCommit, &d.IsSelfApproved, &d.HasPR, &d.PRNumber,
 			&d.PRHref, &d.HasFinalApproval, &d.ApproverLogins,
-			&d.OwnerApprovalCheck, &d.IsCompliant, &d.Reasons, &d.CommitHref,
+			&d.OwnerApprovalCheck, &d.IsCompliant, &d.Reasons, &d.CommitHref, &d.BranchName,
 		); err != nil {
 			return nil, fmt.Errorf("scan detail: %w", err)
 		}
