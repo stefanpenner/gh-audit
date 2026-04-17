@@ -38,10 +38,7 @@ func (c *GraphQLClient) EnrichCommits(ctx context.Context, org, repo string, sha
 	var results []model.EnrichmentResult
 
 	for i := 0; i < len(shas); i += graphQLBatchSize {
-		end := i + graphQLBatchSize
-		if end > len(shas) {
-			end = len(shas)
-		}
+		end := min(i+graphQLBatchSize, len(shas))
 		batch := shas[i:end]
 
 		batchResults, err := c.enrichBatch(ctx, org, repo, batch)

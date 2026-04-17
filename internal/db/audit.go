@@ -32,10 +32,7 @@ func (d *DB) UpsertAuditResults(ctx context.Context, results []model.AuditResult
 		return nil
 	}
 	for i := 0; i < len(results); i += batchSize {
-		end := i + batchSize
-		if end > len(results) {
-			end = len(results)
-		}
+		end := min(i+batchSize, len(results))
 		if err := d.upsertAuditBatch(ctx, results[i:end]); err != nil {
 			return err
 		}
@@ -51,7 +48,7 @@ func (d *DB) upsertAuditBatch(ctx context.Context, results []model.AuditResult) 
 	defer tx.Rollback()
 
 	placeholders := make([]string, len(results))
-	args := make([]interface{}, 0, len(results)*14)
+	args := make([]any, 0, len(results)*14)
 	for i, r := range results {
 		placeholders[i] = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 		args = append(args,
@@ -90,13 +87,13 @@ func toDuckDBList(ss []string) string {
 }
 
 // scanDuckDBTextArray converts the value returned by DuckDB for a TEXT[] column
-// into a Go []string. DuckDB's Go driver returns TEXT[] as []interface{}.
-func scanDuckDBTextArray(v interface{}) []string {
+// into a Go []string. DuckDB's Go driver returns TEXT[] as []any.
+func scanDuckDBTextArray(v any) []string {
 	if v == nil {
 		return nil
 	}
 	switch val := v.(type) {
-	case []interface{}:
+	case []any:
 		result := make([]string, 0, len(val))
 		for _, elem := range val {
 			if s, ok := elem.(string); ok {
@@ -134,7 +131,7 @@ func scanDuckDBTextArray(v interface{}) []string {
 // GetAuditResults retrieves audit results with optional filters, joined with commit data.
 func (d *DB) GetAuditResults(ctx context.Context, opts AuditQueryOpts) ([]AuditRow, error) {
 	var conditions []string
-	var args []interface{}
+	var args []any
 
 	if opts.Org != "" {
 		conditions = append(conditions, "a.org = ?")
@@ -180,7 +177,7 @@ func (d *DB) GetAuditResults(ctx context.Context, opts AuditQueryOpts) ([]AuditR
 	var result []AuditRow
 	for rows.Next() {
 		var row AuditRow
-		var approvers, reasons interface{}
+		var approvers, reasons any
 		if err := rows.Scan(
 			&row.Org, &row.Repo, &row.SHA,
 			&row.IsEmptyCommit, &row.IsBot, &row.HasPR, &row.PRNumber,

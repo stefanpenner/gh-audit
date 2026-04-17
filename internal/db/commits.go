@@ -17,10 +17,7 @@ func (d *DB) UpsertCommits(ctx context.Context, commits []model.Commit) error {
 	}
 
 	for i := 0; i < len(commits); i += batchSize {
-		end := i + batchSize
-		if end > len(commits) {
-			end = len(commits)
-		}
+		end := min(i+batchSize, len(commits))
 		if err := d.upsertCommitBatch(ctx, commits[i:end]); err != nil {
 			return err
 		}
@@ -36,7 +33,7 @@ func (d *DB) upsertCommitBatch(ctx context.Context, commits []model.Commit) erro
 	defer tx.Rollback()
 
 	placeholders := make([]string, len(commits))
-	args := make([]interface{}, 0, len(commits)*11)
+	args := make([]any, 0, len(commits)*11)
 	for i, c := range commits {
 		placeholders[i] = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 		args = append(args, c.Org, c.Repo, c.SHA, c.AuthorLogin, c.AuthorEmail,
@@ -60,14 +57,11 @@ func (d *DB) UpsertCommitBranches(ctx context.Context, org, repo string, shas []
 	}
 
 	for i := 0; i < len(shas); i += batchSize {
-		end := i + batchSize
-		if end > len(shas) {
-			end = len(shas)
-		}
+		end := min(i+batchSize, len(shas))
 		batch := shas[i:end]
 
 		placeholders := make([]string, len(batch))
-		args := make([]interface{}, 0, len(batch)*4)
+		args := make([]any, 0, len(batch)*4)
 		for j, sha := range batch {
 			placeholders[j] = "(?, ?, ?, ?)"
 			args = append(args, org, repo, sha, branch)
@@ -107,7 +101,7 @@ func (d *DB) GetCommitsBySHA(ctx context.Context, org, repo string, shas []strin
 	}
 
 	placeholders := make([]string, len(shas))
-	args := make([]interface{}, 0, len(shas)+2)
+	args := make([]any, 0, len(shas)+2)
 	args = append(args, org, repo)
 	for i, sha := range shas {
 		placeholders[i] = "?"
@@ -130,7 +124,7 @@ func (d *DB) GetCommitsBySHA(ctx context.Context, org, repo string, shas []strin
 
 func scanCommits(rows interface {
 	Next() bool
-	Scan(...interface{}) error
+	Scan(...any) error
 	Err() error
 }) ([]model.Commit, error) {
 	var result []model.Commit

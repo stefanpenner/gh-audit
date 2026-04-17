@@ -14,10 +14,7 @@ func (d *DB) UpsertPullRequests(ctx context.Context, prs []model.PullRequest) er
 		return nil
 	}
 	for i := 0; i < len(prs); i += batchSize {
-		end := i + batchSize
-		if end > len(prs) {
-			end = len(prs)
-		}
+		end := min(i+batchSize, len(prs))
 		if err := d.upsertPRBatch(ctx, prs[i:end]); err != nil {
 			return err
 		}
@@ -33,7 +30,7 @@ func (d *DB) upsertPRBatch(ctx context.Context, prs []model.PullRequest) error {
 	defer tx.Rollback()
 
 	placeholders := make([]string, len(prs))
-	args := make([]interface{}, 0, len(prs)*10)
+	args := make([]any, 0, len(prs)*10)
 	for i, pr := range prs {
 		placeholders[i] = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 		args = append(args, pr.Org, pr.Repo, pr.Number, pr.Title, pr.Merged,
@@ -56,10 +53,7 @@ func (d *DB) UpsertReviews(ctx context.Context, reviews []model.Review) error {
 		return nil
 	}
 	for i := 0; i < len(reviews); i += batchSize {
-		end := i + batchSize
-		if end > len(reviews) {
-			end = len(reviews)
-		}
+		end := min(i+batchSize, len(reviews))
 		if err := d.upsertReviewBatch(ctx, reviews[i:end]); err != nil {
 			return err
 		}
@@ -75,7 +69,7 @@ func (d *DB) upsertReviewBatch(ctx context.Context, reviews []model.Review) erro
 	defer tx.Rollback()
 
 	placeholders := make([]string, len(reviews))
-	args := make([]interface{}, 0, len(reviews)*9)
+	args := make([]any, 0, len(reviews)*9)
 	for i, r := range reviews {
 		placeholders[i] = "(?, ?, ?, ?, ?, ?, ?, ?, ?)"
 		args = append(args, r.Org, r.Repo, r.PRNumber, r.ReviewID, r.ReviewerLogin,
@@ -98,10 +92,7 @@ func (d *DB) UpsertCheckRuns(ctx context.Context, checkRuns []model.CheckRun) er
 		return nil
 	}
 	for i := 0; i < len(checkRuns); i += batchSize {
-		end := i + batchSize
-		if end > len(checkRuns) {
-			end = len(checkRuns)
-		}
+		end := min(i+batchSize, len(checkRuns))
 		if err := d.upsertCheckRunBatch(ctx, checkRuns[i:end]); err != nil {
 			return err
 		}
@@ -117,7 +108,7 @@ func (d *DB) upsertCheckRunBatch(ctx context.Context, checkRuns []model.CheckRun
 	defer tx.Rollback()
 
 	placeholders := make([]string, len(checkRuns))
-	args := make([]interface{}, 0, len(checkRuns)*8)
+	args := make([]any, 0, len(checkRuns)*8)
 	for i, cr := range checkRuns {
 		placeholders[i] = "(?, ?, ?, ?, ?, ?, ?, ?)"
 		args = append(args, cr.Org, cr.Repo, cr.CommitSHA, cr.CheckRunID, cr.CheckName,
@@ -147,7 +138,7 @@ func (d *DB) UpsertCommitPRs(ctx context.Context, org, repo, sha string, prNumbe
 	defer tx.Rollback()
 
 	placeholders := make([]string, len(prNumbers))
-	args := make([]interface{}, 0, len(prNumbers)*4)
+	args := make([]any, 0, len(prNumbers)*4)
 	for i, n := range prNumbers {
 		placeholders[i] = "(?, ?, ?, ?)"
 		args = append(args, org, repo, sha, n)

@@ -57,14 +57,14 @@ func TestListOrgRepos(t *testing.T) {
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				page := r.URL.Query().Get("page")
 				if page == "" || page == "1" {
-					repos := make([]map[string]interface{}, 2)
-					repos[0] = map[string]interface{}{
+					repos := make([]map[string]any, 2)
+					repos[0] = map[string]any{
 						"name":           "repo1",
 						"full_name":      "testorg/repo1",
 						"default_branch": "main",
 						"archived":       false,
 					}
-					repos[1] = map[string]interface{}{
+					repos[1] = map[string]any{
 						"name":           "repo2",
 						"full_name":      "testorg/repo2",
 						"default_branch": "master",
@@ -73,7 +73,7 @@ func TestListOrgRepos(t *testing.T) {
 					w.Header().Set("Link", fmt.Sprintf(`<%s/orgs/testorg/repos?page=2>; rel="next"`, "http://"+r.Host))
 					json.NewEncoder(w).Encode(repos)
 				} else {
-					repos := []map[string]interface{}{
+					repos := []map[string]any{
 						{
 							"name":           "repo3",
 							"full_name":      "testorg/repo3",
@@ -89,7 +89,7 @@ func TestListOrgRepos(t *testing.T) {
 		{
 			name: "includes archived repos",
 			handler: func(w http.ResponseWriter, r *http.Request) {
-				repos := []map[string]interface{}{
+				repos := []map[string]any{
 					{
 						"name":           "archived-repo",
 						"full_name":      "testorg/archived-repo",
@@ -138,21 +138,21 @@ func TestListCommits(t *testing.T) {
 		{
 			name: "returns commits in date range",
 			handler: func(w http.ResponseWriter, r *http.Request) {
-				commits := []map[string]interface{}{
+				commits := []map[string]any{
 					{
 						"sha":      "abc123",
 						"html_url": "https://github.com/testorg/repo/commit/abc123",
-						"commit": map[string]interface{}{
+						"commit": map[string]any{
 							"message": "fix: something",
-							"author": map[string]interface{}{
+							"author": map[string]any{
 								"email": "dev@example.com",
 								"date":  "2024-01-15T10:00:00Z",
 							},
 						},
-						"author": map[string]interface{}{
+						"author": map[string]any{
 							"login": "developer",
 						},
-						"parents": []map[string]interface{}{
+						"parents": []map[string]any{
 							{"sha": "parent1"},
 						},
 					},
@@ -166,35 +166,35 @@ func TestListCommits(t *testing.T) {
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				page := r.URL.Query().Get("page")
 				if page == "" || page == "1" {
-					commits := []map[string]interface{}{
+					commits := []map[string]any{
 						{
 							"sha": "sha1",
-							"commit": map[string]interface{}{
+							"commit": map[string]any{
 								"message": "commit 1",
-								"author": map[string]interface{}{
+								"author": map[string]any{
 									"email": "a@b.com",
 									"date":  "2024-01-15T10:00:00Z",
 								},
 							},
-							"author":  map[string]interface{}{"login": "dev1"},
-							"parents": []map[string]interface{}{},
+							"author":  map[string]any{"login": "dev1"},
+							"parents": []map[string]any{},
 						},
 					}
 					w.Header().Set("Link", fmt.Sprintf(`<%s/repos/testorg/repo/commits?page=2>; rel="next"`, "http://"+r.Host))
 					json.NewEncoder(w).Encode(commits)
 				} else {
-					commits := []map[string]interface{}{
+					commits := []map[string]any{
 						{
 							"sha": "sha2",
-							"commit": map[string]interface{}{
+							"commit": map[string]any{
 								"message": "commit 2",
-								"author": map[string]interface{}{
+								"author": map[string]any{
 									"email": "b@c.com",
 									"date":  "2024-01-16T10:00:00Z",
 								},
 							},
-							"author":  map[string]interface{}{"login": "dev2"},
-							"parents": []map[string]interface{}{},
+							"author":  map[string]any{"login": "dev2"},
+							"parents": []map[string]any{},
 						},
 					}
 					json.NewEncoder(w).Encode(commits)
@@ -234,23 +234,23 @@ func TestListCommits(t *testing.T) {
 
 func TestGetCommitDetail(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		commit := map[string]interface{}{
+		commit := map[string]any{
 			"sha":      "abc123",
 			"html_url": "https://github.com/testorg/repo/commit/abc123",
-			"commit": map[string]interface{}{
+			"commit": map[string]any{
 				"message": "feat: add feature",
-				"author": map[string]interface{}{
+				"author": map[string]any{
 					"email": "dev@example.com",
 					"date":  "2024-01-15T10:00:00Z",
 				},
 			},
-			"author": map[string]interface{}{
+			"author": map[string]any{
 				"login": "developer",
 			},
-			"parents": []map[string]interface{}{
+			"parents": []map[string]any{
 				{"sha": "parent1"},
 			},
-			"stats": map[string]interface{}{
+			"stats": map[string]any{
 				"additions": 42,
 				"deletions": 13,
 			},

@@ -207,7 +207,7 @@ func writeDetailSheet(f *excelize.File, sheet string, details []DetailRow, redHe
 	}
 
 	// Write header row
-	headerRow := make([]interface{}, len(headers))
+	headerRow := make([]any, len(headers))
 	for i, h := range headers {
 		headerRow[i] = excelize.Cell{StyleID: headerStyle, Value: h}
 	}
@@ -232,7 +232,7 @@ func writeDetailSheet(f *excelize.File, sheet string, details []DetailRow, redHe
 			compliantStr = "Yes"
 		}
 
-		rowData := []interface{}{
+		rowData := []any{
 			d.Org,
 			d.Repo,
 			d.SHA,

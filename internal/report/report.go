@@ -80,7 +80,7 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 		WHERE 1=1
 	`
 
-	args := []interface{}{}
+	args := []any{}
 	if opts.Org != "" {
 		query += " AND a.org = ?"
 		args = append(args, opts.Org)
@@ -147,7 +147,7 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 		WHERE 1=1
 	`
 
-	args := []interface{}{}
+	args := []any{}
 	if opts.Org != "" {
 		query += " AND a.org = ?"
 		args = append(args, opts.Org)

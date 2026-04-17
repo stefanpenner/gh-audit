@@ -12,56 +12,56 @@ import (
 )
 
 // graphqlFixture builds a realistic GraphQL response for the given SHAs.
-func graphqlFixture(shas []string, withPRs bool) map[string]interface{} {
-	repo := map[string]interface{}{}
+func graphqlFixture(shas []string, withPRs bool) map[string]any {
+	repo := map[string]any{}
 
 	for i, sha := range shas {
 		alias := fmt.Sprintf("c%d", i)
 		if !withPRs {
-			repo[alias] = map[string]interface{}{
+			repo[alias] = map[string]any{
 				"oid": sha,
-				"associatedPullRequests": map[string]interface{}{
-					"nodes": []interface{}{},
+				"associatedPullRequests": map[string]any{
+					"nodes": []any{},
 				},
 			}
 			continue
 		}
 
-		repo[alias] = map[string]interface{}{
+		repo[alias] = map[string]any{
 			"oid": sha,
-			"associatedPullRequests": map[string]interface{}{
-				"nodes": []interface{}{
-					map[string]interface{}{
+			"associatedPullRequests": map[string]any{
+				"nodes": []any{
+					map[string]any{
 						"number":     100 + i,
 						"title":      fmt.Sprintf("PR for %s", sha[:7]),
 						"merged":     true,
-						"mergeCommit": map[string]interface{}{"oid": sha},
+						"mergeCommit": map[string]any{"oid": sha},
 						"headRefOid": fmt.Sprintf("head%s", sha[:7]),
-						"author":     map[string]interface{}{"login": "author1"},
+						"author":     map[string]any{"login": "author1"},
 						"mergedAt":   "2024-01-15T10:00:00Z",
 						"url":        fmt.Sprintf("https://github.com/testorg/repo/pull/%d", 100+i),
-						"reviews": map[string]interface{}{
-							"nodes": []interface{}{
-								map[string]interface{}{
+						"reviews": map[string]any{
+							"nodes": []any{
+								map[string]any{
 									"databaseId":  int64(200 + i),
 									"state":       "APPROVED",
-									"author":      map[string]interface{}{"login": "reviewer1"},
-									"commit":      map[string]interface{}{"oid": sha},
+									"author":      map[string]any{"login": "reviewer1"},
+									"commit":      map[string]any{"oid": sha},
 									"submittedAt": "2024-01-14T10:00:00Z",
 									"url":         fmt.Sprintf("https://github.com/testorg/repo/pull/%d#pullrequestreview-%d", 100+i, 200+i),
 								},
 							},
 						},
-						"commits": map[string]interface{}{
-							"nodes": []interface{}{
-								map[string]interface{}{
-									"commit": map[string]interface{}{
-										"checkSuites": map[string]interface{}{
-											"nodes": []interface{}{
-												map[string]interface{}{
-													"checkRuns": map[string]interface{}{
-														"nodes": []interface{}{
-															map[string]interface{}{
+						"commits": map[string]any{
+							"nodes": []any{
+								map[string]any{
+									"commit": map[string]any{
+										"checkSuites": map[string]any{
+											"nodes": []any{
+												map[string]any{
+													"checkRuns": map[string]any{
+														"nodes": []any{
+															map[string]any{
 																"databaseId":  int64(300 + i),
 																"name":        "ci/tests",
 																"status":      "COMPLETED",
@@ -83,8 +83,8 @@ func graphqlFixture(shas []string, withPRs bool) map[string]interface{} {
 		}
 	}
 
-	return map[string]interface{}{
-		"data": map[string]interface{}{
+	return map[string]any{
+		"data": map[string]any{
 			"repository": repo,
 		},
 	}
@@ -250,36 +250,36 @@ func TestEnrichCommits_MultiplePRs(t *testing.T) {
 	sha := "abc1234567890abc1234567890abc1234567890ab"
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		resp := map[string]interface{}{
-			"data": map[string]interface{}{
-				"repository": map[string]interface{}{
-					"c0": map[string]interface{}{
+		resp := map[string]any{
+			"data": map[string]any{
+				"repository": map[string]any{
+					"c0": map[string]any{
 						"oid": sha,
-						"associatedPullRequests": map[string]interface{}{
-							"nodes": []interface{}{
-								map[string]interface{}{
+						"associatedPullRequests": map[string]any{
+							"nodes": []any{
+								map[string]any{
 									"number":     10,
 									"title":      "First PR",
 									"merged":     true,
-									"mergeCommit": map[string]interface{}{"oid": sha},
+									"mergeCommit": map[string]any{"oid": sha},
 									"headRefOid": "head1",
-									"author":     map[string]interface{}{"login": "dev1"},
+									"author":     map[string]any{"login": "dev1"},
 									"mergedAt":   "2024-01-15T10:00:00Z",
 									"url":        "https://github.com/testorg/repo/pull/10",
-									"reviews":    map[string]interface{}{"nodes": []interface{}{}},
-									"commits":    map[string]interface{}{"nodes": []interface{}{}},
+									"reviews":    map[string]any{"nodes": []any{}},
+									"commits":    map[string]any{"nodes": []any{}},
 								},
-								map[string]interface{}{
+								map[string]any{
 									"number":     11,
 									"title":      "Second PR",
 									"merged":     true,
-									"mergeCommit": map[string]interface{}{"oid": sha},
+									"mergeCommit": map[string]any{"oid": sha},
 									"headRefOid": "head2",
-									"author":     map[string]interface{}{"login": "dev2"},
+									"author":     map[string]any{"login": "dev2"},
 									"mergedAt":   "2024-01-16T10:00:00Z",
 									"url":        "https://github.com/testorg/repo/pull/11",
-									"reviews":    map[string]interface{}{"nodes": []interface{}{}},
-									"commits":    map[string]interface{}{"nodes": []interface{}{}},
+									"reviews":    map[string]any{"nodes": []any{}},
+									"commits":    map[string]any{"nodes": []any{}},
 								},
 							},
 						},
@@ -308,8 +308,8 @@ func TestEnrichCommits_MultiplePRs(t *testing.T) {
 func TestEnrichCommits_GraphQLError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		resp := map[string]interface{}{
-			"errors": []map[string]interface{}{
+		resp := map[string]any{
+			"errors": []map[string]any{
 				{"message": "something went wrong"},
 			},
 		}
@@ -355,59 +355,59 @@ func TestEnrichCommits_ResponseParsing(t *testing.T) {
 	sha := "abc1234567890abc1234567890abc1234567890ab"
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		resp := map[string]interface{}{
-			"data": map[string]interface{}{
-				"repository": map[string]interface{}{
-					"c0": map[string]interface{}{
+		resp := map[string]any{
+			"data": map[string]any{
+				"repository": map[string]any{
+					"c0": map[string]any{
 						"oid": sha,
-						"associatedPullRequests": map[string]interface{}{
-							"nodes": []interface{}{
-								map[string]interface{}{
+						"associatedPullRequests": map[string]any{
+							"nodes": []any{
+								map[string]any{
 									"number":      42,
 									"title":       "Add feature X",
 									"merged":      true,
-									"mergeCommit":  map[string]interface{}{"oid": "merge123"},
+									"mergeCommit":  map[string]any{"oid": "merge123"},
 									"headRefOid":  "headabc",
-									"author":      map[string]interface{}{"login": "octocat"},
+									"author":      map[string]any{"login": "octocat"},
 									"mergedAt":    "2024-03-20T15:30:00Z",
 									"url":         "https://github.com/testorg/repo/pull/42",
-									"reviews": map[string]interface{}{
-										"nodes": []interface{}{
-											map[string]interface{}{
+									"reviews": map[string]any{
+										"nodes": []any{
+											map[string]any{
 												"databaseId":  int64(999),
 												"state":       "CHANGES_REQUESTED",
-												"author":      map[string]interface{}{"login": "critic"},
-												"commit":      map[string]interface{}{"oid": "rev123"},
+												"author":      map[string]any{"login": "critic"},
+												"commit":      map[string]any{"oid": "rev123"},
 												"submittedAt": "2024-03-19T10:00:00Z",
 												"url":         "https://github.com/testorg/repo/pull/42#pullrequestreview-999",
 											},
-											map[string]interface{}{
+											map[string]any{
 												"databaseId":  int64(1000),
 												"state":       "APPROVED",
-												"author":      map[string]interface{}{"login": "approver"},
-												"commit":      map[string]interface{}{"oid": "rev456"},
+												"author":      map[string]any{"login": "approver"},
+												"commit":      map[string]any{"oid": "rev456"},
 												"submittedAt": "2024-03-20T12:00:00Z",
 												"url":         "https://github.com/testorg/repo/pull/42#pullrequestreview-1000",
 											},
 										},
 									},
-									"commits": map[string]interface{}{
-										"nodes": []interface{}{
-											map[string]interface{}{
-												"commit": map[string]interface{}{
-													"checkSuites": map[string]interface{}{
-														"nodes": []interface{}{
-															map[string]interface{}{
-																"checkRuns": map[string]interface{}{
-																	"nodes": []interface{}{
-																		map[string]interface{}{
+									"commits": map[string]any{
+										"nodes": []any{
+											map[string]any{
+												"commit": map[string]any{
+													"checkSuites": map[string]any{
+														"nodes": []any{
+															map[string]any{
+																"checkRuns": map[string]any{
+																	"nodes": []any{
+																		map[string]any{
 																			"databaseId":  int64(501),
 																			"name":        "lint",
 																			"status":      "COMPLETED",
 																			"conclusion":  "SUCCESS",
 																			"completedAt": "2024-03-20T14:00:00Z",
 																		},
-																		map[string]interface{}{
+																		map[string]any{
 																			"databaseId":  int64(502),
 																			"name":        "test",
 																			"status":      "COMPLETED",

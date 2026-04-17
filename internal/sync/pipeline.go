@@ -113,7 +113,6 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	g.SetLimit(concurrency)
 
 	for _, rwo := range allRepos {
-		rwo := rwo
 		g.Go(func() error {
 			if err := p.syncRepo(gctx, rwo.repo, rwo.orgCfg); err != nil {
 				p.logger.Error("sync repo failed", "org", rwo.repo.Org, "repo", rwo.repo.Name, "error", err)
@@ -192,10 +191,7 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 	// Enrich in batches
 	var allEnrichments []model.EnrichmentResult
 	for i := 0; i < len(unaudited); i += enrichBatchSize {
-		end := i + enrichBatchSize
-		if end > len(unaudited) {
-			end = len(unaudited)
-		}
+		end := min(i+enrichBatchSize, len(unaudited))
 		batch := unaudited[i:end]
 
 		batchSHAs := make([]string, len(batch))
