@@ -61,11 +61,12 @@ type OrgConfig struct {
 
 // Pipeline orchestrates the sync of GitHub data into the local database.
 type Pipeline struct {
-	source   GitHubSource
-	enricher Enricher
-	store    Store
-	config   *SyncConfig
-	logger   *slog.Logger
+	source     GitHubSource
+	enricher   Enricher
+	store      Store
+	config     *SyncConfig
+	logger     *slog.Logger
+	onProgress ProgressCallback
 }
 
 // NewPipeline creates a new sync pipeline.
@@ -79,6 +80,17 @@ func NewPipeline(source GitHubSource, enricher Enricher, store Store, cfg *SyncC
 		store:    store,
 		config:   cfg,
 		logger:   logger,
+	}
+}
+
+// SetProgressCallback sets a function that receives progress updates during sync.
+func (p *Pipeline) SetProgressCallback(cb ProgressCallback) {
+	p.onProgress = cb
+}
+
+func (p *Pipeline) reportProgress(prog RepoProgress) {
+	if p.onProgress != nil {
+		p.onProgress(prog)
 	}
 }
 
@@ -166,6 +178,15 @@ func (p *Pipeline) syncRepo(ctx context.Context, repo model.RepoInfo, orgCfg Org
 func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, branch string, writer *DBWriter) error {
 	p.logger.Info("sync repo branch start", "org", repo.Org, "repo", repo.Name, "branch", branch)
 
+	prog := RepoProgress{
+		Org:       repo.Org,
+		Repo:      repo.Name,
+		Branch:    branch,
+		Phase:     PhaseFetchingCommits,
+		StartedAt: time.Now(),
+	}
+	p.reportProgress(prog)
+
 	since, err := p.determineSince(ctx, repo.Org, repo.Name, branch)
 	if err != nil {
 		return fmt.Errorf("determining since: %w", err)
@@ -178,12 +199,21 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 
 	commits, err := p.source.ListCommits(ctx, repo.Org, repo.Name, branch, since, until)
 	if err != nil {
+		prog.Phase = PhaseFailed
+		prog.Error = err
+		p.reportProgress(prog)
 		return fmt.Errorf("listing commits: %w", err)
 	}
+
+	prog.Commits = len(commits)
+	p.reportProgress(prog)
 
 	p.logger.Info("fetched commits", "org", repo.Org, "repo", repo.Name, "branch", branch, "count", len(commits))
 
 	if len(commits) == 0 {
+		prog.Phase = PhaseDone
+		prog.DoneAt = time.Now()
+		p.reportProgress(prog)
 		return nil
 	}
 
@@ -210,13 +240,24 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 		return fmt.Errorf("getting unaudited commits: %w", err)
 	}
 
+	prog.Unaudited = len(unaudited)
+	prog.Phase = PhaseEnriching
+	p.reportProgress(prog)
+
 	p.logger.Info("unaudited commits", "org", repo.Org, "repo", repo.Name, "branch", branch, "count", len(unaudited))
 
 	// Enrich batches in parallel — these are pure API reads
 	allEnrichments, err := p.enrichInParallel(ctx, repo, branch, unaudited)
 	if err != nil {
+		prog.Phase = PhaseFailed
+		prog.Error = err
+		p.reportProgress(prog)
 		return fmt.Errorf("enriching commits: %w", err)
 	}
+
+	prog.Enriched = len(allEnrichments)
+	prog.Phase = PhaseAuditing
+	p.reportProgress(prog)
 
 	// Collect enrichment data for a single batched write
 	var allPRs []model.PullRequest
@@ -330,6 +371,11 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 			return fmt.Errorf("upserting sync cursor: %w", err)
 		}
 	}
+
+	prog.Audited = len(auditResults)
+	prog.Phase = PhaseDone
+	prog.DoneAt = time.Now()
+	p.reportProgress(prog)
 
 	p.logger.Info("sync repo branch done", "org", repo.Org, "repo", repo.Name, "branch", branch, "commits", len(commits), "audited", len(auditResults))
 	return nil

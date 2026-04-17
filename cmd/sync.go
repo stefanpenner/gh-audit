@@ -1,17 +1,21 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
 	"strings"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 	"github.com/stefanpenner/gh-audit/internal/config"
 	"github.com/stefanpenner/gh-audit/internal/db"
 	ghclient "github.com/stefanpenner/gh-audit/internal/github"
 	"github.com/stefanpenner/gh-audit/internal/sync"
+	"github.com/stefanpenner/gh-audit/internal/ui"
+	"golang.org/x/term"
 )
 
 func newSyncCmd() *cobra.Command {
@@ -21,6 +25,7 @@ func newSyncCmd() *cobra.Command {
 		since       string
 		until       string
 		concurrency int
+		noUI        bool
 	)
 
 	cmd := &cobra.Command{
@@ -77,7 +82,33 @@ func newSyncCmd() *cobra.Command {
 			enricher := ghclient.NewGraphQLClient(pool, logger)
 
 			pipeline := sync.NewPipeline(source, enricher, dbConn, syncCfg, logger)
-			return pipeline.Run(cmd.Context())
+
+			isTTY := term.IsTerminal(int(os.Stdout.Fd()))
+			if !isTTY || noUI {
+				return pipeline.Run(cmd.Context())
+			}
+
+			ctx, cancel := context.WithCancel(cmd.Context())
+			defer cancel()
+
+			uiModel := ui.NewSyncModel(0)
+			prog := tea.NewProgram(uiModel, tea.WithAltScreen())
+
+			pipeline.SetProgressCallback(uiModel.ProgressCallback(prog))
+
+			go func() {
+				syncErr := pipeline.Run(ctx)
+				prog.Send(ui.DoneMsg{Err: syncErr})
+			}()
+
+			if _, err := prog.Run(); err != nil {
+				cancel()
+				return fmt.Errorf("UI error: %w", err)
+			}
+			if uiModel.Quitting() {
+				cancel()
+			}
+			return nil
 		},
 	}
 
@@ -86,6 +117,7 @@ func newSyncCmd() *cobra.Command {
 	cmd.Flags().StringVar(&since, "since", "", "sync since date (ISO 8601)")
 	cmd.Flags().StringVar(&until, "until", "", "sync until date (ISO 8601)")
 	cmd.Flags().IntVar(&concurrency, "concurrency", 0, "max concurrent repo syncs (default from config)")
+	cmd.Flags().BoolVar(&noUI, "no-ui", false, "disable interactive progress UI")
 
 	return cmd
 }
