@@ -38,7 +38,10 @@ func newSyncCmd() *cobra.Command {
 			}
 			defer dbConn.Close()
 
-			syncCfg := buildSyncConfig(cfg, orgs, repos, since, until, concurrency)
+			syncCfg, err := buildSyncConfig(cfg, orgs, repos, since, until, concurrency)
+			if err != nil {
+				return err
+			}
 
 			logger := slog.Default()
 
@@ -97,7 +100,7 @@ func resolveDBPath(cfg *config.Config) string {
 	return dbPath
 }
 
-func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until string, concurrency int) *sync.SyncConfig {
+func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until string, concurrency int) (*sync.SyncConfig, error) {
 	syncCfg := &sync.SyncConfig{
 		Concurrency:         cfg.Sync.Concurrency,
 		EnrichConcurrency:   cfg.Sync.EnrichConcurrency,
@@ -151,6 +154,8 @@ func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until stri
 			syncCfg.Since = t
 		} else if t, err := time.Parse("2006-01-02", since); err == nil {
 			syncCfg.Since = t
+		} else {
+			return nil, fmt.Errorf("invalid --since format: %s (use ISO 8601)", since)
 		}
 	}
 	if until != "" {
@@ -158,6 +163,8 @@ func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until stri
 			syncCfg.Until = t
 		} else if t, err := time.Parse("2006-01-02", until); err == nil {
 			syncCfg.Until = t
+		} else {
+			return nil, fmt.Errorf("invalid --until format: %s (use ISO 8601)", until)
 		}
 	}
 
@@ -165,7 +172,7 @@ func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until stri
 		syncCfg.Concurrency = concurrency
 	}
 
-	return syncCfg
+	return syncCfg, nil
 }
 
 // convertScopes converts config.OrgScope to github.OrgScope.

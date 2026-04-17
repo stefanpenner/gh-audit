@@ -88,24 +88,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 			}
 		}
 
-		// Check Owner Approval (required checks on PR's head commit)
-		ownerApprovalStatus := "missing"
-		for _, rc := range requiredChecks {
-			for _, cr := range enrichment.CheckRuns {
-				if cr.CommitSHA == pr.HeadSHA && cr.CheckName == rc.Name {
-					if strings.EqualFold(cr.Conclusion, rc.Conclusion) {
-						ownerApprovalStatus = "success"
-					} else {
-						ownerApprovalStatus = "failure"
-					}
-				}
-			}
-		}
-
-		// If no required checks configured, treat Owner Approval as not required (success)
-		if len(requiredChecks) == 0 {
-			ownerApprovalStatus = "success"
-		}
+		ownerApprovalStatus := evaluateRequiredChecks(enrichment.CheckRuns, pr.HeadSHA, requiredChecks)
 
 		if ownerApprovalStatus != "success" {
 			prReasons = append(prReasons, fmt.Sprintf("Owner Approval check missing/failed (PR #%d)", pr.Number))
@@ -139,33 +122,53 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		result.PRNumber = bestPR.Number
 		result.PRHref = bestPR.Href
 		result.ApproverLogins = bestApprovers
-		// Set approval fields based on best PR
 		for _, review := range enrichment.Reviews {
 			if review.PRNumber == bestPR.Number && review.State == "APPROVED" && review.CommitID == bestPR.HeadSHA {
-				result.HasFinalApproval = true
-				break
-			}
-		}
-		// Owner Approval check status for best PR
-		ownerApprovalStatus := "missing"
-		for _, rc := range requiredChecks {
-			for _, cr := range enrichment.CheckRuns {
-				if cr.CommitSHA == bestPR.HeadSHA && cr.CheckName == rc.Name {
-					if strings.EqualFold(cr.Conclusion, rc.Conclusion) {
-						ownerApprovalStatus = "success"
-					} else {
-						ownerApprovalStatus = "failure"
-					}
+				if !isSelfApproval(review, commit, *bestPR) {
+					result.HasFinalApproval = true
+					break
 				}
 			}
 		}
-		if len(requiredChecks) == 0 {
-			ownerApprovalStatus = "success"
-		}
+		ownerApprovalStatus := evaluateRequiredChecks(enrichment.CheckRuns, bestPR.HeadSHA, requiredChecks)
 		result.OwnerApprovalCheck = ownerApprovalStatus
 	}
 	result.Reasons = bestReasons
 	return result
+}
+
+// evaluateRequiredChecks determines the owner approval status for a set of
+// required checks against the check runs for a given commit SHA.
+// Returns "success" if all pass, "failure" if any found but failed, "missing" if not found.
+func evaluateRequiredChecks(checkRuns []model.CheckRun, headSHA string, requiredChecks []RequiredCheck) string {
+	if len(requiredChecks) == 0 {
+		return "success"
+	}
+	allPassed := true
+	anyFailed := false
+	for _, rc := range requiredChecks {
+		found := false
+		for _, cr := range checkRuns {
+			if cr.CommitSHA == headSHA && cr.CheckName == rc.Name {
+				found = true
+				if !strings.EqualFold(cr.Conclusion, rc.Conclusion) {
+					anyFailed = true
+					allPassed = false
+				}
+				break
+			}
+		}
+		if !found {
+			allPassed = false
+		}
+	}
+	if allPassed {
+		return "success"
+	}
+	if anyFailed {
+		return "failure"
+	}
+	return "missing"
 }
 
 // isSelfApproval checks whether a review's author is the same person who

@@ -503,6 +503,62 @@ func TestEvaluateCommit(t *testing.T) {
 			wantReasons:    []string{"compliant"},
 		},
 		{
+			name:   "multiple required checks all pass",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs:     []model.PullRequest{basePR},
+				Reviews: []model.Review{approvedReview},
+				CheckRuns: []model.CheckRun{
+					{Org: "myorg", Repo: "myrepo", CommitSHA: "head123", CheckRunID: 100, CheckName: "Owner Approval", Status: "completed", Conclusion: "success"},
+					{Org: "myorg", Repo: "myrepo", CommitSHA: "head123", CheckRunID: 101, CheckName: "lint", Status: "completed", Conclusion: "success"},
+				},
+			},
+			requiredChecks: []RequiredCheck{
+				{Name: "Owner Approval", Conclusion: "success"},
+				{Name: "lint", Conclusion: "success"},
+			},
+			wantCompliant: true,
+			wantHasPR:     true,
+			wantReasons:   []string{"compliant"},
+		},
+		{
+			name:   "multiple required checks one fails",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs:     []model.PullRequest{basePR},
+				Reviews: []model.Review{approvedReview},
+				CheckRuns: []model.CheckRun{
+					{Org: "myorg", Repo: "myrepo", CommitSHA: "head123", CheckRunID: 100, CheckName: "Owner Approval", Status: "completed", Conclusion: "success"},
+					{Org: "myorg", Repo: "myrepo", CommitSHA: "head123", CheckRunID: 101, CheckName: "lint", Status: "completed", Conclusion: "failure"},
+				},
+			},
+			requiredChecks: []RequiredCheck{
+				{Name: "Owner Approval", Conclusion: "success"},
+				{Name: "lint", Conclusion: "success"},
+			},
+			wantCompliant: false,
+			wantHasPR:     true,
+			wantReasons:   []string{"Owner Approval check missing/failed (PR #42)"},
+		},
+		{
+			name:   "multiple required checks one missing one passes",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs:     []model.PullRequest{basePR},
+				Reviews: []model.Review{approvedReview},
+				CheckRuns: []model.CheckRun{
+					{Org: "myorg", Repo: "myrepo", CommitSHA: "head123", CheckRunID: 100, CheckName: "Owner Approval", Status: "completed", Conclusion: "success"},
+				},
+			},
+			requiredChecks: []RequiredCheck{
+				{Name: "Owner Approval", Conclusion: "success"},
+				{Name: "lint", Conclusion: "success"},
+			},
+			wantCompliant: false,
+			wantHasPR:     true,
+			wantReasons:   []string{"Owner Approval check missing/failed (PR #42)"},
+		},
+		{
 			name: "multiple reviewers one self one legitimate is compliant",
 			commit: model.Commit{
 				Org: "myorg", Repo: "myrepo", SHA: "abc123",
@@ -558,6 +614,106 @@ func TestEvaluateCommit(t *testing.T) {
 						}
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestEvaluateRequiredChecks(t *testing.T) {
+	checks := []model.CheckRun{
+		{CommitSHA: "head1", CheckName: "lint", Conclusion: "success"},
+		{CommitSHA: "head1", CheckName: "test", Conclusion: "failure"},
+		{CommitSHA: "head1", CheckName: "build", Conclusion: "success"},
+		{CommitSHA: "other", CheckName: "lint", Conclusion: "success"},
+	}
+
+	tests := []struct {
+		name           string
+		headSHA        string
+		requiredChecks []RequiredCheck
+		want           string
+	}{
+		{
+			name:           "no required checks",
+			headSHA:        "head1",
+			requiredChecks: nil,
+			want:           "success",
+		},
+		{
+			name:    "single check passes",
+			headSHA: "head1",
+			requiredChecks: []RequiredCheck{
+				{Name: "lint", Conclusion: "success"},
+			},
+			want: "success",
+		},
+		{
+			name:    "single check fails",
+			headSHA: "head1",
+			requiredChecks: []RequiredCheck{
+				{Name: "test", Conclusion: "success"},
+			},
+			want: "failure",
+		},
+		{
+			name:    "single check missing",
+			headSHA: "head1",
+			requiredChecks: []RequiredCheck{
+				{Name: "deploy", Conclusion: "success"},
+			},
+			want: "missing",
+		},
+		{
+			name:    "all pass",
+			headSHA: "head1",
+			requiredChecks: []RequiredCheck{
+				{Name: "lint", Conclusion: "success"},
+				{Name: "build", Conclusion: "success"},
+			},
+			want: "success",
+		},
+		{
+			name:    "one passes one fails",
+			headSHA: "head1",
+			requiredChecks: []RequiredCheck{
+				{Name: "lint", Conclusion: "success"},
+				{Name: "test", Conclusion: "success"},
+			},
+			want: "failure",
+		},
+		{
+			name:    "one passes one missing",
+			headSHA: "head1",
+			requiredChecks: []RequiredCheck{
+				{Name: "lint", Conclusion: "success"},
+				{Name: "deploy", Conclusion: "success"},
+			},
+			want: "missing",
+		},
+		{
+			name:    "failure takes precedence over missing",
+			headSHA: "head1",
+			requiredChecks: []RequiredCheck{
+				{Name: "test", Conclusion: "success"},
+				{Name: "deploy", Conclusion: "success"},
+			},
+			want: "failure",
+		},
+		{
+			name:    "wrong SHA no match",
+			headSHA: "wrong",
+			requiredChecks: []RequiredCheck{
+				{Name: "lint", Conclusion: "success"},
+			},
+			want: "missing",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := evaluateRequiredChecks(checks, tt.headSHA, tt.requiredChecks)
+			if got != tt.want {
+				t.Errorf("evaluateRequiredChecks() = %q, want %q", got, tt.want)
 			}
 		})
 	}

@@ -26,18 +26,19 @@ CREATE TABLE IF NOT EXISTS sync_cursors (
 );
 
 CREATE TABLE IF NOT EXISTS commits (
-	org            TEXT NOT NULL,
-	repo           TEXT NOT NULL,
-	sha            TEXT NOT NULL,
-	author_login   TEXT,
-	author_email   TEXT,
-	committed_at   TIMESTAMP,
-	message        TEXT,
-	parent_count   INTEGER,
-	additions      INTEGER,
-	deletions      INTEGER,
-	href           TEXT,
-	fetched_at     TIMESTAMP DEFAULT current_timestamp,
+	org              TEXT NOT NULL,
+	repo             TEXT NOT NULL,
+	sha              TEXT NOT NULL,
+	author_login     TEXT,
+	author_email     TEXT,
+	committer_login  TEXT,
+	committed_at     TIMESTAMP,
+	message          TEXT,
+	parent_count     INTEGER,
+	additions        INTEGER,
+	deletions        INTEGER,
+	href             TEXT,
+	fetched_at       TIMESTAMP DEFAULT current_timestamp,
 	PRIMARY KEY (org, repo, sha)
 );
 

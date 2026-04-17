@@ -12,7 +12,7 @@ import (
 const batchSize = 500
 
 var commitColumns = []string{
-	"org", "repo", "sha", "author_login", "author_email",
+	"org", "repo", "sha", "author_login", "author_email", "committer_login",
 	"committed_at", "message", "parent_count", "additions", "deletions", "href",
 }
 
@@ -26,7 +26,7 @@ func (d *DB) UpsertCommits(ctx context.Context, commits []model.Commit) error {
 	rows := make([][]driver.Value, len(commits))
 	for i, c := range commits {
 		rows[i] = []driver.Value{
-			c.Org, c.Repo, c.SHA, c.AuthorLogin, c.AuthorEmail,
+			c.Org, c.Repo, c.SHA, c.AuthorLogin, c.AuthorEmail, c.CommitterLogin,
 			c.CommittedAt, c.Message, c.ParentCount, c.Additions, c.Deletions, c.Href,
 		}
 	}
@@ -53,7 +53,7 @@ func (d *DB) UpsertCommitBranches(ctx context.Context, org, repo string, shas []
 // GetUnauditedCommits returns commits in org/repo that have no corresponding audit_results row.
 func (d *DB) GetUnauditedCommits(ctx context.Context, org, repo string) ([]model.Commit, error) {
 	rows, err := d.DB.QueryContext(ctx, `
-		SELECT c.org, c.repo, c.sha, c.author_login, c.author_email,
+		SELECT c.org, c.repo, c.sha, c.author_login, c.author_email, c.committer_login,
 		       c.committed_at, c.message, c.parent_count, c.additions, c.deletions, c.href
 		FROM commits c
 		LEFT JOIN audit_results a ON c.org = a.org AND c.repo = a.repo AND c.sha = a.sha
@@ -81,7 +81,7 @@ func (d *DB) GetCommitsBySHA(ctx context.Context, org, repo string, shas []strin
 		args = append(args, sha)
 	}
 
-	q := fmt.Sprintf(`SELECT org, repo, sha, author_login, author_email,
+	q := fmt.Sprintf(`SELECT org, repo, sha, author_login, author_email, committer_login,
 		committed_at, message, parent_count, additions, deletions, href
 		FROM commits
 		WHERE org = ? AND repo = ? AND sha IN (%s)`, strings.Join(placeholders, ", "))
@@ -103,7 +103,7 @@ func scanCommits(rows interface {
 	var result []model.Commit
 	for rows.Next() {
 		var c model.Commit
-		if err := rows.Scan(&c.Org, &c.Repo, &c.SHA, &c.AuthorLogin, &c.AuthorEmail,
+		if err := rows.Scan(&c.Org, &c.Repo, &c.SHA, &c.AuthorLogin, &c.AuthorEmail, &c.CommitterLogin,
 			&c.CommittedAt, &c.Message, &c.ParentCount, &c.Additions, &c.Deletions, &c.Href); err != nil {
 			return nil, fmt.Errorf("scan commit: %w", err)
 		}

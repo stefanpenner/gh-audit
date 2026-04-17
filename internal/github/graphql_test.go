@@ -520,6 +520,9 @@ func TestEnrichCommits_ResponseParsing(t *testing.T) {
 	if r.CheckRuns[1].Conclusion != "FAILURE" {
 		t.Errorf("checkRun[1].Conclusion = %q", r.CheckRuns[1].Conclusion)
 	}
+	if r.CheckRuns[0].CommitSHA != "headabc" {
+		t.Errorf("checkRun[0].CommitSHA = %q, want headabc (should be HeadSHA, not MergeCommitSHA)", r.CheckRuns[0].CommitSHA)
+	}
 }
 
 // mockGraphQLPool creates a pool whose transport rewrites the GraphQL endpoint

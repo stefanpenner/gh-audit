@@ -118,7 +118,7 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 		args = append(args, opts.Since)
 	}
 	if !opts.Until.IsZero() {
-		query += " AND c.committed_at <= ?"
+		query += " AND c.committed_at < ?"
 		args = append(args, opts.Until)
 	}
 
@@ -153,7 +153,7 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			a.repo,
 			a.sha,
 			COALESCE(c.author_login, ''),
-			COALESCE(c.author_login, ''),
+			COALESCE(c.committer_login, ''),
 			COALESCE(c.committed_at, '1970-01-01'::TIMESTAMP),
 			COALESCE(c.message, ''),
 			a.is_bot,
@@ -170,11 +170,12 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			a.is_compliant,
 			COALESCE(array_to_string(a.reasons, ', '), ''),
 			COALESCE(a.commit_href, ''),
-			COALESCE(cb.branch, '')
+			COALESCE((SELECT cb.branch FROM commit_branches cb
+				WHERE cb.org = a.org AND cb.repo = a.repo AND cb.sha = a.sha
+				LIMIT 1), '')
 		FROM audit_results a
 		JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
 		LEFT JOIN pull_requests p ON a.org = p.org AND a.repo = p.repo AND a.pr_number = p.number
-		LEFT JOIN commit_branches cb ON a.org = cb.org AND a.repo = cb.repo AND a.sha = cb.sha
 		WHERE 1=1
 	`
 
@@ -185,7 +186,7 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 		args = append(args, opts.Since)
 	}
 	if !opts.Until.IsZero() {
-		query += " AND c.committed_at <= ?"
+		query += " AND c.committed_at < ?"
 		args = append(args, opts.Until)
 	}
 	if opts.OnlyFailures {

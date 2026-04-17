@@ -46,9 +46,7 @@ type OrgScope struct {
 
 // AuditRulesConfig controls what constitutes a compliant commit.
 type AuditRulesConfig struct {
-	RequirePR       bool          `yaml:"require_pr"`
-	RequireApproval bool          `yaml:"require_approval"`
-	RequiredChecks  []CheckConfig `yaml:"required_checks"`
+	RequiredChecks []CheckConfig `yaml:"required_checks"`
 }
 
 // CheckConfig describes a required status check.

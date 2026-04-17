@@ -86,6 +86,15 @@ func (d *DB) migrate(ctx context.Context) error {
 		}
 	}
 
+	// Add columns introduced after initial release.
+	for _, alter := range addColumnMigrations {
+		if _, err := d.DB.ExecContext(ctx, alter); err != nil {
+			if !strings.Contains(err.Error(), "already exists") {
+				return fmt.Errorf("alter table: %w\nSQL: %s", err, alter)
+			}
+		}
+	}
+
 	return nil
 }
 

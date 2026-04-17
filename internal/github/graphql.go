@@ -402,9 +402,7 @@ func (c *GraphQLClient) parsePRNode(ctx context.Context, data json.RawMessage, o
 					Status:     cr.Status,
 					Conclusion: cr.Conclusion,
 				}
-				if pr.MergeCommitSHA != "" {
-					checkRun.CommitSHA = pr.MergeCommitSHA
-				}
+				checkRun.CommitSHA = pr.HeadSHA
 				if cr.CompletedAt != "" {
 					if t, err := time.Parse(time.RFC3339, cr.CompletedAt); err == nil {
 						checkRun.CompletedAt = t
