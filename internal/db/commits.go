@@ -134,6 +134,7 @@ func scanCommits(rows interface {
 			&c.CommittedAt, &c.Message, &c.ParentCount, &c.Additions, &c.Deletions, &c.Href); err != nil {
 			return nil, fmt.Errorf("scan commit: %w", err)
 		}
+		c.CoAuthors = model.ParseCoAuthors(c.Message)
 		result = append(result, c)
 	}
 	return result, rows.Err()

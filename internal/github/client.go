@@ -4,15 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"regexp"
-	"strings"
 	"time"
 
 	gogithub "github.com/google/go-github/v72/github"
 	"github.com/stefanpenner/gh-audit/internal/model"
 )
 
-var coAuthorRe = regexp.MustCompile(`(?i)co-authored-by:\s*(.+?)\s*<([^>]+)>`)
 
 // Client wraps the GitHub REST API with token-pool-aware authentication.
 type Client struct {
@@ -154,7 +151,7 @@ func (c *Client) ListCommits(ctx context.Context, org, repo, branch string, sinc
 			}
 			commit.ParentCount = len(rc.Parents)
 			commit.Branch = branch
-			commit.CoAuthors = parseCoAuthors(commit.Message)
+			commit.CoAuthors = model.ParseCoAuthors(commit.Message)
 			allCommits = append(allCommits, commit)
 		}
 
@@ -201,7 +198,7 @@ func (c *Client) GetCommitDetail(ctx context.Context, org, repo, sha string) (*m
 		}
 	}
 	commit.ParentCount = len(rc.Parents)
-	commit.CoAuthors = parseCoAuthors(commit.Message)
+	commit.CoAuthors = model.ParseCoAuthors(commit.Message)
 	if rc.GetStats() != nil {
 		commit.Additions = rc.GetStats().GetAdditions()
 		commit.Deletions = rc.GetStats().GetDeletions()
@@ -521,38 +518,3 @@ func (c *Client) EnrichCommits(ctx context.Context, org, repo string, shas []str
 	return results, nil
 }
 
-// noreplyRe extracts a GitHub login from noreply email addresses.
-// Handles both "user@users.noreply.github.com" and "12345+user@users.noreply.github.com".
-var noreplyRe = regexp.MustCompile(`^(?:\d+\+)?([^@]+)@users\.noreply\.github\.com$`)
-
-// parseCoAuthors extracts co-authors from "Co-authored-by" trailers in commit messages.
-func parseCoAuthors(message string) []model.CoAuthor {
-	if !strings.Contains(strings.ToLower(message), "co-authored-by") {
-		return nil
-	}
-	matches := coAuthorRe.FindAllStringSubmatch(message, -1)
-	if len(matches) == 0 {
-		return nil
-	}
-	coAuthors := make([]model.CoAuthor, 0, len(matches))
-	for _, m := range matches {
-		email := strings.TrimSpace(m[2])
-		login := loginFromNoreplyEmail(email)
-		coAuthors = append(coAuthors, model.CoAuthor{
-			Name:  strings.TrimSpace(m[1]),
-			Email: email,
-			Login: login,
-		})
-	}
-	return coAuthors
-}
-
-// loginFromNoreplyEmail extracts a GitHub login from a noreply email address.
-// Returns empty string if the email is not a GitHub noreply address.
-func loginFromNoreplyEmail(email string) string {
-	m := noreplyRe.FindStringSubmatch(strings.ToLower(email))
-	if m == nil {
-		return ""
-	}
-	return m[1]
-}

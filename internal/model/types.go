@@ -2,7 +2,50 @@
 // See README.md for a rendered UML class diagram of type relationships.
 package model
 
-import "time"
+import (
+	"regexp"
+	"strings"
+	"time"
+)
+
+var coAuthorRe = regexp.MustCompile(`(?i)co-authored-by:\s*(.+?)\s*<([^>]+)>`)
+
+// noreplyRe extracts a GitHub login from noreply email addresses.
+// Handles both "user@users.noreply.github.com" and "12345+user@users.noreply.github.com".
+var noreplyRe = regexp.MustCompile(`^(?:\d+\+)?([^@]+)@users\.noreply\.github\.com$`)
+
+// ParseCoAuthors extracts co-authors from "Co-authored-by" trailers in commit messages.
+// GitHub login is resolved from noreply email addresses when possible.
+func ParseCoAuthors(message string) []CoAuthor {
+	if !strings.Contains(strings.ToLower(message), "co-authored-by") {
+		return nil
+	}
+	matches := coAuthorRe.FindAllStringSubmatch(message, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	coAuthors := make([]CoAuthor, 0, len(matches))
+	for _, m := range matches {
+		email := strings.TrimSpace(m[2])
+		login := LoginFromNoreplyEmail(email)
+		coAuthors = append(coAuthors, CoAuthor{
+			Name:  strings.TrimSpace(m[1]),
+			Email: email,
+			Login: login,
+		})
+	}
+	return coAuthors
+}
+
+// LoginFromNoreplyEmail extracts a GitHub login from a noreply email address.
+// Returns empty string if the email is not a GitHub noreply address.
+func LoginFromNoreplyEmail(email string) string {
+	m := noreplyRe.FindStringSubmatch(strings.ToLower(email))
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
 
 // A Commit is a git commit synced from GitHub.
 //

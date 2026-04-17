@@ -10,6 +10,7 @@ import (
 	"time"
 
 	gogithub "github.com/google/go-github/v72/github"
+	"github.com/stefanpenner/gh-audit/internal/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -398,7 +399,7 @@ func TestParseCoAuthors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := parseCoAuthors(tt.message)
+			got := model.ParseCoAuthors(tt.message)
 			require.Len(t, got, tt.want)
 			for i, ca := range got {
 				if i < len(tt.names) {
@@ -442,7 +443,7 @@ func TestParseCoAuthors_NoreplyLogin(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := parseCoAuthors(tt.message)
+			got := model.ParseCoAuthors(tt.message)
 			require.Len(t, got, 1)
 			assert.Equal(t, tt.wantLogin, got[0].Login)
 		})
@@ -450,10 +451,10 @@ func TestParseCoAuthors_NoreplyLogin(t *testing.T) {
 }
 
 func TestLoginFromNoreplyEmail(t *testing.T) {
-	assert.Equal(t, "user", loginFromNoreplyEmail("user@users.noreply.github.com"))
-	assert.Equal(t, "user", loginFromNoreplyEmail("12345+user@users.noreply.github.com"))
-	assert.Equal(t, "", loginFromNoreplyEmail("user@example.com"))
-	assert.Equal(t, "", loginFromNoreplyEmail(""))
+	assert.Equal(t, "user", model.LoginFromNoreplyEmail("user@users.noreply.github.com"))
+	assert.Equal(t, "user", model.LoginFromNoreplyEmail("12345+user@users.noreply.github.com"))
+	assert.Equal(t, "", model.LoginFromNoreplyEmail("user@example.com"))
+	assert.Equal(t, "", model.LoginFromNoreplyEmail(""))
 }
 
 func TestListCommitPullRequests(t *testing.T) {
