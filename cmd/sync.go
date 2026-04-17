@@ -96,19 +96,26 @@ func newSyncCmd() *cobra.Command {
 
 			pipeline.SetProgressCallback(uiModel.ProgressCallback(prog))
 
+			var syncErr error
+			syncDone := make(chan struct{})
 			go func() {
-				syncErr := pipeline.Run(ctx)
+				defer close(syncDone)
+				syncErr = pipeline.Run(ctx)
 				prog.Send(ui.DoneMsg{Err: syncErr})
 			}()
 
 			if _, err := prog.Run(); err != nil {
 				cancel()
+				<-syncDone
 				return fmt.Errorf("UI error: %w", err)
 			}
 			if uiModel.Quitting() {
 				cancel()
+				<-syncDone
+				return nil
 			}
-			return nil
+			<-syncDone
+			return syncErr
 		},
 	}
 

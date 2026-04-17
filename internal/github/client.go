@@ -106,6 +106,9 @@ func (c *Client) ListCommits(ctx context.Context, org, repo, branch string, sinc
 			if rc.GetAuthor() != nil {
 				commit.AuthorLogin = rc.GetAuthor().GetLogin()
 			}
+			if rc.GetCommitter() != nil {
+				commit.CommitterLogin = rc.GetCommitter().GetLogin()
+			}
 			if rc.GetCommit() != nil {
 				commit.Message = rc.GetCommit().GetMessage()
 				if rc.GetCommit().GetAuthor() != nil {
@@ -147,6 +150,9 @@ func (c *Client) GetCommitDetail(ctx context.Context, org, repo, sha string) (*m
 	}
 	if rc.GetAuthor() != nil {
 		commit.AuthorLogin = rc.GetAuthor().GetLogin()
+	}
+	if rc.GetCommitter() != nil {
+		commit.CommitterLogin = rc.GetCommitter().GetLogin()
 	}
 	if rc.GetCommit() != nil {
 		commit.Message = rc.GetCommit().GetMessage()
