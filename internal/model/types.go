@@ -66,6 +66,7 @@ type PullRequest struct {
 	HeadSHA        string
 	MergeCommitSHA string
 	AuthorLogin    string
+	MergedByLogin  string
 	MergedAt       time.Time
 	Href           string
 }

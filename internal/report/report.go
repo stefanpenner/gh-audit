@@ -17,10 +17,16 @@ type Reporter struct {
 	db *sql.DB
 }
 
+// RepoFilter identifies a single org/repo pair for filtering.
+type RepoFilter struct {
+	Org  string
+	Repo string
+}
+
 // ReportOpts controls report filtering.
 type ReportOpts struct {
-	Org          string
-	Repo         string
+	Org          string       // filter by single org (used when --org is set without --repo)
+	Repos        []RepoFilter // org/repo pairs from --repo flags; takes precedence over Org
 	Since        time.Time
 	Until        time.Time
 	OnlyFailures bool
@@ -56,6 +62,7 @@ type DetailRow struct {
 	HasPR              bool      `json:"has_pr"`
 	PRNumber           int       `json:"pr_number"`
 	PRHref             string    `json:"pr_href"`
+	MergedByLogin      string    `json:"merged_by_login"`
 	HasFinalApproval   bool      `json:"has_final_approval"`
 	ApproverLogins     string    `json:"approver_logins"`
 	OwnerApprovalCheck string    `json:"owner_approval_check"`
@@ -68,6 +75,22 @@ type DetailRow struct {
 // New creates a new Reporter.
 func New(db *sql.DB) *Reporter {
 	return &Reporter{db: db}
+}
+
+// appendRepoFilter appends org/repo WHERE clauses to a query builder.
+func appendRepoFilter(query string, args []any, opts ReportOpts) (string, []any) {
+	if len(opts.Repos) > 0 {
+		clauses := make([]string, len(opts.Repos))
+		for i, rf := range opts.Repos {
+			clauses[i] = "(a.org = ? AND a.repo = ?)"
+			args = append(args, rf.Org, rf.Repo)
+		}
+		query += " AND (" + strings.Join(clauses, " OR ") + ")"
+	} else if opts.Org != "" {
+		query += " AND a.org = ?"
+		args = append(args, opts.Org)
+	}
+	return query, args
 }
 
 // GetSummary returns per-repo compliance summary rows.
@@ -89,14 +112,7 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 	`
 
 	args := []any{}
-	if opts.Org != "" {
-		query += " AND a.org = ?"
-		args = append(args, opts.Org)
-	}
-	if opts.Repo != "" {
-		query += " AND a.repo = ?"
-		args = append(args, opts.Repo)
-	}
+	query, args = appendRepoFilter(query, args, opts)
 	if !opts.Since.IsZero() {
 		query += " AND c.committed_at >= ?"
 		args = append(args, opts.Since)
@@ -147,6 +163,7 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			a.has_pr,
 			COALESCE(a.pr_number, 0),
 			COALESCE(a.pr_href, ''),
+			COALESCE(p.merged_by_login, ''),
 			a.has_final_approval,
 			COALESCE(array_to_string(a.approver_logins, ', '), ''),
 			COALESCE(a.owner_approval_check, ''),
@@ -156,19 +173,13 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			COALESCE(cb.branch, '')
 		FROM audit_results a
 		JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
+		LEFT JOIN pull_requests p ON a.org = p.org AND a.repo = p.repo AND a.pr_number = p.number
 		LEFT JOIN commit_branches cb ON a.org = cb.org AND a.repo = cb.repo AND a.sha = cb.sha
 		WHERE 1=1
 	`
 
 	args := []any{}
-	if opts.Org != "" {
-		query += " AND a.org = ?"
-		args = append(args, opts.Org)
-	}
-	if opts.Repo != "" {
-		query += " AND a.repo = ?"
-		args = append(args, opts.Repo)
-	}
+	query, args = appendRepoFilter(query, args, opts)
 	if !opts.Since.IsZero() {
 		query += " AND c.committed_at >= ?"
 		args = append(args, opts.Since)
@@ -195,7 +206,7 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 		if err := rows.Scan(
 			&d.Org, &d.Repo, &d.SHA, &d.AuthorLogin, &d.CommitterLogin, &d.CommittedAt,
 			&d.Message, &d.IsBot, &d.IsExemptAuthor, &d.IsEmptyCommit, &d.IsSelfApproved, &d.HasPR, &d.PRNumber,
-			&d.PRHref, &d.HasFinalApproval, &d.ApproverLogins,
+			&d.PRHref, &d.MergedByLogin, &d.HasFinalApproval, &d.ApproverLogins,
 			&d.OwnerApprovalCheck, &d.IsCompliant, &d.Reasons, &d.CommitHref, &d.BranchName,
 		); err != nil {
 			return nil, fmt.Errorf("scan detail: %w", err)
@@ -221,14 +232,18 @@ func (r *Reporter) FormatTable(w io.Writer, summary []SummaryRow, details []Deta
 
 	// Details section
 	fmt.Fprintln(tw, "=== DETAILS ===")
-	fmt.Fprintln(tw, "Org\tRepo\tSHA\tAuthor\tDate\tCompliant\tReasons")
+	fmt.Fprintln(tw, "Org\tRepo\tSHA\tAuthor\tMerged By\tDate\tCompliant\tReasons")
 	for _, d := range details {
 		sha := d.SHA
 		if len(sha) > 7 {
 			sha = sha[:7]
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%v\t%s\n",
-			d.Org, d.Repo, sha, d.AuthorLogin,
+		mergedBy := d.MergedByLogin
+		if mergedBy == "" {
+			mergedBy = "-"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%v\t%s\n",
+			d.Org, d.Repo, sha, d.AuthorLogin, mergedBy,
 			d.CommittedAt.Format("2006-01-02 15:04"), d.IsCompliant, d.Reasons)
 	}
 
@@ -240,7 +255,7 @@ func (r *Reporter) FormatCSV(w io.Writer, details []DetailRow) error {
 	cw := csv.NewWriter(w)
 
 	header := []string{
-		"Org", "Repo", "SHA", "Author", "Date", "Message",
+		"Org", "Repo", "SHA", "Author", "Merged By", "Date", "Message",
 		"Is Bot", "Is Empty", "Has PR", "PR #", "PR Link",
 		"Approved", "Approvers", "Owner Approval",
 		"Compliant", "Reasons", "Commit Link",
@@ -251,7 +266,7 @@ func (r *Reporter) FormatCSV(w io.Writer, details []DetailRow) error {
 
 	for _, d := range details {
 		record := []string{
-			d.Org, d.Repo, d.SHA, d.AuthorLogin,
+			d.Org, d.Repo, d.SHA, d.AuthorLogin, d.MergedByLogin,
 			d.CommittedAt.Format("2006-01-02 15:04:05"),
 			d.Message,
 			fmt.Sprintf("%v", d.IsBot),

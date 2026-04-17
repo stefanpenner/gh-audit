@@ -30,15 +30,15 @@ func (d *DB) upsertPRBatch(ctx context.Context, prs []model.PullRequest) error {
 	defer tx.Rollback()
 
 	placeholders := make([]string, len(prs))
-	args := make([]any, 0, len(prs)*10)
+	args := make([]any, 0, len(prs)*11)
 	for i, pr := range prs {
-		placeholders[i] = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+		placeholders[i] = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 		args = append(args, pr.Org, pr.Repo, pr.Number, pr.Title, pr.Merged,
-			pr.HeadSHA, pr.MergeCommitSHA, pr.AuthorLogin, pr.MergedAt, pr.Href)
+			pr.HeadSHA, pr.MergeCommitSHA, pr.AuthorLogin, pr.MergedByLogin, pr.MergedAt, pr.Href)
 	}
 
 	q := fmt.Sprintf(`INSERT OR REPLACE INTO pull_requests
-		(org, repo, number, title, merged, head_sha, merge_commit_sha, author_login, merged_at, href)
+		(org, repo, number, title, merged, head_sha, merge_commit_sha, author_login, merged_by_login, merged_at, href)
 		VALUES %s`, strings.Join(placeholders, ", "))
 
 	if _, err := tx.ExecContext(ctx, q, args...); err != nil {
@@ -157,7 +157,7 @@ func (d *DB) UpsertCommitPRs(ctx context.Context, org, repo, sha string, prNumbe
 func (d *DB) GetPRsForCommit(ctx context.Context, org, repo, sha string) ([]model.PullRequest, error) {
 	rows, err := d.DB.QueryContext(ctx, `
 		SELECT p.org, p.repo, p.number, p.title, p.merged, p.head_sha,
-		       p.merge_commit_sha, p.author_login, p.merged_at, p.href
+		       p.merge_commit_sha, p.author_login, COALESCE(p.merged_by_login, ''), p.merged_at, p.href
 		FROM pull_requests p
 		INNER JOIN commit_prs cp ON p.org = cp.org AND p.repo = cp.repo AND p.number = cp.pr_number
 		WHERE cp.org = ? AND cp.repo = ? AND cp.sha = ?`, org, repo, sha)
@@ -170,7 +170,7 @@ func (d *DB) GetPRsForCommit(ctx context.Context, org, repo, sha string) ([]mode
 	for rows.Next() {
 		var pr model.PullRequest
 		if err := rows.Scan(&pr.Org, &pr.Repo, &pr.Number, &pr.Title, &pr.Merged,
-			&pr.HeadSHA, &pr.MergeCommitSHA, &pr.AuthorLogin, &pr.MergedAt, &pr.Href); err != nil {
+			&pr.HeadSHA, &pr.MergeCommitSHA, &pr.AuthorLogin, &pr.MergedByLogin, &pr.MergedAt, &pr.Href); err != nil {
 			return nil, fmt.Errorf("scan PR: %w", err)
 		}
 		result = append(result, pr)

@@ -14,7 +14,7 @@ import (
 func newReportCmd() *cobra.Command {
 	var (
 		org          string
-		repo         string
+		repos        []string
 		since        string
 		until        string
 		format       string
@@ -32,18 +32,18 @@ func newReportCmd() *cobra.Command {
 			}
 			defer dbConn.Close()
 
-			// Support org/repo format for --repo flag.
-			if repo != "" && strings.Contains(repo, "/") {
-				parts := strings.SplitN(repo, "/", 2)
-				if org == "" {
-					org = parts[0]
+			// Build repo filters from --repo flags (org/repo format).
+			var repoFilters []report.RepoFilter
+			for _, r := range repos {
+				if strings.Contains(r, "/") {
+					parts := strings.SplitN(r, "/", 2)
+					repoFilters = append(repoFilters, report.RepoFilter{Org: parts[0], Repo: parts[1]})
 				}
-				repo = parts[1]
 			}
 
 			opts := report.ReportOpts{
 				Org:          org,
-				Repo:         repo,
+				Repos:        repoFilters,
 				OnlyFailures: onlyFailures,
 			}
 
@@ -139,7 +139,7 @@ func newReportCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&org, "org", "", "filter by org")
-	cmd.Flags().StringVar(&repo, "repo", "", "filter by repo")
+	cmd.Flags().StringSliceVar(&repos, "repo", nil, "filter by repo (org/repo format, repeatable)")
 	cmd.Flags().StringVar(&since, "since", "", "filter since date (ISO 8601)")
 	cmd.Flags().StringVar(&until, "until", "", "filter until date (ISO 8601)")
 	cmd.Flags().StringVar(&format, "format", "table", "output format (table|csv|json|xlsx)")

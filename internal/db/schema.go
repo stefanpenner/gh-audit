@@ -44,6 +44,7 @@ const (
 		head_sha         TEXT,
 		merge_commit_sha TEXT,
 		author_login     TEXT,
+		merged_by_login  TEXT,
 		merged_at        TIMESTAMP,
 		href             TEXT,
 		fetched_at       TIMESTAMP DEFAULT current_timestamp,

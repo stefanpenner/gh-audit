@@ -108,6 +108,7 @@ func buildBatchQuery(org, repo string, shas []string) string {
 		buf.WriteString("            mergeCommit { oid }\n")
 		buf.WriteString("            headRefOid\n")
 		buf.WriteString("            author { login }\n")
+		buf.WriteString("            mergedBy { login }\n")
 		buf.WriteString("            mergedAt\n")
 		buf.WriteString("            url\n")
 		buf.WriteString("            reviews(first: 100) {\n")
@@ -286,6 +287,9 @@ type gqlPRNode struct {
 	Author     *struct {
 		Login string `json:"login"`
 	} `json:"author"`
+	MergedBy *struct {
+		Login string `json:"login"`
+	} `json:"mergedBy"`
 	MergedAt string `json:"mergedAt"`
 	URL      string `json:"url"`
 	Reviews struct {
@@ -349,6 +353,9 @@ func (c *GraphQLClient) parsePRNode(ctx context.Context, data json.RawMessage, o
 	}
 	if node.Author != nil {
 		pr.AuthorLogin = node.Author.Login
+	}
+	if node.MergedBy != nil {
+		pr.MergedByLogin = node.MergedBy.Login
 	}
 	if node.MergedAt != "" {
 		if t, err := time.Parse(time.RFC3339, node.MergedAt); err == nil {

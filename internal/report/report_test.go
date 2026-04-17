@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS pull_requests (
 	head_sha         TEXT,
 	merge_commit_sha TEXT,
 	author_login     TEXT,
+	merged_by_login  TEXT,
 	merged_at        TIMESTAMP,
 	href             TEXT,
 	fetched_at       TIMESTAMP DEFAULT current_timestamp,
@@ -289,6 +290,60 @@ func TestGetSummaryRespectsOrgRepoFilters(t *testing.T) {
 	}
 	if summary[0].Org != "org1" {
 		t.Errorf("expected org1, got %s", summary[0].Org)
+	}
+}
+
+func TestGetSummaryMultiRepoFilter(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	insertCommit(t, db, "nodejs", "node", "aaa", "dev1", now, 10, 5)
+	insertCommit(t, db, "rails", "rails", "bbb", "dev1", now, 10, 5)
+	insertCommit(t, db, "other", "stuff", "ccc", "dev1", now, 10, 5)
+
+	insertAuditResult(t, db, "nodejs", "node", "aaa", false, false, true, true, true, 1, nil, []string{"compliant"})
+	insertAuditResult(t, db, "rails", "rails", "bbb", false, false, true, true, true, 2, nil, []string{"compliant"})
+	insertAuditResult(t, db, "other", "stuff", "ccc", false, false, false, false, false, 0, nil, []string{"no associated pull request"})
+
+	r := New(db)
+
+	// Filter to just nodejs/node and rails/rails
+	summary, err := r.GetSummary(context.Background(), ReportOpts{
+		Repos: []RepoFilter{
+			{Org: "nodejs", Repo: "node"},
+			{Org: "rails", Repo: "rails"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("GetSummary: %v", err)
+	}
+
+	if len(summary) != 2 {
+		t.Fatalf("expected 2 summary rows, got %d", len(summary))
+	}
+
+	orgs := map[string]bool{}
+	for _, s := range summary {
+		orgs[s.Org+"/"+s.Repo] = true
+	}
+	if !orgs["nodejs/node"] || !orgs["rails/rails"] {
+		t.Errorf("expected nodejs/node and rails/rails, got %v", orgs)
+	}
+
+	// Verify details also filtered
+	details, err := r.GetDetails(context.Background(), ReportOpts{
+		Repos: []RepoFilter{
+			{Org: "nodejs", Repo: "node"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("GetDetails: %v", err)
+	}
+	if len(details) != 1 {
+		t.Fatalf("expected 1 detail row, got %d", len(details))
+	}
+	if details[0].Org != "nodejs" || details[0].Repo != "node" {
+		t.Errorf("expected nodejs/node, got %s/%s", details[0].Org, details[0].Repo)
 	}
 }
 
@@ -692,6 +747,58 @@ func TestEmptyNonCompliantSheetStillCreated(t *testing.T) {
 	}
 	if len(rows) != 1 {
 		t.Errorf("expected 1 row (header only) in empty Non-Compliant sheet, got %d", len(rows))
+	}
+}
+
+func TestDetailRowMergedByLogin(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	insertCommit(t, db, "org1", "repo1", "aaa111aaa", "alice", now, 10, 5)
+	insertAuditResult(t, db, "org1", "repo1", "aaa111aaa", false, false, true, true, true, 42, []string{"bob"}, []string{"compliant"})
+
+	// Insert PR with merged_by_login
+	_, err := db.Exec(`INSERT INTO pull_requests (org, repo, number, title, merged, head_sha, author_login, merged_by_login, merged_at, href)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"org1", "repo1", 42, "fix stuff", true, "aaa111aaa", "alice", "carol", now,
+		"https://github.com/org1/repo1/pull/42")
+	if err != nil {
+		t.Fatalf("insert PR: %v", err)
+	}
+
+	r := New(db)
+	details, err := r.GetDetails(context.Background(), ReportOpts{})
+	if err != nil {
+		t.Fatalf("GetDetails: %v", err)
+	}
+
+	if len(details) != 1 {
+		t.Fatalf("expected 1 detail row, got %d", len(details))
+	}
+	if details[0].MergedByLogin != "carol" {
+		t.Errorf("MergedByLogin = %q, want %q", details[0].MergedByLogin, "carol")
+	}
+}
+
+func TestDetailRowMergedByLoginEmpty(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	// Commit with no PR (direct push) — merged_by should be empty
+	insertCommit(t, db, "org1", "repo1", "bbb222bbb", "dave", now, 5, 2)
+	insertAuditResult(t, db, "org1", "repo1", "bbb222bbb", false, false, false, false, false, 0, nil, []string{"no associated pull request"})
+
+	r := New(db)
+	details, err := r.GetDetails(context.Background(), ReportOpts{})
+	if err != nil {
+		t.Fatalf("GetDetails: %v", err)
+	}
+
+	if len(details) != 1 {
+		t.Fatalf("expected 1 detail row, got %d", len(details))
+	}
+	if details[0].MergedByLogin != "" {
+		t.Errorf("MergedByLogin = %q, want empty", details[0].MergedByLogin)
 	}
 }
 

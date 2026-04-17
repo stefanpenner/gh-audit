@@ -231,7 +231,7 @@ func writeSummarySheet(f *excelize.File, sheet string, summary []SummaryRow, opt
 func detailHeaders() []string {
 	return []string{
 		"Org", "Repo", "SHA", "Author", "Committer", "Date", "Message",
-		"Branch", "PR #", "Approved?", "Approver", "Self-Approved?",
+		"Branch", "PR #", "Merged By", "Approved?", "Approver", "Self-Approved?",
 		"Owner Approval", "Compliant?", "Reasons", "Commit Link", "PR Link",
 	}
 }
@@ -520,6 +520,7 @@ func detailRowData(d DetailRow) []any {
 		msg,
 		d.BranchName,
 		d.PRNumber,
+		d.MergedByLogin,
 		approvedStr,
 		d.ApproverLogins,
 		selfApprovedStr,
@@ -581,18 +582,19 @@ func writeDetailRowWithHyperlinks(f *excelize.File, sheet string, row int, d Det
 		}
 	}
 
-	f.SetCellValue(sheet, cellName(10, row), approvedStr)
-	f.SetCellValue(sheet, cellName(11, row), d.ApproverLogins)
-	f.SetCellValue(sheet, cellName(12, row), selfApprovedStr)
-	f.SetCellValue(sheet, cellName(13, row), d.OwnerApprovalCheck)
-	f.SetCellValue(sheet, cellName(14, row), compliantStr)
-	f.SetCellValue(sheet, cellName(15, row), d.Reasons)
-	f.SetCellValue(sheet, cellName(16, row), d.CommitHref)
-	f.SetCellValue(sheet, cellName(17, row), d.PRHref)
+	f.SetCellValue(sheet, cellName(10, row), d.MergedByLogin)
+	f.SetCellValue(sheet, cellName(11, row), approvedStr)
+	f.SetCellValue(sheet, cellName(12, row), d.ApproverLogins)
+	f.SetCellValue(sheet, cellName(13, row), selfApprovedStr)
+	f.SetCellValue(sheet, cellName(14, row), d.OwnerApprovalCheck)
+	f.SetCellValue(sheet, cellName(15, row), compliantStr)
+	f.SetCellValue(sheet, cellName(16, row), d.Reasons)
+	f.SetCellValue(sheet, cellName(17, row), d.CommitHref)
+	f.SetCellValue(sheet, cellName(18, row), d.PRHref)
 }
 
 func setDetailColumnWidths(f *excelize.File, sheet string, numCols int) {
-	widths := []float64{12, 25, 12, 15, 15, 18, 40, 20, 8, 10, 20, 14, 15, 10, 40, 40, 40}
+	widths := []float64{12, 25, 12, 15, 15, 18, 40, 20, 8, 15, 10, 20, 14, 15, 10, 40, 40, 40}
 	for i := 0; i < numCols && i < len(widths); i++ {
 		colName, _ := excelize.ColumnNumberToName(i + 1)
 		f.SetColWidth(sheet, colName, colName, widths[i])
