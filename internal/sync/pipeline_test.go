@@ -831,3 +831,189 @@ func TestPipelineConcurrentRepoSync(t *testing.T) {
 		t.Fatalf("expected 3 audit results, got %d", len(store.auditResults))
 	}
 }
+
+func TestPipelineRealisticMix(t *testing.T) {
+	now := time.Now()
+
+	commits := []model.Commit{
+		{Org: "acme", Repo: "app", SHA: "aaa1", AuthorLogin: "dependabot[bot]", CommittedAt: now, Additions: 5, Deletions: 2},
+		{Org: "acme", Repo: "app", SHA: "aaa2", AuthorLogin: "some-ci[bot]", CommittedAt: now, Additions: 3, Deletions: 1},
+		{Org: "acme", Repo: "app", SHA: "aaa3", AuthorLogin: "alice", CommittedAt: now, Additions: 10, Deletions: 4},
+		{Org: "acme", Repo: "app", SHA: "aaa4", AuthorLogin: "bob", CommittedAt: now, Additions: 7, Deletions: 3},
+		{Org: "acme", Repo: "app", SHA: "aaa5", AuthorLogin: "charlie", CommittedAt: now, Additions: 1, Deletions: 0},
+		{Org: "acme", Repo: "app", SHA: "aaa6", AuthorLogin: "dave", CommittedAt: now, Additions: 0, Deletions: 0},
+		{Org: "acme", Repo: "app", SHA: "aaa7", AuthorLogin: "eve", CommittedAt: now, Additions: 4, Deletions: 1},
+		{Org: "acme", Repo: "app", SHA: "aaa8", AuthorLogin: "frank", CommittedAt: now, Additions: 2, Deletions: 1},
+	}
+
+	source := &mockSource{
+		repos: map[string][]model.RepoInfo{
+			"acme": {{Org: "acme", Name: "app", FullName: "acme/app", DefaultBranch: "main"}},
+		},
+		commits: map[string][]model.Commit{
+			"acme/app/main": commits,
+		},
+	}
+
+	enricher := &mockEnricher{
+		results: map[string][]model.EnrichmentResult{
+			"acme/app": {
+				// aaa1: dependabot — exempt, enrichment doesn't matter
+				{Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa1", Additions: 5, Deletions: 2}},
+				// aaa2: non-exempt bot, no PR → non-compliant
+				{Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa2", Additions: 3, Deletions: 1}},
+				// aaa3: alice's commit, proper approval on final commit → compliant
+				{
+					Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa3", Additions: 10, Deletions: 4},
+					PRs:    []model.PullRequest{{Org: "acme", Repo: "app", Number: 10, Merged: true, HeadSHA: "aaa3", AuthorLogin: "alice"}},
+					Reviews: []model.Review{
+						{Org: "acme", Repo: "app", PRNumber: 10, ReviewID: 100, ReviewerLogin: "bob", State: "APPROVED", CommitID: "aaa3"},
+					},
+				},
+				// aaa4: bob's commit, approval on OLD commit (stale) → non-compliant
+				{
+					Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa4", Additions: 7, Deletions: 3},
+					PRs:    []model.PullRequest{{Org: "acme", Repo: "app", Number: 20, Merged: true, HeadSHA: "aaa4", AuthorLogin: "bob"}},
+					Reviews: []model.Review{
+						{Org: "acme", Repo: "app", PRNumber: 20, ReviewID: 200, ReviewerLogin: "alice", State: "APPROVED", CommitID: "old-sha-xyz"},
+					},
+				},
+				// aaa5: charlie, direct push no PR → non-compliant
+				{Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa5", Additions: 1, Deletions: 0}},
+				// aaa6: dave, empty commit → compliant
+				{Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa6", Additions: 0, Deletions: 0}},
+				// aaa7: eve self-approves her own PR → non-compliant
+				{
+					Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa7", Additions: 4, Deletions: 1},
+					PRs:    []model.PullRequest{{Org: "acme", Repo: "app", Number: 30, Merged: true, HeadSHA: "aaa7", AuthorLogin: "eve"}},
+					Reviews: []model.Review{
+						{Org: "acme", Repo: "app", PRNumber: 30, ReviewID: 300, ReviewerLogin: "eve", State: "APPROVED", CommitID: "aaa7"},
+					},
+				},
+				// aaa8: frank self-approves BUT independent approval also exists → compliant
+				{
+					Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa8", Additions: 2, Deletions: 1},
+					PRs:    []model.PullRequest{{Org: "acme", Repo: "app", Number: 40, Merged: true, HeadSHA: "aaa8", AuthorLogin: "frank"}},
+					Reviews: []model.Review{
+						{Org: "acme", Repo: "app", PRNumber: 40, ReviewID: 400, ReviewerLogin: "frank", State: "APPROVED", CommitID: "aaa8"},
+						{Org: "acme", Repo: "app", PRNumber: 40, ReviewID: 401, ReviewerLogin: "alice", State: "APPROVED", CommitID: "aaa8"},
+					},
+				},
+			},
+		},
+	}
+
+	store := newMockStore()
+	cfg := &SyncConfig{
+		Orgs:          []OrgConfig{{Name: "acme"}},
+		Concurrency:   1,
+		ExemptAuthors: []string{"dependabot[bot]"},
+	}
+
+	p := NewPipeline(source, enricher, store, cfg, slog.Default())
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatalf("pipeline run: %v", err)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	if len(store.auditResults) != 8 {
+		t.Fatalf("expected 8 audit results, got %d", len(store.auditResults))
+	}
+
+	resultMap := make(map[string]model.AuditResult)
+	for _, r := range store.auditResults {
+		resultMap[r.SHA] = r
+	}
+
+	type expectation struct {
+		sha            string
+		compliant      bool
+		isBot          bool
+		isExempt       bool
+		isEmpty        bool
+		isSelfApproved bool
+		hasPR          bool
+		desc           string
+	}
+
+	expectations := []expectation{
+		{sha: "aaa1", compliant: true, isBot: true, isExempt: true, desc: "exempt bot (dependabot)"},
+		{sha: "aaa2", compliant: false, isBot: true, isExempt: false, desc: "non-exempt bot, no PR"},
+		{sha: "aaa3", compliant: true, hasPR: true, desc: "human with proper approval"},
+		{sha: "aaa4", compliant: false, hasPR: true, desc: "human with stale approval"},
+		{sha: "aaa5", compliant: false, desc: "direct push, no PR"},
+		{sha: "aaa6", compliant: true, isEmpty: true, desc: "empty commit"},
+		{sha: "aaa7", compliant: false, isSelfApproved: true, hasPR: true, desc: "self-approved only"},
+		{sha: "aaa8", compliant: true, hasPR: true, desc: "self-approval + independent approval"},
+	}
+
+	for _, exp := range expectations {
+		t.Run(exp.desc, func(t *testing.T) {
+			r, ok := resultMap[exp.sha]
+			if !ok {
+				t.Fatalf("missing audit result for %s", exp.sha)
+			}
+			if r.IsCompliant != exp.compliant {
+				t.Errorf("IsCompliant: got %v, want %v (reasons: %v)", r.IsCompliant, exp.compliant, r.Reasons)
+			}
+			if r.IsBot != exp.isBot {
+				t.Errorf("IsBot: got %v, want %v", r.IsBot, exp.isBot)
+			}
+			if r.IsExemptAuthor != exp.isExempt {
+				t.Errorf("IsExemptAuthor: got %v, want %v", r.IsExemptAuthor, exp.isExempt)
+			}
+			if r.IsEmptyCommit != exp.isEmpty {
+				t.Errorf("IsEmptyCommit: got %v, want %v", r.IsEmptyCommit, exp.isEmpty)
+			}
+			if r.IsSelfApproved != exp.isSelfApproved {
+				t.Errorf("IsSelfApproved: got %v, want %v", r.IsSelfApproved, exp.isSelfApproved)
+			}
+			if r.HasPR != exp.hasPR {
+				t.Errorf("HasPR: got %v, want %v", r.HasPR, exp.hasPR)
+			}
+		})
+	}
+
+	// Verify aggregate counts
+	var compliant, nonCompliant, bots, exempt, empty, selfApproved int
+	for _, r := range store.auditResults {
+		if r.IsCompliant {
+			compliant++
+		} else {
+			nonCompliant++
+		}
+		if r.IsBot {
+			bots++
+		}
+		if r.IsExemptAuthor {
+			exempt++
+		}
+		if r.IsEmptyCommit {
+			empty++
+		}
+		if r.IsSelfApproved {
+			selfApproved++
+		}
+	}
+
+	if compliant != 4 {
+		t.Errorf("compliant: got %d, want 4", compliant)
+	}
+	if nonCompliant != 4 {
+		t.Errorf("non-compliant: got %d, want 4", nonCompliant)
+	}
+	if bots != 2 {
+		t.Errorf("bots: got %d, want 2", bots)
+	}
+	if exempt != 1 {
+		t.Errorf("exempt: got %d, want 1", exempt)
+	}
+	if empty != 1 {
+		t.Errorf("empty: got %d, want 1", empty)
+	}
+	if selfApproved != 1 {
+		t.Errorf("self-approved: got %d, want 1", selfApproved)
+	}
+}
