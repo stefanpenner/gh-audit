@@ -63,7 +63,8 @@ gh-audit sync --repo my-org/my-repo --since 2026-01-01 --until 2026-04-01
 gh-audit report --only-failures
 
 # Re-evaluate audit results after updating config/rules (no API calls)
-gh-audit re-audit
+gh-audit re-evaluate-commits
+# (legacy alias `re-audit` still works)
 
 # Validate your config file
 gh-audit config validate
@@ -178,6 +179,20 @@ audit_rules:
   required_checks:
     - name: "Owner Approval"
       conclusion: success
+  # Branches that count as part of the audited history. Reports are scoped
+  # to commits on one of these branches, which prevents PR-branch commits
+  # persisted during enrichment (for squash-merge contributor attribution)
+  # from polluting raw counts after a re-evaluate-commits pass.
+  #
+  # Supports glob patterns: `*` (any chars), `?` (single char). Matching is
+  # case-sensitive — list both casings if you need them. Default when unset:
+  # ["master", "main"].
+  audit_branches:
+    - master
+    - main
+    - "release/*"
+    - "HF_BF_*"
+    - "hf_bf_*"
 
 sync:
   concurrency: 10
@@ -197,11 +212,13 @@ exemptions:
 
 The exempt shortcut only fires when every PR-branch commit author is also in this list. See [Exempt authors](#exempt-authors).
 
-## Re-audit
+## Re-evaluate commits
 
-`gh-audit re-audit` re-runs the audit decision tree on every commit in the database without making any GitHub API calls. It uses the enrichment data (PRs, reviews, check runs) already stored from a previous sync.
+`gh-audit re-evaluate-commits` re-runs the compliance evaluation on every commit in the database without making any GitHub API calls. It uses the enrichment data (PRs, reviews, check runs) already stored from a previous sync, and runs in a single pass — every revert is judged standalone.
 
-Use this after changing audit rules (e.g. adding a required check) or exempt authors in your config -- no need to re-fetch everything from GitHub.
+Use this after changing audit rules (e.g. adding a required check) or exempt authors in your config — no need to re-fetch everything from GitHub.
+
+The legacy command name `re-audit` continues to work as an alias.
 
 ## Config management
 

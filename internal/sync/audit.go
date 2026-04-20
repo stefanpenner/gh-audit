@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/stefanpenner/gh-audit/internal/github"
 	"github.com/stefanpenner/gh-audit/internal/model"
 )
 
@@ -13,8 +14,33 @@ type RequiredCheck struct {
 	Conclusion string
 }
 
+// StatsFetcher resolves a commit's additions/deletions. Used by EvaluateCommit
+// for the empty-commit fallback so we only pay for GetCommitDetail when no
+// other compliance path has succeeded. Implementations should check the DB
+// first and fall through to the REST API; returning any error leaves the
+// stats at whatever the caller passed in (typically zero).
+type StatsFetcher func(org, repo, sha string) (additions, deletions int, err error)
+
 // EvaluateCommit determines compliance for a single commit given its enrichment data.
-func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []string, requiredChecks []RequiredCheck) model.AuditResult {
+//
+// The empty-commit fallback (additions == 0 && deletions == 0 → compliant) is
+// evaluated LAST, only after the PR-approval and exempt-author paths have
+// failed. The eager behaviour prior to this change — fetching
+// additions/deletions up-front for every commit — accounted for ~16% of all
+// GitHub REST traffic on a full sweep; most commits pass the approval path
+// and never need stats. fetchStats lets the fallback lazily resolve them only
+// when the audit would otherwise flag the commit non-compliant.
+//
+// Revert waivers (see the clean-revert block below) are standalone: each
+// revert is judged on its own signals (diff verification, or GitHub-server
+// provenance) without looking at the reverted commit's verdict. That keeps
+// the audit single-pass and order-independent. See TODO.md for the stricter
+// "reverted commit must also be compliant" variant.
+//
+// fetchStats may be nil (tests, offline evaluations); the empty-commit
+// fallback is skipped in that case and compliance uses the strict
+// PR-approval path only.
+func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []string, requiredChecks []RequiredCheck, fetchStats StatsFetcher) model.AuditResult {
 	result := model.AuditResult{
 		Org:        commit.Org,
 		Repo:       commit.Repo,
@@ -22,11 +48,18 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		CommitHref: commit.Href,
 	}
 
-	// Clean-revert signal is informational and orthogonal to compliance. Copy
-	// it early so every return path surfaces it.
+	// Clean-revert and clean-merge signals are informational and orthogonal
+	// to compliance. Copy them early so every return path surfaces them.
 	result.IsCleanRevert = enrichment.IsCleanRevert
 	result.RevertVerification = enrichment.RevertVerification
 	result.RevertedSHA = enrichment.RevertedSHA
+	result.IsCleanMerge = enrichment.IsCleanMerge
+	result.MergeVerification = enrichment.MergeVerification
+
+	// Informational annotations (automation markers, etc.). Computed here
+	// so they're attached to every early-return path. These do not affect
+	// IsCompliant — they're metadata for reviewers.
+	result.Annotations = ComputeAnnotations(commit, enrichment)
 
 	// Detect bot authors (informational — login ending in [bot])
 	if strings.HasSuffix(strings.ToLower(commit.AuthorLogin), "[bot]") {
@@ -52,18 +85,15 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		}
 	}
 
-	// Check empty commit
-	if commit.Additions == 0 && commit.Deletions == 0 {
-		result.IsEmptyCommit = true
-		result.IsCompliant = true
-		result.Reasons = []string{"empty commit"}
-		result.MergeStrategy = classifyMergeStrategy(commit, false)
-		return result
-	}
-
 	// Check for associated PRs
 	if len(enrichment.PRs) == 0 {
 		result.HasPR = false
+		// Empty-commit fallback: a commit with no PR is only non-compliant
+		// if it actually touched files. Resolve stats lazily here so
+		// approved-path commits (the majority) never trigger a REST call.
+		if applyEmptyCommitFallback(&result, &commit, fetchStats) {
+			return result
+		}
 		result.IsCompliant = false
 		result.Reasons = []string{"no associated pull request"}
 		result.MergeStrategy = classifyMergeStrategy(commit, false)
@@ -101,11 +131,14 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		}
 
 		// Per-reviewer last-state tracking: for each reviewer on the final commit,
-		// keep only their most recent review submitted at or before merge time.
-		// A DISMISSED review overrides an earlier APPROVED from the same reviewer
-		// (SOX requirement). Reviews after MergedAt are excluded so compliance
-		// reflects the point-in-time state at merge; post-merge activity is
-		// tracked separately via HasPostMergeConcern.
+		// keep the review whose state reflects their standing at merge time.
+		// Only DISMISSED or CHANGES_REQUESTED supersede an earlier APPROVED from
+		// the same reviewer (SOX requirement — a withdrawn approval must not
+		// count). A later COMMENTED review does NOT revoke an earlier APPROVED,
+		// matching GitHub's UI behaviour where commenting after approving
+		// leaves the approval intact. Reviews after MergedAt are excluded so
+		// compliance reflects the point-in-time state at merge; post-merge
+		// activity is tracked separately via HasPostMergeConcern.
 		latestByReviewer := make(map[string]model.Review)
 		hasPostMergeConcern := false
 		for _, review := range enrichment.Reviews {
@@ -122,9 +155,21 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 				continue
 			}
 			existing, exists := latestByReviewer[review.ReviewerLogin]
-			if !exists || review.SubmittedAt.After(existing.SubmittedAt) {
+			if !exists {
 				latestByReviewer[review.ReviewerLogin] = review
+				continue
 			}
+			if !review.SubmittedAt.After(existing.SubmittedAt) {
+				continue
+			}
+			// Newer review from same reviewer: only overwrite if it's a
+			// state-changing review (APPROVED, CHANGES_REQUESTED, DISMISSED).
+			// Plain COMMENTED reviews carry no state and must not clobber an
+			// earlier APPROVED.
+			if review.State == "COMMENTED" && existing.State == "APPROVED" {
+				continue
+			}
+			latestByReviewer[review.ReviewerLogin] = review
 		}
 
 		hasApprovalOnFinal := false
@@ -140,7 +185,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 			}
 		}
 
-		// Detect stale approvals: approvals on older commits (pre-force-push)
+		// Detect stale approvals: approvals on an earlier SHA of this PR
 		hasStaleApproval := false
 		if !hasApprovalOnFinal {
 			for _, review := range enrichment.Reviews {
@@ -198,7 +243,42 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		}
 	}
 
-	// No PR satisfied all checks
+	// No PR satisfied all checks. Empty-commit fallback: if the commit
+	// didn't actually touch any files (e.g. an empty merge/rebase artefact),
+	// it's trivially compliant regardless of PR review state. Resolve stats
+	// lazily; the approved-PR branch above never reaches this point, so we
+	// only pay the GetCommitDetail cost on already-suspect commits.
+	if applyEmptyCommitFallback(&result, &commit, fetchStats) {
+		return result
+	}
+	// Revert waivers — each evaluated standalone (no cross-commit lookup).
+	// See TODO.md for the stricter "reverted commit must also be compliant"
+	// variant that we've deferred.
+	//
+	// R1 — clean revert. IsCleanRevert == true means one of:
+	//   - AutoRevert (bot-generated, trusted by construction), OR
+	//   - ManualRevert whose diff was verified as the exact inverse of the
+	//     reverted commit (revert_verification == "diff-verified").
+	// A clean revert puts bytes back that were already on master, so it
+	// needs no fresh review.
+	//
+	// R2 — GitHub-server-created revert. Any revert-prefixed commit whose
+	// committer is `web-flow` AND signature is GitHub-verified came through
+	// the "Revert" button on github.com: only GitHub's server can produce a
+	// web-flow-signed commit. Provenance substitutes for a diff match, so
+	// this also covers the conflict-resolved revert case where R1 fails.
+	if revertCompliant, reason := evaluateRevertCompliance(commit, enrichment); revertCompliant {
+		result.IsCompliant = true
+		result.HasFinalApproval = false
+		if bestPR != nil {
+			result.PRNumber = bestPR.Number
+			result.PRHref = bestPR.Href
+		}
+		result.Reasons = []string{reason}
+		result.MergeStrategy = classifyMergeStrategy(commit, bestPR != nil)
+		result.PRCommitAuthorLogins = distinctPRBranchAuthors(enrichment.PRBranchCommits)
+		return result
+	}
 	result.IsCompliant = false
 	result.IsSelfApproved = bestSelfApproved
 	result.HasStaleApproval = bestStaleApproval
@@ -218,9 +298,17 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 				continue
 			}
 			existing, exists := fallbackLatest[review.ReviewerLogin]
-			if !exists || review.SubmittedAt.After(existing.SubmittedAt) {
+			if !exists {
 				fallbackLatest[review.ReviewerLogin] = review
+				continue
 			}
+			if !review.SubmittedAt.After(existing.SubmittedAt) {
+				continue
+			}
+			if review.State == "COMMENTED" && existing.State == "APPROVED" {
+				continue
+			}
+			fallbackLatest[review.ReviewerLogin] = review
 		}
 		for _, review := range fallbackLatest {
 			if review.State == "APPROVED" && !isSelfApproval(review, commit, *bestPR, bestPRCommitAuthors) {
@@ -235,6 +323,81 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	result.MergeStrategy = classifyMergeStrategy(commit, true)
 	result.PRCommitAuthorLogins = distinctPRBranchAuthors(enrichment.PRBranchCommits)
 	return result
+}
+
+// webFlowCommitter is GitHub's server-side committer login for commits
+// produced by UI actions (merge button, Revert button, edit-in-browser).
+// Paired with a verified signature it's a strong provenance guard — only
+// GitHub holds the web-flow signing key.
+const webFlowCommitter = "web-flow"
+
+// evaluateRevertCompliance returns (true, reason) iff the commit qualifies
+// for one of the revert waivers:
+//
+//	R1 — clean revert (bot auto-revert or diff-verified manual revert).
+//	R2 — revert-prefixed commit whose committer is web-flow AND whose
+//	     signature is GitHub-verified (came from the Revert button on
+//	     github.com; covers conflict-resolved reverts where R1 fails).
+//
+// Returns (false, "") otherwise. Each rule is evaluated standalone —
+// the reverted commit's compliance is NOT consulted (see TODO.md for the
+// stricter variant).
+func evaluateRevertCompliance(commit model.Commit, enrichment model.EnrichmentResult) (bool, string) {
+	if enrichment.IsCleanRevert {
+		if enrichment.RevertedSHA != "" {
+			return true, fmt.Sprintf("clean revert of %s", truncateSHA(enrichment.RevertedSHA))
+		}
+		return true, "clean revert"
+	}
+	kind, revertedSHA := github.ParseRevert(commit.Message)
+	if kind == github.NotRevert {
+		return false, ""
+	}
+	if !strings.EqualFold(commit.CommitterLogin, webFlowCommitter) || !commit.IsVerified {
+		return false, ""
+	}
+	if revertedSHA != "" {
+		return true, fmt.Sprintf("GitHub-server revert of %s (web-flow, verified)", truncateSHA(revertedSHA))
+	}
+	return true, "GitHub-server revert (web-flow, verified)"
+}
+
+// truncateSHA returns the first 12 chars of a git SHA, or the full string
+// if it's shorter. Used in reasons strings to keep them readable.
+func truncateSHA(sha string) string {
+	if len(sha) <= 12 {
+		return sha
+	}
+	return sha[:12]
+}
+
+// applyEmptyCommitFallback flips `result` to the "empty commit" compliant
+// state when the commit's net diff is zero lines. Returns true iff the
+// fallback fired (caller should return `result` unchanged).
+//
+// Stats are resolved lazily: if the commit already carries non-zero
+// additions/deletions the check short-circuits without IO; otherwise
+// fetchStats is called (DB-first, API-fallback). A nil fetchStats or a
+// fetch error leaves the caller's existing zero stats in place, which means
+// the commit IS marked empty — matching the legacy "stats default to zero →
+// treated as empty" semantics so this refactor is a strict subset.
+func applyEmptyCommitFallback(result *model.AuditResult, commit *model.Commit, fetchStats StatsFetcher) bool {
+	if commit.Additions != 0 || commit.Deletions != 0 {
+		return false
+	}
+	if fetchStats != nil {
+		if adds, dels, err := fetchStats(commit.Org, commit.Repo, commit.SHA); err == nil {
+			commit.Additions, commit.Deletions = adds, dels
+		}
+	}
+	if commit.Additions != 0 || commit.Deletions != 0 {
+		return false
+	}
+	result.IsEmptyCommit = true
+	result.IsCompliant = true
+	result.Reasons = []string{"empty commit"}
+	result.MergeStrategy = classifyMergeStrategy(*commit, false)
+	return true
 }
 
 // evaluateRequiredChecks determines the owner approval status for a set of
@@ -285,8 +448,16 @@ func isSelfApproval(review model.Review, commit model.Commit, pr model.PullReque
 		return true
 	}
 
-	// Skip merge commits — the commit author is the person who clicked merge.
-	if commit.ParentCount <= 1 {
+	// For CleanMerge commits (2 parents, auto-generated message) the commit
+	// author/committer is just who clicked merge — GitHub's merge button
+	// refuses to produce such a commit when there are conflicts, so no code
+	// was authored here. Skip the author/committer check.
+	//
+	// DirtyMerge (2 parents, non-auto message) and OctopusMerge (3+ parents)
+	// may carry committer-authored conflict-resolution or edits, so we still
+	// check them.
+	mergeKind := github.ClassifyMerge(commit.ParentCount, commit.Message, commit.CommitterLogin, commit.IsVerified)
+	if mergeKind != github.CleanMerge {
 		if strings.EqualFold(commit.AuthorLogin, reviewer) {
 			return true
 		}

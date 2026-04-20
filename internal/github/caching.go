@@ -48,6 +48,12 @@ type EnrichmentCache interface {
 	GetReviewsForPR(ctx context.Context, org, repo string, prNumber int) ([]model.Review, error)
 	GetCheckRunsForCommit(ctx context.Context, org, repo, sha string) ([]model.CheckRun, error)
 	GetCommitsForPR(ctx context.Context, org, repo string, prNumber int) ([]model.Commit, error)
+	// GetCommitsBySHA returns the DB-stored commit rows for the given SHAs.
+	// Used by enrichment to avoid a redundant GetCommitDetail call — the
+	// list-commits response already populated message/author/parent_count,
+	// and additions/deletions are resolved lazily via the audit's
+	// empty-commit fallback when needed.
+	GetCommitsBySHA(ctx context.Context, org, repo string, shas []string) ([]model.Commit, error)
 }
 
 // A CachingEnricher wraps a Client with per-run in-memory caches and an
@@ -104,6 +110,25 @@ func (ce *CachingEnricher) indexPR(pr *model.PullRequest) {
 		}
 	}
 	ce.mergeCommitIdx[key] = append(ce.mergeCommitIdx[key], pr.Number)
+}
+
+// getCommit resolves the commit's metadata (message, author, parent count,
+// etc.) without calling GitHub. The DB row is written by UpsertCommits
+// during the list-commits phase, which runs before EnrichCommits, so on a
+// normal pipeline invocation the row is always present. The fallback to
+// GetCommitDetail is kept for defensive reasons (tests that invoke the
+// enricher without a pre-populated store); it counts as a CommitDetail
+// stat so the telemetry still surfaces any unexpected hits.
+func (ce *CachingEnricher) getCommit(ctx context.Context, org, repo, sha string) (*model.Commit, error) {
+	if ce.dbCache != nil {
+		if commits, err := ce.dbCache.GetCommitsBySHA(ctx, org, repo, []string{sha}); err == nil && len(commits) > 0 {
+			c := commits[0]
+			ce.Stats.DBHits.Add(1)
+			return &c, nil
+		}
+	}
+	ce.Stats.CommitDetail.Add(1)
+	return ce.client.GetCommitDetail(ctx, org, repo, sha)
 }
 
 func (ce *CachingEnricher) getPRsForCommit(ctx context.Context, org, repo, sha string) ([]model.PullRequest, error) {
@@ -330,8 +355,14 @@ type prEnrichment struct {
 // check runs, and branch commits are fetched in the same goroutine so we
 // don't explode goroutine count by 4× for tiny wins.
 func (ce *CachingEnricher) enrichOneCommit(ctx context.Context, org, repo, sha string) (model.EnrichmentResult, error) {
-	ce.Stats.CommitDetail.Add(1)
-	detail, err := ce.client.GetCommitDetail(ctx, org, repo, sha)
+	// Recover the commit's metadata (message/author/parent_count) from the
+	// DB — the list-commits phase already persisted everything we need
+	// except additions/deletions, and those are resolved lazily by the
+	// audit's empty-commit fallback. Historically we called
+	// GetCommitDetail eagerly here; on a full-org sweep that accounted for
+	// ~16% of all REST calls and was wasted on every commit that passed
+	// the PR-approval path (most of them).
+	detail, err := ce.getCommit(ctx, org, repo, sha)
 	if err != nil {
 		return model.EnrichmentResult{}, err
 	}
@@ -416,55 +447,84 @@ func (ce *CachingEnricher) enrichOneCommit(ctx context.Context, org, repo, sha s
 		PRBranchCommits: prBranchCommits,
 	}
 
-	// Classify & verify clean-revert status. Auto-reverts trusted by pattern;
-	// manual reverts verified by comparing file patches.
-	ce.classifyRevert(ctx, org, repo, sha, &result)
+	// Classify & verify clean-revert and clean-merge status. Both may need
+	// this commit's file patches (revert verification for manual reverts,
+	// merge verification to detect conflict-resolution edits). We fetch
+	// those files at most once per commit and share between classifiers.
+	ce.classifyRevertAndMerge(ctx, org, repo, sha, detail.ParentCount, &result)
 
 	return result, nil
 }
 
-// classifyRevert inspects the commit's message and, for manual reverts,
-// fetches the reverted commit's files and checks that the revert's diff is
-// an exact inverse. Populates the IsCleanRevert / RevertVerification /
-// RevertedSHA fields on the result.
-func (ce *CachingEnricher) classifyRevert(ctx context.Context, org, repo, sha string, result *model.EnrichmentResult) {
+// classifyRevertAndMerge populates the revert-classification and
+// merge-classification fields on the enrichment. The two checks share the
+// same GetCommitFiles(current commit) call when both need it, so the total
+// cost is at most one extra API call for merge classification plus one more
+// for a diff-verified manual revert.
+func (ce *CachingEnricher) classifyRevertAndMerge(
+	ctx context.Context,
+	org, repo, sha string,
+	parentCount int,
+	result *model.EnrichmentResult,
+) {
+	// Lazily fetch this commit's own files; reused by both classifiers.
+	var ownFiles []model.FileDiff
+	var ownFilesErr error
+	var ownFetched bool
+	fetchOwn := func() ([]model.FileDiff, error) {
+		if ownFetched {
+			return ownFiles, ownFilesErr
+		}
+		ownFetched = true
+		ce.Stats.RevertVerification.Add(1)
+		ownFiles, ownFilesErr = ce.client.GetCommitFiles(ctx, org, repo, sha)
+		return ownFiles, ownFilesErr
+	}
+
+	// --- Revert classification ---
 	kind, revertedSHA := ParseRevert(result.Commit.Message)
 	switch kind {
 	case NotRevert, RevertOfRevert:
 		result.RevertVerification = "none"
-		return
 	case AutoRevert:
 		result.IsCleanRevert = true
 		result.RevertVerification = "message-only"
 		result.RevertedSHA = revertedSHA
-		return
 	case ManualRevert:
 		result.RevertedSHA = revertedSHA
-		if revertedSHA == "" {
+		switch {
+		case revertedSHA == "":
 			// Message matched the prefix but no `This reverts commit <sha>`
-			// trailer was found — we can't verify, so we mark as
-			// message-only + not clean.
+			// trailer was found — can't verify, mark as message-only.
 			result.RevertVerification = "message-only"
-			return
+		default:
+			revertFiles, err := fetchOwn()
+			if err != nil {
+				result.RevertVerification = "message-only"
+				break
+			}
+			ce.Stats.RevertVerification.Add(1)
+			revertedFiles, err := ce.client.GetCommitFiles(ctx, org, repo, revertedSHA)
+			if err != nil {
+				result.RevertVerification = "message-only"
+				break
+			}
+			if IsCleanRevertDiff(revertFiles, revertedFiles) {
+				result.IsCleanRevert = true
+				result.RevertVerification = "diff-verified"
+			} else {
+				result.RevertVerification = "diff-mismatch"
+			}
 		}
-		// Need both R's files and A's files to diff-verify.
-		ce.Stats.RevertVerification.Add(1)
-		revertFiles, err := ce.client.GetCommitFiles(ctx, org, repo, sha)
-		if err != nil {
-			result.RevertVerification = "message-only"
-			return
-		}
-		ce.Stats.RevertVerification.Add(1)
-		revertedFiles, err := ce.client.GetCommitFiles(ctx, org, repo, revertedSHA)
-		if err != nil {
-			result.RevertVerification = "message-only"
-			return
-		}
-		if IsCleanRevertDiff(revertFiles, revertedFiles) {
-			result.IsCleanRevert = true
-			result.RevertVerification = "diff-verified"
-		} else {
-			result.RevertVerification = "diff-mismatch"
-		}
+	}
+
+	// --- Merge classification ---
+	// See ClassifyMerge for the detection rule. No extra API call needed:
+	// parent count, message, committer, and signature verification are all
+	// in the commit detail we fetched at the start of enrichOneCommit.
+	mk := ClassifyMerge(parentCount, result.Commit.Message, result.Commit.CommitterLogin, result.Commit.IsVerified)
+	result.MergeVerification = mergeKindVerification(mk)
+	if mk == CleanMerge {
+		result.IsCleanMerge = true
 	}
 }

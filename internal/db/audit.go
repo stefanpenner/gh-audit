@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"fmt"
 	"strings"
@@ -32,8 +33,10 @@ var auditResultColumns = []string{
 	"has_pr", "pr_number", "pr_count", "has_final_approval", "has_stale_approval",
 	"has_post_merge_concern",
 	"is_clean_revert", "revert_verification", "reverted_sha",
+	"is_clean_merge", "merge_verification",
 	"is_self_approved", "approver_logins", "owner_approval_check", "is_compliant",
 	"reasons", "merge_strategy", "pr_commit_author_logins", "commit_href", "pr_href",
+	"annotations",
 }
 
 // UpsertAuditResults batch-inserts audit results using the DuckDB Appender API
@@ -51,6 +54,7 @@ func (d *DB) UpsertAuditResults(ctx context.Context, results []model.AuditResult
 			r.HasFinalApproval, r.HasStaleApproval,
 			r.HasPostMergeConcern,
 			r.IsCleanRevert, nullIfEmpty(r.RevertVerification), nullIfEmpty(r.RevertedSHA),
+			r.IsCleanMerge, nullIfEmpty(r.MergeVerification),
 			r.IsSelfApproved,
 			toAnySlice(r.ApproverLogins),
 			nullIfEmpty(r.OwnerApprovalCheck), r.IsCompliant,
@@ -58,6 +62,7 @@ func (d *DB) UpsertAuditResults(ctx context.Context, results []model.AuditResult
 			nullIfEmpty(r.MergeStrategy),
 			toAnySlice(r.PRCommitAuthorLogins),
 			r.CommitHref, r.PRHref,
+			toAnySlice(r.Annotations),
 		}
 	}
 
@@ -136,6 +141,62 @@ func (d *DB) DeleteAuditResults(ctx context.Context, org, repo string) error {
 	return nil
 }
 
+// RevertMergeClassification captures the enrichment-phase fields that the
+// re-audit path cannot recompute (they require GetCommitFiles calls against
+// the reverted commit, which re-audit intentionally skips). Callers that
+// re-audit should read these from the existing audit_results row before
+// deleting, then copy them onto the new AuditResult so the classification
+// isn't clobbered.
+type RevertMergeClassification struct {
+	IsCleanRevert       bool
+	RevertVerification  string
+	RevertedSHA         string
+	IsCleanMerge        bool
+	MergeVerification   string
+}
+
+// GetRevertMergeClassification returns the stored revert/merge classification
+// for a commit, or zero values if no audit row exists.
+func (d *DB) GetRevertMergeClassification(ctx context.Context, org, repo, sha string) (RevertMergeClassification, error) {
+	var c RevertMergeClassification
+	row := d.DB.QueryRowContext(ctx, `
+SELECT
+  COALESCE(is_clean_revert, false),
+  COALESCE(revert_verification, ''),
+  COALESCE(reverted_sha, ''),
+  COALESCE(is_clean_merge, false),
+  COALESCE(merge_verification, '')
+FROM audit_results
+WHERE org = ? AND repo = ? AND sha = ?`, org, repo, sha)
+	err := row.Scan(&c.IsCleanRevert, &c.RevertVerification, &c.RevertedSHA, &c.IsCleanMerge, &c.MergeVerification)
+	if err == sql.ErrNoRows {
+		return c, nil
+	}
+	return c, err
+}
+
+// DeleteAuditResultsBySHA removes a single audit result for (org, repo, sha).
+// Used by the backfill path which re-audits a single commit after discovering
+// its missing PR; DuckDB's INSERT OR REPLACE hits a "List Update is not
+// supported" error when the existing row has non-empty LIST columns (reasons,
+// approver_logins), so we delete-then-insert instead of relying on UPSERT.
+func (d *DB) DeleteAuditResultsBySHA(ctx context.Context, org, repo, sha string) error {
+	_, err := d.DB.ExecContext(ctx,
+		"DELETE FROM audit_results WHERE org = ? AND repo = ? AND sha = ?",
+		org, repo, sha)
+	if err != nil {
+		return fmt.Errorf("delete audit result for %s/%s@%s: %w", org, repo, sha[:min(12, len(sha))], err)
+	}
+	return nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // DeleteOrphanedAuditResults removes audit results whose SHA no longer appears
 // in the commits table. Safe to call after UpsertAuditResults — if it fails,
 // the only consequence is stale rows (no data loss).
@@ -186,8 +247,10 @@ func (d *DB) GetAuditResults(ctx context.Context, opts AuditQueryOpts) ([]AuditR
 		       COALESCE(a.pr_count, 0), a.has_final_approval, COALESCE(a.has_stale_approval, false),
 		       COALESCE(a.has_post_merge_concern, false),
 		       COALESCE(a.is_clean_revert, false), COALESCE(a.revert_verification, ''), COALESCE(a.reverted_sha, ''),
+		       COALESCE(a.is_clean_merge, false), COALESCE(a.merge_verification, ''),
 		       a.is_self_approved, a.approver_logins, COALESCE(a.owner_approval_check::TEXT, ''), a.is_compliant,
 		       a.reasons, COALESCE(a.merge_strategy, ''), a.commit_href, a.pr_href, a.audited_at,
+		       COALESCE(a.annotations, []::TEXT[]),
 		       COALESCE(c.author_login, ''), COALESCE(c.committed_at, '1970-01-01'::TIMESTAMP), COALESCE(c.message, '')
 		FROM audit_results a
 		LEFT JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
@@ -203,21 +266,24 @@ func (d *DB) GetAuditResults(ctx context.Context, opts AuditQueryOpts) ([]AuditR
 	var result []AuditRow
 	for rows.Next() {
 		var row AuditRow
-		var approvers, reasons any
+		var approvers, reasons, annotations any
 		if err := rows.Scan(
 			&row.Org, &row.Repo, &row.SHA,
 			&row.IsEmptyCommit, &row.IsBot, &row.IsExemptAuthor, &row.HasPR, &row.PRNumber,
 			&row.PRCount, &row.HasFinalApproval, &row.HasStaleApproval,
 			&row.HasPostMergeConcern,
 			&row.IsCleanRevert, &row.RevertVerification, &row.RevertedSHA,
+			&row.IsCleanMerge, &row.MergeVerification,
 			&row.IsSelfApproved, &approvers, &row.OwnerApprovalCheck,
 			&row.IsCompliant, &reasons, &row.MergeStrategy, &row.CommitHref, &row.PRHref, &row.AuditedAt,
+			&annotations,
 			&row.AuthorLogin, &row.CommittedAt, &row.Message,
 		); err != nil {
 			return nil, fmt.Errorf("scan audit row: %w", err)
 		}
 		row.ApproverLogins = scanDuckDBTextArray(approvers)
 		row.Reasons = scanDuckDBTextArray(reasons)
+		row.Annotations = scanDuckDBTextArray(annotations)
 		result = append(result, row)
 	}
 	return result, rows.Err()

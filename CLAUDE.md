@@ -6,8 +6,12 @@
 - Audit detection logic (`internal/sync/audit.go`) — update the "What gh-audit detects" section
 - Sync pipeline phases (`internal/sync/pipeline.go`) — update the "Sync pipeline" section
 - REST endpoints called (`internal/github/client.go`) — update the "Enrich" phase
+- Caching/enrichment behaviour (`internal/github/caching.go`) — update "Caching layer" section
+- Revert classification (`internal/github/revert.go`) — update "Revert & merge classification" and rule 8
+- Merge classification (`internal/github/merge.go`) — update "Revert & merge classification" and the "Clean Merges" sheet description
+- Annotations (`internal/sync/annotations.go`) — update "Annotations" section
 - Database schema (`internal/db/schema.go`) — update the "Database schema" table
-- Report formats (`internal/report/`) — update the "Report layer" section
+- Report formats (`internal/report/`) — update the "Report layer" section and sheet list
 - CLI commands (`cmd/`) — update "Package structure" if commands are added/removed
 - Token pool behaviour (`internal/github/tokenpool.go`) — update "Token pool" section
 

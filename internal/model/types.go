@@ -208,6 +208,17 @@ type AuditResult struct {
 	// RevertedSHA is the SHA of the commit being reverted, extracted from
 	// the revert commit's message. Empty if not a revert.
 	RevertedSHA        string
+	// IsCleanMerge is true when the commit is a two-parent merge that
+	// introduced no new content beyond its parents — i.e., no conflict
+	// resolution or post-merge edit. Informational — does not affect
+	// IsCompliant (policy for clean merges is not yet codified).
+	IsCleanMerge      bool
+	// MergeVerification records how the merge was classified.
+	// One of: "" / "none" (squash or single-parent), "clean" (2 parents,
+	// files[] empty — merge introduced no diff of its own), "dirty"
+	// (2 parents, merge commit has conflict-resolution or extra content),
+	// "octopus" (3+ parents, not auto-classified).
+	MergeVerification string
 	IsSelfApproved     bool // true if only approvals are from code contributors
 	ApproverLogins     []string
 	OwnerApprovalCheck string // success, failure, missing
@@ -217,6 +228,13 @@ type AuditResult struct {
 	PRCommitAuthorLogins  []string
 	CommitHref            string
 	PRHref             string
+	// Annotations are informational tags attached by the audit's detector
+	// pass (see internal/sync/annotations.go). They describe structural
+	// patterns — automation/dep-bump markers, etc. — without affecting
+	// IsCompliant. Reviewers can filter by tag to triage automated or
+	// automation-adjacent PRs. Format is "<family>:<kv>" (e.g.
+	// "automation:depex") so the XLSX can filter by prefix.
+	Annotations          []string
 	AuditedAt          time.Time
 }
 
@@ -269,4 +287,8 @@ type EnrichmentResult struct {
 	IsCleanRevert      bool
 	RevertVerification string
 	RevertedSHA        string
+	// Clean-merge signal computed during enrichment (see AuditResult
+	// fields of the same name for semantics).
+	IsCleanMerge      bool
+	MergeVerification string
 }

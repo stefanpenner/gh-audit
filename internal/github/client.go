@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	gogithub "github.com/google/go-github/v72/github"
@@ -232,6 +233,192 @@ func (c *Client) GetCommitFiles(ctx context.Context, org, repo, sha string) ([]m
 		})
 	}
 	return files, nil
+}
+
+// FindMergingPR returns the PR whose merge_commit_sha equals targetSHA, by
+// enumerating closed PRs whose merge occurred within a time window around
+// committedAt. This is the canonical way to answer "which PR delivered this
+// commit to master" without relying on the commit message or the
+// /commits/:sha/pulls endpoint (which returns *every* PR whose branch
+// contains the commit — often attributing a squash-merged commit to a later,
+// unrelated PR that happens to have the commit in its branch history).
+//
+// The caller supplies the base branches that count as delivery targets
+// (typically the audit_branches list: master, main, release/*, HF_BF_*, …).
+// windowBefore / windowAfter bound how far back/forward we scan closed PRs.
+//
+// Returns (nil, nil) when no PR in the window matches — the commit may have
+// been pushed directly, merged before the window opened, or merged onto a
+// branch we don't consider.
+func (c *Client) FindMergingPR(
+	ctx context.Context,
+	org, repo, targetSHA string,
+	committedAt time.Time,
+	baseBranches []string,
+	windowBefore, windowAfter time.Duration,
+) (*model.PullRequest, error) {
+	windowStart := committedAt.Add(-windowBefore)
+	windowEnd := committedAt.Add(windowAfter)
+	targetSHA = strings.ToLower(targetSHA)
+
+	for _, base := range baseBranches {
+		pr, err := c.findMergingPROnBase(ctx, org, repo, targetSHA, base, windowStart, windowEnd)
+		if err != nil {
+			return nil, err
+		}
+		if pr != nil {
+			return pr, nil
+		}
+	}
+	return nil, nil
+}
+
+// ListClosedMergedPRs paginates GitHub's PR list for (base, state=closed)
+// newest-first, invoking `cb` for each merged PR whose merged_at falls in
+// [windowStart, windowEnd]. Pagination stops when a page's oldest
+// updated_at drops below windowStart — older PRs can't have matching
+// merged_at values. Intended for bulk backfill use cases that want to
+// index a repo's merged history once and then match many SHAs locally.
+func (c *Client) ListClosedMergedPRs(
+	ctx context.Context,
+	org, repo, base string,
+	windowStart, windowEnd time.Time,
+	cb func(*model.PullRequest),
+) error {
+	opts := &gogithub.PullRequestListOptions{
+		State:       "closed",
+		Base:        base,
+		Sort:        "updated",
+		Direction:   "desc",
+		ListOptions: gogithub.ListOptions{PerPage: 100},
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		gh, err := c.ghClient(ctx, org, repo)
+		if err != nil {
+			return err
+		}
+		prs, resp, err := gh.PullRequests.List(ctx, org, repo, opts)
+		if err != nil {
+			return fmt.Errorf("listing PRs %s/%s base=%s page %d: %w", org, repo, base, opts.Page, err)
+		}
+		for _, pr := range prs {
+			if pr.MergedAt == nil {
+				continue
+			}
+			merged := pr.GetMergedAt().Time
+			if merged.Before(windowStart) || merged.After(windowEnd) {
+				continue
+			}
+			cb(buildPRModel(org, repo, pr))
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		if len(prs) > 0 {
+			oldestUpdated := prs[len(prs)-1].GetUpdatedAt().Time
+			if oldestUpdated.Before(windowStart) {
+				break
+			}
+		}
+		opts.Page = resp.NextPage
+	}
+	return nil
+}
+
+// findMergingPROnBase scans closed PRs on a single base branch, newest-first,
+// until it either finds a merge_commit_sha match or walks past windowStart.
+// Branch patterns with wildcards (e.g. "release/*") are passed through to
+// GitHub's base filter verbatim — the API treats an unknown base as "no
+// match" rather than erroring, so wildcards get quietly ignored and we fall
+// back to scanning the default branch via subsequent iterations. Concrete
+// branches (master, main, specific release branch names) work reliably.
+func (c *Client) findMergingPROnBase(
+	ctx context.Context,
+	org, repo, targetSHA, base string,
+	windowStart, windowEnd time.Time,
+) (*model.PullRequest, error) {
+	opts := &gogithub.PullRequestListOptions{
+		State:       "closed",
+		Base:        base,
+		Sort:        "updated",
+		Direction:   "desc",
+		ListOptions: gogithub.ListOptions{PerPage: 100},
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		gh, err := c.ghClient(ctx, org, repo)
+		if err != nil {
+			return nil, err
+		}
+		prs, resp, err := gh.PullRequests.List(ctx, org, repo, opts)
+		if err != nil {
+			return nil, fmt.Errorf("listing PRs %s/%s base=%s page %d: %w", org, repo, base, opts.Page, err)
+		}
+		for _, pr := range prs {
+			if pr.MergedAt == nil {
+				continue
+			}
+			// Page is updated-desc but merged_at can diverge from updated_at
+			// (e.g. someone edits the PR title years later). Scan every row
+			// in the page; use updated_at only as the pagination stop signal.
+			merged := pr.GetMergedAt().Time
+			if merged.Before(windowStart) || merged.After(windowEnd) {
+				continue
+			}
+			if strings.EqualFold(pr.GetMergeCommitSHA(), targetSHA) {
+				return buildPRModel(org, repo, pr), nil
+			}
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		// Stop scanning when the page's youngest updated_at drops below the
+		// window — older PRs can't possibly match, and we'd just burn API
+		// budget paginating further.
+		if len(prs) > 0 {
+			oldestUpdated := prs[len(prs)-1].GetUpdatedAt().Time
+			if oldestUpdated.Before(windowStart) {
+				break
+			}
+		}
+		opts.Page = resp.NextPage
+	}
+	return nil, nil
+}
+
+// buildPRModel converts a go-github PullRequest into our model shape. Kept
+// package-private because it duplicates the conversion logic in
+// ListCommitPullRequests; a future refactor could consolidate.
+func buildPRModel(org, repo string, pr *gogithub.PullRequest) *model.PullRequest {
+	p := &model.PullRequest{
+		Org:        org,
+		Repo:       repo,
+		Number:     pr.GetNumber(),
+		Title:      pr.GetTitle(),
+		Merged:     true,
+		HeadSHA:    pr.GetHead().GetSHA(),
+		HeadBranch: pr.GetHead().GetRef(),
+		Href:       pr.GetHTMLURL(),
+	}
+	if pr.MergedAt != nil {
+		p.MergedAt = pr.MergedAt.Time
+	}
+	if pr.GetMergeCommitSHA() != "" {
+		p.MergeCommitSHA = pr.GetMergeCommitSHA()
+	}
+	if pr.GetUser() != nil {
+		p.AuthorLogin = pr.GetUser().GetLogin()
+	}
+	if pr.GetMergedBy() != nil {
+		p.MergedByLogin = pr.GetMergedBy().GetLogin()
+	}
+	return p
 }
 
 // ListCommitPullRequests returns merged PRs associated with a commit.

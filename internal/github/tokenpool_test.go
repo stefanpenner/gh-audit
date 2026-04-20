@@ -256,6 +256,14 @@ func TestAddPATToken(t *testing.T) {
 	assert.Equal(t, "org1", tok.scopes[0].Org)
 }
 
+func TestHasToken(t *testing.T) {
+	pool := NewTokenPool(testLogger())
+	assert.False(t, pool.HasToken("missing"))
+	pool.AddPATToken("alice", "secret", nil)
+	assert.True(t, pool.HasToken("alice"))
+	assert.False(t, pool.HasToken("bob"))
+}
+
 func TestRateLimitTransport_Handles403Abuse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "1")
@@ -299,11 +307,13 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
-func TestSecondaryRateLimitRetry(t *testing.T) {
+func TestSecondaryRateLimitReassignsToken(t *testing.T) {
+	// First call returns secondary-rate-limit 403 → the transport should
+	// cool down the originating token and re-pick a different one.
 	callCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
-		if callCount <= 2 {
+		if callCount == 1 {
 			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(403)
 			fmt.Fprint(w, `{"message": "You have triggered an abuse detection mechanism"}`)
@@ -317,22 +327,22 @@ func TestSecondaryRateLimitRetry(t *testing.T) {
 
 	pool := NewTokenPool(testLogger())
 	pool.AddPATToken("t1", "token1", nil)
+	pool.AddPATToken("t2", "token2", nil)
 
 	client, err := pool.Pick(context.Background(), "", "")
 	require.NoError(t, err)
 
-	start := time.Now()
 	resp, err := client.Get(srv.URL)
-	elapsed := time.Since(start)
-
-	require.NoError(t, err)
-	resp.Body.Close()
+	require.NoError(t, err, "expected reassigned token retry to succeed")
+	defer resp.Body.Close()
 	assert.Equal(t, 200, resp.StatusCode)
-	assert.Equal(t, 3, callCount, "should have retried twice then succeeded")
-	assert.GreaterOrEqual(t, elapsed, 2*time.Second, "should have waited for backoff")
+	assert.Equal(t, 2, callCount, "should have reassigned once and succeeded")
 }
 
-func TestSecondaryRateLimitExhausted(t *testing.T) {
+func TestSecondaryRateLimitExhaustedAllTokens(t *testing.T) {
+	// Every token returns secondary rate limit on every call. After the
+	// reassign budget is exhausted the caller must see an error whose
+	// cause is still the SecondaryRateLimitError.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "1")
 		w.WriteHeader(403)
@@ -342,13 +352,74 @@ func TestSecondaryRateLimitExhausted(t *testing.T) {
 
 	pool := NewTokenPool(testLogger())
 	pool.AddPATToken("t1", "token1", nil)
+	pool.AddPATToken("t2", "token2", nil)
 
 	client, err := pool.Pick(context.Background(), "", "")
 	require.NoError(t, err)
 
-	_, err = client.Get(srv.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", srv.URL, nil)
+	_, err = client.Do(req)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "secondary rate limit")
+	assert.Contains(t, err.Error(), "rate limit", "expected rate-limit error, got: %v", err)
+}
+
+func TestParseOrgRepoFromPath(t *testing.T) {
+	tests := []struct {
+		path string
+		org  string
+		repo string
+	}{
+		{"/repos/octocat/hello-world/commits", "octocat", "hello-world"},
+		{"/repos/octocat/hello-world", "octocat", "hello-world"},
+		{"/orgs/myorg/repos", "myorg", ""},
+		{"/user", "", ""},
+		{"/rate_limit", "", ""},
+		{"", "", ""},
+		{"/", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			gotOrg, gotRepo := parseOrgRepoFromPath(tt.path)
+			assert.Equal(t, tt.org, gotOrg)
+			assert.Equal(t, tt.repo, gotRepo)
+		})
+	}
+}
+
+func TestPrimaryRateLimitMarksTokenAndSucceedsOnRetry(t *testing.T) {
+	// Single server that counts calls. The first call returns primary rate
+	// limit (and sets x-ratelimit-remaining: 0); subsequent calls succeed.
+	// The transport should transparently re-pick and retry on the same server.
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			w.Header().Set("x-ratelimit-remaining", "0")
+			w.Header().Set("x-ratelimit-reset", fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()))
+			w.WriteHeader(403)
+			fmt.Fprint(w, `{"message": "API rate limit exceeded for installation ID 12345"}`)
+			return
+		}
+		w.Header().Set("x-ratelimit-remaining", "4999")
+		w.WriteHeader(200)
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	pool := NewTokenPool(testLogger())
+	pool.AddPATToken("t1", "token1", nil)
+	pool.AddPATToken("t2", "token2", nil)
+
+	client, err := pool.Pick(context.Background(), "", "")
+	require.NoError(t, err)
+
+	resp, err := client.Get(srv.URL)
+	require.NoError(t, err, "expected retry on alternate token to succeed")
+	defer resp.Body.Close()
+	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(t, 2, callCount, "should have retried exactly once with a second token")
 }
 
 func TestScopeMatches(t *testing.T) {

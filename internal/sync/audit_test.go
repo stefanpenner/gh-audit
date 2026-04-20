@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -491,6 +492,22 @@ func TestEvaluateCommit(t *testing.T) {
 			wantReasons:    []string{"no approval on final commit (PR #42)"},
 		},
 		{
+			name:   "APPROVED then COMMENTED on final commit is still compliant",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{basePR},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "head123", SubmittedAt: now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer1", State: "COMMENTED", CommitID: "head123", SubmittedAt: now},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks: requiredChecks,
+			wantCompliant:  true,
+			wantHasPR:      true,
+			wantReasons:    []string{"compliant"},
+		},
+		{
 			name:   "mixed states on final CHANGES_REQUESTED and APPROVED from different reviewers",
 			commit: baseCommit,
 			enrichment: model.EnrichmentResult{
@@ -582,8 +599,10 @@ func TestEvaluateCommit(t *testing.T) {
 			commit: model.Commit{
 				Org: "myorg", Repo: "myrepo", SHA: "mergeabc",
 				AuthorLogin: "merger", CommitterLogin: "web-flow",
-				Additions: 10, Deletions: 5, ParentCount: 2,
-				Href: "https://github.com/myorg/myrepo/commit/mergeabc",
+				IsVerified: true,
+				Additions:  10, Deletions: 5, ParentCount: 2,
+				Message: "Merge pull request #42 from codeauthor/feature",
+				Href:    "https://github.com/myorg/myrepo/commit/mergeabc",
 			},
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{
@@ -823,7 +842,7 @@ func TestEvaluateCommit(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := EvaluateCommit(tt.commit, tt.enrichment, tt.exemptAuthors, tt.requiredChecks)
+			result := EvaluateCommit(tt.commit, tt.enrichment, tt.exemptAuthors, tt.requiredChecks, nil)
 
 			assert.Equal(t, tt.wantCompliant, result.IsCompliant, "IsCompliant (reasons: %v)", result.Reasons)
 			assert.Equal(t, tt.wantBot, result.IsBot, "IsBot")
@@ -1003,7 +1022,7 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			},
 		}
 
-		result := EvaluateCommit(squashCommit, enrichment, nil, nil)
+		result := EvaluateCommit(squashCommit, enrichment, nil, nil, nil)
 		assert.True(t, result.IsSelfApproved, "dev-b approved but also contributed commits")
 		assert.False(t, result.IsCompliant)
 		assert.Contains(t, result.PRCommitAuthorLogins, "dev-a")
@@ -1023,7 +1042,7 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			},
 		}
 
-		result := EvaluateCommit(squashCommit, enrichment, nil, nil)
+		result := EvaluateCommit(squashCommit, enrichment, nil, nil, nil)
 		assert.False(t, result.IsSelfApproved)
 		assert.True(t, result.IsCompliant)
 	})
@@ -1046,7 +1065,7 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			},
 		}
 
-		result := EvaluateCommit(botCommit, enrichment, []string{"dependabot[bot]"}, nil)
+		result := EvaluateCommit(botCommit, enrichment, []string{"dependabot[bot]"}, nil, nil)
 		assert.True(t, result.IsExemptAuthor, "commit author is exempt")
 		assert.False(t, result.IsCompliant, "non-exempt contributor needs review")
 	})
@@ -1070,7 +1089,7 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			},
 		}
 
-		result := EvaluateCommit(botCommit, enrichment, []string{"dependabot[bot]"}, nil)
+		result := EvaluateCommit(botCommit, enrichment, []string{"dependabot[bot]"}, nil, nil)
 		assert.True(t, result.IsExemptAuthor)
 		assert.True(t, result.IsCompliant, "independent review covers human contributor")
 	})
@@ -1092,7 +1111,7 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			},
 		}
 
-		result := EvaluateCommit(botCommit, enrichment, []string{"dependabot[bot]"}, nil)
+		result := EvaluateCommit(botCommit, enrichment, []string{"dependabot[bot]"}, nil, nil)
 		require.True(t, result.IsCompliant)
 		assert.True(t, result.IsExemptAuthor)
 		assert.Equal(t, []string{"exempt: configured author"}, result.Reasons)
@@ -1118,7 +1137,406 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			},
 		}
 
-		result := EvaluateCommit(mergeCommit, enrichment, nil, nil)
+		result := EvaluateCommit(mergeCommit, enrichment, nil, nil, nil)
 		assert.True(t, result.IsSelfApproved, "dev-b is both reviewer and PR commit author")
 	})
+
+	t.Run("CleanMerge — committer-as-reviewer is NOT self-approval", func(t *testing.T) {
+		// GitHub's merge-button produces a 2-parent commit with a canned
+		// message. The committer is whoever clicked merge; they did not
+		// author any code in this commit (GitHub refuses the button on
+		// conflicts). Reviewer == committer must stay clean.
+		cleanMerge := squashCommit
+		cleanMerge.ParentCount = 2
+		cleanMerge.Message = "Merge pull request #10 from dev-a/feature"
+		cleanMerge.AuthorLogin = "dev-b"
+		cleanMerge.CommitterLogin = "web-flow"
+		cleanMerge.IsVerified = true
+
+		mergePR := pr
+		mergePR.AuthorLogin = "dev-a"
+
+		enrichment := model.EnrichmentResult{
+			Commit:  cleanMerge,
+			PRs:     []model.PullRequest{mergePR},
+			Reviews: []model.Review{approvalFromDevB},
+			PRBranchCommits: map[int][]model.Commit{
+				10: {
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a"},
+				},
+			},
+		}
+
+		result := EvaluateCommit(cleanMerge, enrichment, nil, nil, nil)
+		assert.False(t, result.IsSelfApproved, "CleanMerge committer is not a code author")
+		assert.True(t, result.IsCompliant)
+	})
+
+	t.Run("DirtyMerge — committer-as-reviewer IS self-approval", func(t *testing.T) {
+		// A 2-parent commit with a non-auto message may include
+		// conflict-resolution code authored by the committer. If the
+		// committer also approves, that's self-approval.
+		dirtyMerge := squashCommit
+		dirtyMerge.ParentCount = 2
+		dirtyMerge.Message = "Resolve conflicts in foo.go"
+		dirtyMerge.AuthorLogin = "dev-b"
+		dirtyMerge.CommitterLogin = "dev-b"
+
+		mergePR := pr
+		mergePR.AuthorLogin = "dev-a"
+
+		enrichment := model.EnrichmentResult{
+			Commit:  dirtyMerge,
+			PRs:     []model.PullRequest{mergePR},
+			Reviews: []model.Review{approvalFromDevB},
+			PRBranchCommits: map[int][]model.Commit{
+				10: {
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a"},
+				},
+			},
+		}
+
+		result := EvaluateCommit(dirtyMerge, enrichment, nil, nil, nil)
+		assert.True(t, result.IsSelfApproved, "DirtyMerge committer may have authored conflict-resolution code")
+		assert.False(t, result.IsCompliant)
+	})
+
+	t.Run("spoofed CleanMerge message — committer-as-reviewer IS self-approval", func(t *testing.T) {
+		// A malicious actor could craft a local merge commit with a message
+		// that matches GitHub's `Merge pull request #N` format. Without
+		// requiring committer == web-flow AND is_verified, the classifier
+		// would trust the message and skip the committer check. This test
+		// guards against that.
+		spoofed := squashCommit
+		spoofed.ParentCount = 2
+		spoofed.Message = "Merge pull request #10 from dev-a/feature"
+		spoofed.AuthorLogin = "dev-b"
+		spoofed.CommitterLogin = "dev-b" // not web-flow
+		spoofed.IsVerified = false
+
+		mergePR := pr
+		mergePR.AuthorLogin = "dev-a"
+
+		enrichment := model.EnrichmentResult{
+			Commit:  spoofed,
+			PRs:     []model.PullRequest{mergePR},
+			Reviews: []model.Review{approvalFromDevB},
+			PRBranchCommits: map[int][]model.Commit{
+				10: {
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a"},
+				},
+			},
+		}
+
+		result := EvaluateCommit(spoofed, enrichment, nil, nil, nil)
+		assert.True(t, result.IsSelfApproved, "spoofed merge message must not grant CleanMerge trust")
+		assert.False(t, result.IsCompliant)
+	})
+
+	t.Run("web-flow committer but unverified — committer-as-reviewer IS self-approval", func(t *testing.T) {
+		// Verification must also hold; otherwise the signal is forgeable.
+		commit := squashCommit
+		commit.ParentCount = 2
+		commit.Message = "Merge pull request #10 from dev-a/feature"
+		commit.AuthorLogin = "dev-b"
+		commit.CommitterLogin = "web-flow"
+		commit.IsVerified = false
+
+		mergePR := pr
+		mergePR.AuthorLogin = "dev-a"
+
+		enrichment := model.EnrichmentResult{
+			Commit:  commit,
+			PRs:     []model.PullRequest{mergePR},
+			Reviews: []model.Review{approvalFromDevB},
+		}
+
+		result := EvaluateCommit(commit, enrichment, nil, nil, nil)
+		assert.True(t, result.IsSelfApproved, "unverified commit must not be trusted as CleanMerge")
+	})
+
+	t.Run("OctopusMerge — committer-as-reviewer IS self-approval", func(t *testing.T) {
+		octopus := squashCommit
+		octopus.ParentCount = 3
+		octopus.Message = "Merge branches 'a', 'b', 'c'"
+		octopus.AuthorLogin = "dev-b"
+		octopus.CommitterLogin = "dev-b"
+
+		mergePR := pr
+		mergePR.AuthorLogin = "dev-a"
+
+		enrichment := model.EnrichmentResult{
+			Commit:  octopus,
+			PRs:     []model.PullRequest{mergePR},
+			Reviews: []model.Review{approvalFromDevB},
+			PRBranchCommits: map[int][]model.Commit{
+				10: {
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a"},
+				},
+			},
+		}
+
+		result := EvaluateCommit(octopus, enrichment, nil, nil, nil)
+		assert.True(t, result.IsSelfApproved, "OctopusMerge is not auto-trusted")
+		assert.False(t, result.IsCompliant)
+	})
+}
+
+func TestEvaluateCommit_LazyStatsFetcher(t *testing.T) {
+	// A commit with an approved PR must never invoke fetchStats: the audit
+	// should short-circuit on the compliant path.
+	t.Run("approved PR never invokes fetchStats", func(t *testing.T) {
+		mergedAt := time.Now().Add(-time.Hour)
+		commit := model.Commit{
+			Org: "o", Repo: "r", SHA: "abc", AuthorLogin: "dev-a",
+			// Additions/Deletions deliberately zero — pre-refactor this
+			// would have flagged the commit "empty" and short-circuited
+			// BEFORE the PR check, masking bugs. Now the PR check runs
+			// first.
+		}
+		pr := model.PullRequest{
+			Org: "o", Repo: "r", Number: 1, HeadSHA: "head",
+			MergedAt: mergedAt,
+		}
+		enrichment := model.EnrichmentResult{
+			PRs: []model.PullRequest{pr},
+			Reviews: []model.Review{
+				{Org: "o", Repo: "r", PRNumber: 1, CommitID: "head", ReviewerLogin: "reviewer", State: "APPROVED", SubmittedAt: mergedAt.Add(-time.Minute)},
+			},
+		}
+		called := false
+		result := EvaluateCommit(commit, enrichment, nil, nil, func(string, string, string) (int, int, error) {
+			called = true
+			return 1, 1, nil
+		})
+		assert.True(t, result.IsCompliant)
+		assert.False(t, result.IsEmptyCommit, "approved PR should not be misclassified as empty")
+		assert.False(t, called, "fetchStats must not be invoked when PR path succeeds")
+	})
+
+	// A non-compliant commit (no PR) with zero stats should invoke the
+	// fetcher; a non-zero response flips the audit to "non-compliant" and
+	// a zero/error response preserves the legacy "empty → compliant"
+	// behaviour.
+	t.Run("non-compliant commit invokes fetchStats and respects result", func(t *testing.T) {
+		commit := model.Commit{Org: "o", Repo: "r", SHA: "abc", AuthorLogin: "dev-a"}
+		enrichment := model.EnrichmentResult{}
+
+		calls := 0
+		result := EvaluateCommit(commit, enrichment, nil, nil, func(string, string, string) (int, int, error) {
+			calls++
+			return 42, 3, nil
+		})
+		assert.Equal(t, 1, calls, "fetchStats should run exactly once on fallback")
+		assert.False(t, result.IsCompliant, "commit with real diff and no PR is non-compliant")
+		assert.False(t, result.IsEmptyCommit)
+		assert.Contains(t, strings.Join(result.Reasons, "|"), "no associated pull request")
+
+		// Fetcher returns zero → empty-commit fallback fires.
+		calls = 0
+		result2 := EvaluateCommit(commit, enrichment, nil, nil, func(string, string, string) (int, int, error) {
+			calls++
+			return 0, 0, nil
+		})
+		assert.Equal(t, 1, calls)
+		assert.True(t, result2.IsCompliant)
+		assert.True(t, result2.IsEmptyCommit)
+	})
+}
+
+func TestEvaluateCommit_RevertWaivers(t *testing.T) {
+	// R1 — clean revert. A diff-verified clean revert is compliant on its
+	// own, regardless of whether the reverted commit was compliant. R2 —
+	// GitHub-server-created revert. A revert-prefixed commit with committer
+	// == web-flow and a verified signature is compliant even when its diff
+	// doesn't match (conflict-resolved reverts). Both rules evaluate each
+	// commit standalone — see TODO.md for the stricter cross-commit variant.
+	const revertedSHA = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+	mergedAt := time.Now().Add(-time.Hour)
+	revertPR := model.PullRequest{Org: "o", Repo: "r", Number: 7, HeadSHA: "head-7", MergedAt: mergedAt, Href: "https://example/pr/7"}
+	baseCommit := model.Commit{Org: "o", Repo: "r", SHA: "revert-sha", AuthorLogin: "dev-a", Additions: 5, Deletions: 5}
+	baseEnrichment := model.EnrichmentResult{PRs: []model.PullRequest{revertPR}}
+
+	t.Run("R1: diff-verified clean revert is compliant standalone", func(t *testing.T) {
+		enrichment := baseEnrichment
+		enrichment.IsCleanRevert = true
+		enrichment.RevertVerification = "diff-verified"
+		enrichment.RevertedSHA = revertedSHA
+		result := EvaluateCommit(baseCommit, enrichment, nil, nil, nil)
+		assert.True(t, result.IsCompliant)
+		assert.True(t, result.IsCleanRevert, "is_clean_revert flag must survive so the Clean Reverts sheet still picks it up")
+		require.Len(t, result.Reasons, 1)
+		assert.Contains(t, result.Reasons[0], "clean revert of")
+		assert.Contains(t, result.Reasons[0], "a1b2c3d4e5f6", "reason cites the reverted sha prefix")
+	})
+
+	t.Run("R1: auto-revert without a reverted SHA is still compliant", func(t *testing.T) {
+		enrichment := baseEnrichment
+		enrichment.IsCleanRevert = true
+		enrichment.RevertVerification = "message-only"
+		enrichment.RevertedSHA = "" // trusted-by-construction auto-revert
+		result := EvaluateCommit(baseCommit, enrichment, nil, nil, nil)
+		assert.True(t, result.IsCompliant)
+		assert.Contains(t, result.Reasons[0], "clean revert")
+	})
+
+	t.Run("R1 does NOT fire when IsCleanRevert=false", func(t *testing.T) {
+		// "message-only" ManualRevert that failed diff verification: the
+		// revert prefix is in the message but we never confirmed inverse.
+		// Must fall through to PR-approval path (which has no approval).
+		commit := baseCommit
+		commit.Message = `Revert "some change"` + "\n\nThis reverts commit abc123."
+		enrichment := baseEnrichment
+		enrichment.IsCleanRevert = false
+		enrichment.RevertVerification = "diff-mismatch"
+		enrichment.RevertedSHA = revertedSHA
+		result := EvaluateCommit(commit, enrichment, nil, nil, nil)
+		assert.False(t, result.IsCompliant, "message-only / diff-mismatch reverts must not auto-waive")
+	})
+
+	t.Run("R2: web-flow + verified ManualRevert is compliant", func(t *testing.T) {
+		commit := baseCommit
+		commit.Message = `Revert "feature X"` + "\n\nThis reverts commit a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2."
+		commit.CommitterLogin = "web-flow"
+		commit.IsVerified = true
+		result := EvaluateCommit(commit, baseEnrichment, nil, nil, nil)
+		assert.True(t, result.IsCompliant)
+		require.Len(t, result.Reasons, 1)
+		assert.Contains(t, result.Reasons[0], "GitHub-server revert")
+		assert.Contains(t, result.Reasons[0], "web-flow")
+		assert.Contains(t, result.Reasons[0], "a1b2c3d4e5f6")
+	})
+
+	t.Run("R2: web-flow + verified RevertOfRevert is compliant", func(t *testing.T) {
+		// "Revert \"Revert \"...\"\"" — re-apply via GitHub UI. Still a
+		// revert-kind commit, still trusted by provenance.
+		commit := baseCommit
+		commit.Message = `Revert "Revert \"feature X\""`
+		commit.CommitterLogin = "web-flow"
+		commit.IsVerified = true
+		result := EvaluateCommit(commit, baseEnrichment, nil, nil, nil)
+		assert.True(t, result.IsCompliant)
+		assert.Contains(t, result.Reasons[0], "GitHub-server revert")
+	})
+
+	t.Run("R2: missing web-flow committer does NOT waive", func(t *testing.T) {
+		commit := baseCommit
+		commit.Message = `Revert "feature X"` + "\n\nThis reverts commit abc."
+		commit.CommitterLogin = "some-human"
+		commit.IsVerified = true
+		result := EvaluateCommit(commit, baseEnrichment, nil, nil, nil)
+		assert.False(t, result.IsCompliant, "committer must be web-flow for R2")
+	})
+
+	t.Run("R2: missing verified signature does NOT waive", func(t *testing.T) {
+		commit := baseCommit
+		commit.Message = `Revert "feature X"` + "\n\nThis reverts commit abc."
+		commit.CommitterLogin = "web-flow"
+		commit.IsVerified = false
+		result := EvaluateCommit(commit, baseEnrichment, nil, nil, nil)
+		assert.False(t, result.IsCompliant, "signature verification is required for R2")
+	})
+
+	t.Run("R2: non-revert message does NOT waive even if web-flow+verified", func(t *testing.T) {
+		// Guardrail against rule #2 becoming a blanket "web-flow commits
+		// are compliant" waiver. Only revert-kind commits qualify.
+		commit := baseCommit
+		commit.Message = "Add feature Y" // not a revert
+		commit.CommitterLogin = "web-flow"
+		commit.IsVerified = true
+		result := EvaluateCommit(commit, baseEnrichment, nil, nil, nil)
+		assert.False(t, result.IsCompliant, "non-revert commits must not be waived by R2")
+	})
+
+	t.Run("no cross-commit lookup: reverts do NOT depend on prior verdicts", func(t *testing.T) {
+		// A standalone clean revert is compliant regardless of what the
+		// reverted commit looked like. This is the deferred-work boundary
+		// documented in TODO.md.
+		enrichment := baseEnrichment
+		enrichment.IsCleanRevert = true
+		enrichment.RevertVerification = "diff-verified"
+		enrichment.RevertedSHA = revertedSHA
+		// Even if the reverted commit were non-compliant, we don't know
+		// about it here — EvaluateCommit no longer accepts a priorAudit
+		// lookup. The result should still be compliant.
+		result := EvaluateCommit(baseCommit, enrichment, nil, nil, nil)
+		assert.True(t, result.IsCompliant)
+	})
+}
+
+func TestEvaluateRevertCompliance(t *testing.T) {
+	// Unit-level coverage of the waiver helper. Tests above exercise the
+	// same logic end-to-end through EvaluateCommit; these are here so a
+	// regression in the helper is pinpointed directly.
+	revertMsg := `Revert "feature X"` + "\n\nThis reverts commit a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2."
+
+	tests := []struct {
+		name       string
+		commit     model.Commit
+		enrichment model.EnrichmentResult
+		want       bool
+		reasonHint string
+	}{
+		{
+			name:       "R1 fires on IsCleanRevert=true with reverted SHA",
+			commit:     model.Commit{Message: revertMsg},
+			enrichment: model.EnrichmentResult{IsCleanRevert: true, RevertedSHA: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"},
+			want:       true,
+			reasonHint: "clean revert of",
+		},
+		{
+			name:       "R1 fires on IsCleanRevert=true without reverted SHA",
+			commit:     model.Commit{Message: "Automatic revert of abc..def"},
+			enrichment: model.EnrichmentResult{IsCleanRevert: true},
+			want:       true,
+			reasonHint: "clean revert",
+		},
+		{
+			name:       "R2 fires on revert message + web-flow + verified",
+			commit:     model.Commit{Message: revertMsg, CommitterLogin: "web-flow", IsVerified: true},
+			enrichment: model.EnrichmentResult{},
+			want:       true,
+			reasonHint: "GitHub-server revert",
+		},
+		{
+			name:       "R2 fires even when committer case differs (case-insensitive)",
+			commit:     model.Commit{Message: revertMsg, CommitterLogin: "Web-Flow", IsVerified: true},
+			enrichment: model.EnrichmentResult{},
+			want:       true,
+		},
+		{
+			name:       "no waiver: non-revert commit with web-flow + verified",
+			commit:     model.Commit{Message: "Add feature Y", CommitterLogin: "web-flow", IsVerified: true},
+			enrichment: model.EnrichmentResult{},
+			want:       false,
+		},
+		{
+			name:       "no waiver: revert message, non-web-flow committer",
+			commit:     model.Commit{Message: revertMsg, CommitterLogin: "human", IsVerified: true},
+			enrichment: model.EnrichmentResult{},
+			want:       false,
+		},
+		{
+			name:       "no waiver: revert message, web-flow, unverified",
+			commit:     model.Commit{Message: revertMsg, CommitterLogin: "web-flow", IsVerified: false},
+			enrichment: model.EnrichmentResult{},
+			want:       false,
+		},
+		{
+			name:       "no waiver: message-only ManualRevert (IsCleanRevert=false)",
+			commit:     model.Commit{Message: revertMsg},
+			enrichment: model.EnrichmentResult{IsCleanRevert: false, RevertVerification: "diff-mismatch"},
+			want:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, reason := evaluateRevertCompliance(tt.commit, tt.enrichment)
+			assert.Equal(t, tt.want, got)
+			if tt.reasonHint != "" {
+				assert.Contains(t, reason, tt.reasonHint)
+			}
+		})
+	}
 }

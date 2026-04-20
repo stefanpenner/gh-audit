@@ -5,7 +5,10 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -17,11 +20,12 @@ import (
 
 func newSyncCmd() *cobra.Command {
 	var (
-		orgs        []string
-		repos       []string
-		since       string
-		until       string
-		concurrency int
+		orgs            []string
+		repos           []string
+		since           string
+		until           string
+		concurrency     int
+		telemetryOutput string
 	)
 
 	cmd := &cobra.Command{
@@ -57,12 +61,100 @@ func newSyncCmd() *cobra.Command {
 			pipeline.SetTokenStatsFn(func() sync.TokenStatsSnapshot {
 				s := pool.Snapshot()
 				return sync.TokenStatsSnapshot{
-					Total:     s.Total,
-					Available: s.Available,
-					Remaining: s.Remaining,
-					Capacity:  s.Capacity,
+					Total:                    s.Total,
+					Available:                s.Available,
+					Remaining:                s.Remaining,
+					Capacity:                 s.Capacity,
+					SecondaryRateLimitEvents: s.SecondaryRateLimitEvents,
+					PrimaryRateLimitEvents:   s.PrimaryRateLimitEvents,
+					TokenReassigns:           s.TokenReassigns,
+					InFlight:                 s.InFlight,
 				}
 			})
+			pipeline.SetAPIStatsFn(func() sync.APIStatsSnapshot {
+				return sync.APIStatsSnapshot{
+					CommitDetail:       enricher.Stats.CommitDetail.Load(),
+					CommitPRs:          enricher.Stats.CommitPRs.Load(),
+					PRDetail:           enricher.Stats.PRDetail.Load(),
+					Reviews:            enricher.Stats.Reviews.Load(),
+					CheckRuns:          enricher.Stats.CheckRuns.Load(),
+					PRCommits:          enricher.Stats.PRCommits.Load(),
+					RevertVerification: enricher.Stats.RevertVerification.Load(),
+					CacheHits:          enricher.Stats.CacheHits.Load(),
+					DBHits:             enricher.Stats.DBHits.Load(),
+				}
+			})
+
+			// Lazy stats fetcher for the audit's empty-commit fallback. Reads
+			// the DB first (where the row may already carry additions/deletions
+			// from a prior sync) and only falls back to GetCommitDetail if both
+			// are still zero. The callback runs inside EvaluateCommit which has
+			// no ambient context; use the cobra command's context so the REST
+			// call honours SIGINT/SIGTERM.
+			ctxForFetcher := cmd.Context()
+			pipeline.SetStatsFetcher(func(org, repo, sha string) (int, int, error) {
+				if commits, err := dbConn.GetCommitsBySHA(ctxForFetcher, org, repo, []string{sha}); err == nil {
+					for _, c := range commits {
+						if c.Additions != 0 || c.Deletions != 0 {
+							enricher.Stats.DBHits.Add(1)
+							return c.Additions, c.Deletions, nil
+						}
+					}
+				}
+				enricher.Stats.CommitDetail.Add(1)
+				detail, err := client.GetCommitDetail(ctxForFetcher, org, repo, sha)
+				if err != nil {
+					return 0, 0, err
+				}
+				// Persist so a re-audit (or a sibling enrichment on the same
+				// sha) short-circuits through the DB branch above.
+				_ = dbConn.UpdateCommitStats(ctxForFetcher, org, repo, sha, detail.Additions, detail.Deletions)
+				return detail.Additions, detail.Deletions, nil
+			})
+
+			// Structured telemetry sink. Default path is `telemetry.jsonl`
+			// next to the DB so a multi-run sweep accumulates a single
+			// timeline that can be analysed with `jq` or DuckDB's
+			// `read_json_auto`. Override with --telemetry-output.
+			telemetryPath := telemetryOutput
+			if telemetryPath == "" {
+				telemetryPath = filepath.Join(filepath.Dir(resolveDBPath(cfg)), "telemetry.jsonl")
+			}
+			if telemetryPath != "-" && telemetryPath != "" {
+				tfile, ferr := os.OpenFile(telemetryPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+				if ferr != nil {
+					logger.Warn("failed to open telemetry output; continuing without JSONL sink", "path", telemetryPath, "error", ferr)
+				} else {
+					defer tfile.Close()
+					pipeline.SetTelemetryOutput(tfile)
+					logger.Info("telemetry JSONL sink enabled", "path", telemetryPath)
+				}
+			}
+
+			// SIGHUP → reload config.yaml and grow the pool with any new
+			// tokens (matched by their ID/env name). Existing tokens are
+			// untouched so their rate-limit state and cooldowns are
+			// preserved. Useful for mid-sweep token additions without
+			// restart.
+			hup := make(chan os.Signal, 1)
+			signal.Notify(hup, syscall.SIGHUP)
+			defer signal.Stop(hup)
+			go func() {
+				for range hup {
+					reloaded := loadConfigOrDefault(cfgFile)
+					added, err := addTokensFromConfig(pool, reloaded, logger)
+					if err != nil {
+						logger.Warn("SIGHUP: token reload partial failure", "error", err, "added", added)
+						continue
+					}
+					if len(added) == 0 {
+						logger.Info("SIGHUP: no new tokens to add", "pool_size", pool.Len())
+					} else {
+						logger.Info("SIGHUP: added tokens to pool", "new", added, "pool_size", pool.Len())
+					}
+				}
+			}()
+
 			if err := pipeline.Run(cmd.Context()); err != nil {
 				return err
 			}
@@ -88,6 +180,9 @@ func newSyncCmd() *cobra.Command {
 	cmd.Flags().StringVar(&since, "since", "", "sync since date (ISO 8601)")
 	cmd.Flags().StringVar(&until, "until", "", "sync until date (ISO 8601)")
 	cmd.Flags().IntVar(&concurrency, "concurrency", 0, "max concurrent repo syncs (default from config)")
+	cmd.Flags().StringVar(&telemetryOutput, "telemetry-output", "",
+		`path to append JSONL telemetry records (one line per tick). `+
+			`Default: "telemetry.jsonl" next to the DB. Use "-" to disable.`)
 
 	return cmd
 }
@@ -105,31 +200,8 @@ func loadConfigOrDefault(path string) *config.Config {
 func buildTokenPool(cfg *config.Config, logger *slog.Logger) (*ghclient.TokenPool, error) {
 	pool := ghclient.NewTokenPool(logger)
 
-	for _, tokCfg := range cfg.Tokens {
-		switch tokCfg.Kind {
-		case "pat":
-			token := os.Getenv(tokCfg.Env)
-			if token == "" {
-				continue
-			}
-			scopes := convertScopes(tokCfg.Scopes)
-			pool.AddPATToken(tokCfg.Env, token, scopes)
-		case "app":
-			var keyBytes []byte
-			var err error
-			if tokCfg.PrivateKeyPath != "" {
-				keyBytes, err = os.ReadFile(tokCfg.PrivateKeyPath)
-				if err != nil {
-					return nil, fmt.Errorf("reading private key from %s: %w", tokCfg.PrivateKeyPath, err)
-				}
-			} else {
-				keyBytes = []byte(os.Getenv(tokCfg.PrivateKeyEnv))
-			}
-			scopes := convertScopes(tokCfg.Scopes)
-			if err := pool.AddAppToken(tokCfg.Env, tokCfg.AppID, tokCfg.InstallationID, keyBytes, scopes); err != nil {
-				return nil, fmt.Errorf("adding app token %s: %w", tokCfg.Env, err)
-			}
-		}
+	if _, err := addTokensFromConfig(pool, cfg, logger); err != nil {
+		return nil, err
 	}
 
 	if pool.Len() > 0 {
@@ -143,6 +215,48 @@ func buildTokenPool(cfg *config.Config, logger *slog.Logger) (*ghclient.TokenPoo
 	}
 	pool.AddPATToken("auto", token, nil) // nil scopes = wildcard (all orgs)
 	return pool, nil
+}
+
+// addTokensFromConfig loads every token in cfg that isn't already registered
+// in pool (by ID) and returns the IDs it added. Reused by the initial build
+// and by the SIGHUP reload path so both share identical loader semantics.
+func addTokensFromConfig(pool *ghclient.TokenPool, cfg *config.Config, logger *slog.Logger) ([]string, error) {
+	var added []string
+	for _, tokCfg := range cfg.Tokens {
+		if pool.HasToken(tokCfg.Env) {
+			continue
+		}
+		switch tokCfg.Kind {
+		case "pat":
+			token := os.Getenv(tokCfg.Env)
+			if token == "" {
+				continue
+			}
+			scopes := convertScopes(tokCfg.Scopes)
+			pool.AddPATToken(tokCfg.Env, token, scopes)
+			added = append(added, tokCfg.Env)
+		case "app":
+			var keyBytes []byte
+			var err error
+			if tokCfg.PrivateKeyPath != "" {
+				keyBytes, err = os.ReadFile(tokCfg.PrivateKeyPath)
+				if err != nil {
+					return added, fmt.Errorf("reading private key from %s: %w", tokCfg.PrivateKeyPath, err)
+				}
+			} else {
+				keyBytes = []byte(os.Getenv(tokCfg.PrivateKeyEnv))
+			}
+			scopes := convertScopes(tokCfg.Scopes)
+			if err := pool.AddAppToken(tokCfg.Env, tokCfg.AppID, tokCfg.InstallationID, keyBytes, scopes); err != nil {
+				if logger != nil {
+					logger.Warn("failed to add app token; skipping", "id", tokCfg.Env, "error", err)
+				}
+				continue
+			}
+			added = append(added, tokCfg.Env)
+		}
+	}
+	return added, nil
 }
 
 // detectToken tries GH_TOKEN, GITHUB_TOKEN, then `gh auth token`.

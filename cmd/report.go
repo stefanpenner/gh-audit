@@ -26,7 +26,9 @@ func newReportCmd() *cobra.Command {
 		Use:   "report",
 		Short: "Generate audit reports",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dbConn, err := db.Open(dbPath)
+			cfg := loadConfigOrDefault(cfgFile)
+
+			dbConn, err := db.Open(resolveDBPath(cfg))
 			if err != nil {
 				return fmt.Errorf("opening database: %w", err)
 			}
@@ -67,7 +69,7 @@ func newReportCmd() *cobra.Command {
 				}
 			}
 
-			r := report.New(dbConn.DB)
+			r := report.NewWithBranches(dbConn.DB, cfg.AuditRules.AuditBranches)
 
 			switch format {
 			case "xlsx":

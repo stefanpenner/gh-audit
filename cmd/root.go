@@ -38,6 +38,8 @@ func NewRootCmd() *cobra.Command {
 	rootCmd.AddCommand(newSyncCmd())
 	rootCmd.AddCommand(newReportCmd())
 	rootCmd.AddCommand(newReAuditCmd())
+	rootCmd.AddCommand(newBackfillCmd())
+	rootCmd.AddCommand(newAnnotateCommitsCmd())
 	rootCmd.AddCommand(newConfigCmd())
 
 	return rootCmd

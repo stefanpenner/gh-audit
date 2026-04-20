@@ -659,4 +659,146 @@ func TestGetPullRequest(t *testing.T) {
 	assert.Equal(t, "mergeabc123", pr.MergeCommitSHA)
 }
 
+func TestFindMergingPR(t *testing.T) {
+	const targetSHA = "abc123def456abc123def456abc123def456abcd"
+	committedAt := time.Date(2025, 7, 10, 19, 37, 33, 0, time.UTC)
+
+	mkPR := func(num int, mergeSHA string, mergedAt, updatedAt time.Time) map[string]any {
+		return map[string]any{
+			"number":           num,
+			"title":            fmt.Sprintf("PR #%d", num),
+			"state":            "closed",
+			"merged_at":        mergedAt.UTC().Format(time.RFC3339),
+			"merge_commit_sha": mergeSHA,
+			"updated_at":       updatedAt.UTC().Format(time.RFC3339),
+			"head":             map[string]any{"sha": fmt.Sprintf("head-%d", num), "ref": "feat"},
+			"user":             map[string]any{"login": "author1"},
+			"html_url":         fmt.Sprintf("https://github.com/testorg/testrepo/pull/%d", num),
+		}
+	}
+
+	t.Run("finds PR whose merge_commit_sha matches in time window", func(t *testing.T) {
+		var calls int
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			assert.Equal(t, "closed", r.URL.Query().Get("state"))
+			assert.Equal(t, "master", r.URL.Query().Get("base"))
+			prs := []map[string]any{
+				// Decoy: merged 8 months after, wrong sha.
+				mkPR(82073, "wrong-sha", committedAt.AddDate(0, 8, 0), committedAt.AddDate(0, 8, 0)),
+				// Real merging PR.
+				mkPR(255, targetSHA, committedAt, committedAt),
+			}
+			_ = json.NewEncoder(w).Encode(prs)
+		})
+		srv := httptest.NewServer(handler)
+		defer srv.Close()
+		client := NewClient(mockTokenPool(t, srv.URL), testLogger())
+
+		pr, err := client.FindMergingPR(context.Background(), "testorg", "testrepo", targetSHA, committedAt, []string{"master"}, 7*24*time.Hour, 7*24*time.Hour)
+		require.NoError(t, err)
+		require.NotNil(t, pr)
+		assert.Equal(t, 255, pr.Number)
+		assert.Equal(t, targetSHA, pr.MergeCommitSHA)
+		assert.Equal(t, 1, calls)
+	})
+
+	t.Run("returns nil when no PR in window matches", func(t *testing.T) {
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			prs := []map[string]any{
+				mkPR(1, "other-sha-1", committedAt, committedAt),
+				mkPR(2, "other-sha-2", committedAt.Add(-time.Hour), committedAt),
+			}
+			_ = json.NewEncoder(w).Encode(prs)
+		})
+		srv := httptest.NewServer(handler)
+		defer srv.Close()
+		client := NewClient(mockTokenPool(t, srv.URL), testLogger())
+
+		pr, err := client.FindMergingPR(context.Background(), "testorg", "testrepo", targetSHA, committedAt, []string{"master"}, time.Hour, time.Hour)
+		require.NoError(t, err)
+		assert.Nil(t, pr)
+	})
+
+	t.Run("ignores PRs merged outside the window", func(t *testing.T) {
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			prs := []map[string]any{
+				// Matches SHA but merged a year before committedAt — must be filtered out.
+				mkPR(99, targetSHA, committedAt.AddDate(-1, 0, 0), committedAt.AddDate(-1, 0, 0)),
+			}
+			_ = json.NewEncoder(w).Encode(prs)
+		})
+		srv := httptest.NewServer(handler)
+		defer srv.Close()
+		client := NewClient(mockTokenPool(t, srv.URL), testLogger())
+
+		pr, err := client.FindMergingPR(context.Background(), "testorg", "testrepo", targetSHA, committedAt, []string{"master"}, 7*24*time.Hour, 7*24*time.Hour)
+		require.NoError(t, err)
+		assert.Nil(t, pr, "PR merged outside window should not match")
+	})
+
+	t.Run("case-insensitive SHA match", func(t *testing.T) {
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			prs := []map[string]any{
+				mkPR(7, "ABC123DEF456ABC123DEF456ABC123DEF456ABCD", committedAt, committedAt),
+			}
+			_ = json.NewEncoder(w).Encode(prs)
+		})
+		srv := httptest.NewServer(handler)
+		defer srv.Close()
+		client := NewClient(mockTokenPool(t, srv.URL), testLogger())
+
+		pr, err := client.FindMergingPR(context.Background(), "testorg", "testrepo", targetSHA, committedAt, []string{"master"}, time.Hour, time.Hour)
+		require.NoError(t, err)
+		require.NotNil(t, pr)
+		assert.Equal(t, 7, pr.Number)
+	})
+
+	t.Run("skips unmerged PRs", func(t *testing.T) {
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			prs := []map[string]any{
+				{
+					"number":     13,
+					"title":      "Still open",
+					"state":      "open",
+					"merged_at":  nil,
+					"updated_at": committedAt.UTC().Format(time.RFC3339),
+					"head":       map[string]any{"sha": targetSHA},
+					"html_url":   "https://github.com/testorg/testrepo/pull/13",
+				},
+			}
+			_ = json.NewEncoder(w).Encode(prs)
+		})
+		srv := httptest.NewServer(handler)
+		defer srv.Close()
+		client := NewClient(mockTokenPool(t, srv.URL), testLogger())
+
+		pr, err := client.FindMergingPR(context.Background(), "testorg", "testrepo", targetSHA, committedAt, []string{"master"}, time.Hour, time.Hour)
+		require.NoError(t, err)
+		assert.Nil(t, pr, "open PRs must not be attributed as the merging PR")
+	})
+
+	t.Run("tries each base branch in order and stops at first match", func(t *testing.T) {
+		var calls []string
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			base := r.URL.Query().Get("base")
+			calls = append(calls, base)
+			var prs []map[string]any
+			if base == "main" {
+				prs = append(prs, mkPR(5, targetSHA, committedAt, committedAt))
+			}
+			_ = json.NewEncoder(w).Encode(prs)
+		})
+		srv := httptest.NewServer(handler)
+		defer srv.Close()
+		client := NewClient(mockTokenPool(t, srv.URL), testLogger())
+
+		pr, err := client.FindMergingPR(context.Background(), "testorg", "testrepo", targetSHA, committedAt, []string{"master", "main"}, time.Hour, time.Hour)
+		require.NoError(t, err)
+		require.NotNil(t, pr)
+		assert.Equal(t, 5, pr.Number)
+		assert.Equal(t, []string{"master", "main"}, calls)
+	})
+}
+
 var _ = (*gogithub.Client)(nil)

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -15,7 +16,9 @@ import (
 
 // Reporter generates audit reports from the database.
 type Reporter struct {
-	db *sql.DB
+	db             *sql.DB
+	branchPatterns []string // user-supplied glob list; compiled into branchRegex lazily
+	branchRegex    string   // combined DuckDB regex (^…$) covering all patterns
 }
 
 // RepoFilter identifies a single org/repo pair for filtering.
@@ -47,8 +50,16 @@ type SummaryRow struct {
 	StaleApprovalCount     int     `json:"stale_approval_count"`
 	PostMergeConcernCount  int     `json:"post_merge_concern_count"`
 	CleanRevertCount       int     `json:"clean_revert_count"`
+	CleanMergeCount        int     `json:"clean_merge_count"`
 	MultiplePRCount        int     `json:"multiple_pr_count"`
 	CompliancePct          float64 `json:"compliance_pct"`
+}
+
+// An OtherPR is a PR associated with a commit other than the audited one.
+// Populated for commits with more than one associated PR.
+type OtherPR struct {
+	Number int    `json:"number"`
+	Href   string `json:"href"`
 }
 
 // DetailRow is a single commit's audit detail.
@@ -69,10 +80,16 @@ type DetailRow struct {
 	IsCleanRevert      bool      `json:"is_clean_revert"`
 	RevertVerification string    `json:"revert_verification"`
 	RevertedSHA        string    `json:"reverted_sha"`
+	IsCleanMerge       bool      `json:"is_clean_merge"`
+	MergeVerification  string    `json:"merge_verification"`
 	HasPR              bool      `json:"has_pr"`
 	PRNumber           int       `json:"pr_number"`
 	PRCount            int       `json:"pr_count"`
 	PRHref             string    `json:"pr_href"`
+	// OtherPRs lists PRs associated with the same commit other than the
+	// audited PRNumber. Empty for commits with a single PR, populated when
+	// PRCount > 1.
+	OtherPRs           []OtherPR `json:"other_prs,omitempty"`
 	MergedByLogin      string    `json:"merged_by_login"`
 	HasFinalApproval   bool      `json:"has_final_approval"`
 	ApproverLogins     string    `json:"approver_logins"`
@@ -83,11 +100,89 @@ type DetailRow struct {
 	PRCommitAuthorLogins  string `json:"pr_commit_author_logins"`
 	CommitHref            string `json:"commit_href"`
 	BranchName         string    `json:"branch_name"`
+	// Annotations is the comma-joined informational tags (automation
+	// markers, etc.). Non-compliance-bearing; reviewers filter by prefix
+	// like "automation:". See internal/sync/annotations.go.
+	Annotations        string    `json:"annotations"`
 }
 
-// New creates a new Reporter.
+// New creates a new Reporter scoped to the default audit branches
+// ("master", "main"). For a custom branch set including glob patterns, use
+// NewWithBranches.
 func New(db *sql.DB) *Reporter {
-	return &Reporter{db: db}
+	return NewWithBranches(db, nil)
+}
+
+// NewWithBranches creates a Reporter whose reports are scoped to commits
+// appearing on any branch matching one of the given glob patterns. An empty
+// or nil list falls back to the default ["master", "main"].
+func NewWithBranches(db *sql.DB, branches []string) *Reporter {
+	return &Reporter{
+		db:             db,
+		branchPatterns: branches,
+		branchRegex:    globsToRegex(branches),
+	}
+}
+
+// defaultBranchExists is a correlated subquery fragment that restricts
+// reporting to commits appearing on one of the configured audit branches.
+// Without this, re-audit (which audits every row in commits, including
+// PR-branch commits persisted during enrichment for self-approval
+// attribution) would pollute reports with thousands of rows for commits
+// that never landed on a default branch.
+//
+// Uses DuckDB's regexp_matches to match branch names against the combined
+// glob pattern passed as the second argument. The pattern is built by
+// globsToRegex from the configured list (default: master, main).
+const defaultBranchExists = ` AND EXISTS (
+	SELECT 1 FROM commit_branches cb_scope
+	WHERE cb_scope.org = a.org AND cb_scope.repo = a.repo AND cb_scope.sha = a.sha
+	  AND regexp_matches(cb_scope.branch, ?)
+)`
+
+// globsToRegex builds one anchored regex from a list of glob patterns. Each
+// glob `*` maps to `.*`, `?` to `.`, and every other regex metacharacter is
+// escaped so literal `.`, `_`, `/`, etc. in branch names match literally.
+// Example: ["master", "main", "release/*", "HF_BF_*"] →
+// ^(master|main|release/.*|HF_BF_.*)$
+//
+// Empty input returns the two-entry default "^(master|main)$".
+func globsToRegex(globs []string) string {
+	if len(globs) == 0 {
+		globs = []string{"master", "main"}
+	}
+	parts := make([]string, 0, len(globs))
+	for _, g := range globs {
+		if g == "" {
+			continue
+		}
+		parts = append(parts, globToRegex(g))
+	}
+	if len(parts) == 0 {
+		return "^(master|main)$"
+	}
+	return "^(" + strings.Join(parts, "|") + ")$"
+}
+
+// globToRegex translates a single glob pattern to a regex body (no anchors).
+// Recognised glob chars: `*` → `.*`, `?` → `.`. All other characters are
+// regex-escaped so underscores, dots, slashes, etc. match literally.
+func globToRegex(g string) string {
+	var b strings.Builder
+	for _, r := range g {
+		switch r {
+		case '*':
+			b.WriteString(".*")
+		case '?':
+			b.WriteByte('.')
+		case '.', '\\', '+', '(', ')', '[', ']', '{', '}', '|', '^', '$':
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // appendRepoFilter appends org/repo WHERE clauses to a query builder.
@@ -122,13 +217,15 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 			COUNT(*) FILTER (WHERE COALESCE(a.has_stale_approval, false) = true) AS stale_approval_count,
 			COUNT(*) FILTER (WHERE COALESCE(a.has_post_merge_concern, false) = true) AS post_merge_concern_count,
 			COUNT(*) FILTER (WHERE COALESCE(a.is_clean_revert, false) = true) AS clean_revert_count,
+			COUNT(*) FILTER (WHERE COALESCE(a.is_clean_merge, false) = true) AS clean_merge_count,
 			COUNT(*) FILTER (WHERE COALESCE(a.pr_count, 0) > 1) AS multiple_pr_count
 		FROM audit_results a
 		JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
 		WHERE 1=1
+	` + defaultBranchExists + `
 	`
 
-	args := []any{}
+	args := []any{r.branchRegex}
 	query, args = appendRepoFilter(query, args, opts)
 	if !opts.Since.IsZero() {
 		query += " AND c.committed_at >= ?"
@@ -152,7 +249,7 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 		var s SummaryRow
 		if err := rows.Scan(&s.Org, &s.Repo, &s.TotalCommits,
 			&s.CompliantCount, &s.NonCompliantCount, &s.BotCount, &s.ExemptCount, &s.EmptyCount,
-			&s.SelfApprovedCount, &s.StaleApprovalCount, &s.PostMergeConcernCount, &s.CleanRevertCount, &s.MultiplePRCount); err != nil {
+			&s.SelfApprovedCount, &s.StaleApprovalCount, &s.PostMergeConcernCount, &s.CleanRevertCount, &s.CleanMergeCount, &s.MultiplePRCount); err != nil {
 			return nil, fmt.Errorf("scan summary: %w", err)
 		}
 		if s.TotalCommits > 0 {
@@ -183,6 +280,8 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			COALESCE(a.is_clean_revert, false),
 			COALESCE(a.revert_verification, ''),
 			COALESCE(a.reverted_sha, ''),
+			COALESCE(a.is_clean_merge, false),
+			COALESCE(a.merge_verification, ''),
 			a.has_pr,
 			COALESCE(a.pr_number, 0),
 			COALESCE(a.pr_count, 0),
@@ -196,18 +295,31 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			COALESCE(a.merge_strategy, ''),
 			COALESCE(array_to_string(a.pr_commit_author_logins, ', '), ''),
 			COALESCE(a.commit_href, ''),
-			COALESCE(cb.branch, '')
+			COALESCE(cb.branch, ''),
+			COALESCE(array_to_string(a.annotations, ', '), ''),
+			COALESCE((
+				SELECT string_agg(cp.pr_number::TEXT || '|' || COALESCE(op.href, ''), ','
+					ORDER BY cp.pr_number)
+				FROM commit_prs cp
+				LEFT JOIN pull_requests op ON op.org = cp.org AND op.repo = cp.repo AND op.number = cp.pr_number
+				WHERE cp.org = a.org AND cp.repo = a.repo AND cp.sha = a.sha
+				  AND cp.pr_number != COALESCE(a.pr_number, 0)
+			), '')
 		FROM audit_results a
 		JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
 		LEFT JOIN pull_requests p ON a.org = p.org AND a.repo = p.repo AND a.pr_number = p.number
 		LEFT JOIN (
 			SELECT DISTINCT ON (org, repo, sha) org, repo, sha, branch
 			FROM commit_branches
+			WHERE regexp_matches(branch, ?)
 		) cb ON a.org = cb.org AND a.repo = cb.repo AND a.sha = cb.sha
 		WHERE 1=1
+	` + defaultBranchExists + `
 	`
 
-	args := []any{}
+	// Branch regex parameter appears twice: once for the LEFT JOIN subquery
+	// (to populate BranchName) and once for the defaultBranchExists filter.
+	args := []any{r.branchRegex, r.branchRegex}
 	query, args = appendRepoFilter(query, args, opts)
 	if !opts.Since.IsZero() {
 		query += " AND c.committed_at >= ?"
@@ -232,17 +344,22 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 	var result []DetailRow
 	for rows.Next() {
 		var d DetailRow
+		var otherPRsStr string
 		if err := rows.Scan(
 			&d.Org, &d.Repo, &d.SHA, &d.AuthorLogin, &d.CommitterLogin, &d.CommittedAt,
 			&d.Message, &d.IsBot, &d.IsExemptAuthor, &d.IsEmptyCommit, &d.IsSelfApproved,
 			&d.HasStaleApproval, &d.HasPostMergeConcern,
 			&d.IsCleanRevert, &d.RevertVerification, &d.RevertedSHA,
+			&d.IsCleanMerge, &d.MergeVerification,
 			&d.HasPR, &d.PRNumber, &d.PRCount, &d.PRHref, &d.MergedByLogin,
 			&d.HasFinalApproval, &d.ApproverLogins,
 			&d.OwnerApprovalCheck, &d.IsCompliant, &d.Reasons, &d.MergeStrategy, &d.PRCommitAuthorLogins, &d.CommitHref, &d.BranchName,
+			&d.Annotations,
+			&otherPRsStr,
 		); err != nil {
 			return nil, fmt.Errorf("scan detail: %w", err)
 		}
+		d.OtherPRs = parseOtherPRs(otherPRsStr)
 		result = append(result, d)
 	}
 	return result, rows.Err()
@@ -254,12 +371,12 @@ func (r *Reporter) FormatTable(w io.Writer, summary []SummaryRow, details []Deta
 
 	// Summary section
 	fmt.Fprintln(tw, "=== SUMMARY ===")
-	fmt.Fprintln(tw, "Org\tRepo\tTotal\tCompliant\tNon-Compliant\tCompliance %\tBots\tExempt\tEmpty\tSelf-Approved\tStale Approvals\tPost-Merge Concerns\tClean Reverts\tMultiple PRs")
+	fmt.Fprintln(tw, "Org\tRepo\tTotal\tCompliant\tNon-Compliant\tCompliance %\tBots\tExempt\tEmpty\tSelf-Approved\tStale Approvals\tPost-Merge Concerns\tClean Reverts\tClean Merges\tMultiple PRs")
 	for _, s := range summary {
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%.1f%%\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%.1f%%\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
 			s.Org, s.Repo, s.TotalCommits, s.CompliantCount, s.NonCompliantCount,
 			s.CompliancePct, s.BotCount, s.ExemptCount, s.EmptyCount, s.SelfApprovedCount,
-			s.StaleApprovalCount, s.PostMergeConcernCount, s.CleanRevertCount, s.MultiplePRCount)
+			s.StaleApprovalCount, s.PostMergeConcernCount, s.CleanRevertCount, s.CleanMergeCount, s.MultiplePRCount)
 	}
 	fmt.Fprintln(tw)
 
@@ -295,6 +412,7 @@ func (r *Reporter) FormatCSV(w io.Writer, details []DetailRow) error {
 		"Date", "Branch", "Message",
 		"Is Bot", "Is Empty",
 		"No PR", "Stale Approval", "Post-Merge Concern", "Clean Revert", "Revert Verification", "Reverted SHA",
+		"Clean Merge", "Merge Verification",
 		"Self-Approved Flag", "No Approval",
 		"Commit Link",
 	}
@@ -325,6 +443,8 @@ func (r *Reporter) FormatCSV(w io.Writer, details []DetailRow) error {
 			fmt.Sprintf("%v", d.IsCleanRevert),
 			d.RevertVerification,
 			d.RevertedSHA,
+			fmt.Sprintf("%v", d.IsCleanMerge),
+			d.MergeVerification,
 			fmt.Sprintf("%v", d.IsSelfApproved),
 			fmt.Sprintf("%v", !d.HasFinalApproval && !d.IsSelfApproved),
 			d.CommitHref,
@@ -398,9 +518,10 @@ func (r *Reporter) GetMultiplePRDetails(ctx context.Context, opts ReportOpts) ([
 		JOIN commit_prs cp ON a.org = cp.org AND a.repo = cp.repo AND a.sha = cp.sha
 		LEFT JOIN pull_requests p ON cp.org = p.org AND cp.repo = p.repo AND cp.pr_number = p.number
 		WHERE COALESCE(a.pr_count, 0) > 1
+	` + defaultBranchExists + `
 	`
 
-	args := []any{}
+	args := []any{r.branchRegex}
 	query, args = appendRepoFilter(query, args, opts)
 	if !opts.Since.IsZero() {
 		query += " AND c.committed_at >= ?"
@@ -436,6 +557,26 @@ func (r *Reporter) GetMultiplePRDetails(ctx context.Context, opts ReportOpts) ([
 		result = append(result, m)
 	}
 	return result, rows.Err()
+}
+
+// parseOtherPRs parses the string_agg payload from GetDetails into a slice of
+// OtherPR. The payload format is "num|href,num|href,..." — a href may be empty
+// when the pull_requests row has not been enriched yet.
+func parseOtherPRs(s string) []OtherPR {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	result := make([]OtherPR, 0, len(parts))
+	for _, p := range parts {
+		num, href, _ := strings.Cut(p, "|")
+		n, err := strconv.Atoi(num)
+		if err != nil {
+			continue
+		}
+		result = append(result, OtherPR{Number: n, Href: href})
+	}
+	return result
 }
 
 // truncate shortens a string to maxLen runes, adding "..." if truncated.

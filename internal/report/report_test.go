@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +121,8 @@ CREATE TABLE IF NOT EXISTS audit_results (
 	is_clean_revert      BOOLEAN DEFAULT false,
 	revert_verification  TEXT,
 	reverted_sha         TEXT,
+	is_clean_merge       BOOLEAN DEFAULT false,
+	merge_verification   TEXT,
 	approver_logins      TEXT[],
 	owner_approval_check TEXT,
 	is_compliant         BOOLEAN,
@@ -129,6 +132,7 @@ CREATE TABLE IF NOT EXISTS audit_results (
 	is_self_approved     BOOLEAN,
 	merge_strategy            TEXT,
 	pr_commit_author_logins   TEXT[],
+	annotations               TEXT[],
 	audited_at                TIMESTAMP DEFAULT current_timestamp,
 	PRIMARY KEY (org, repo, sha)
 );
@@ -208,6 +212,16 @@ func insertAuditResultFull(t *testing.T, db *sql.DB, org, repo, sha string, opts
 		fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, opts.prNumber),
 		opts.isSelfApproved)
 	require.NoError(t, err, "insert audit result")
+
+	// Default-branch membership: the report layer filters audit_results to
+	// commits on 'master' or 'main' (see defaultBranchExists). Tests that
+	// expect an audit row to be visible need a corresponding commit_branches
+	// entry. Insert one by default; tests that want to simulate a
+	// PR-branch-only commit can insert an explicit non-default branch before
+	// or after (multi-branch rows coexist).
+	_, err = db.Exec(`INSERT OR IGNORE INTO commit_branches (org, repo, sha, branch) VALUES (?, ?, ?, 'master')`,
+		org, repo, sha)
+	require.NoError(t, err, "insert commit branch (master)")
 }
 
 func insertCommitBranch(t *testing.T, db *sql.DB, org, repo, sha, branch string) {
@@ -542,7 +556,7 @@ func TestGenerateXLSXHasExpectedSheets(t *testing.T) {
 	defer xf.Close()
 
 	sheets := xf.GetSheetList()
-	expected := []string{"Summary", "All Commits", "Non-Compliant", "Exemptions", "Self-Approved", "Stale Approvals", "Post-Merge Concerns", "Clean Reverts", "Multiple PRs"}
+	expected := []string{"Summary", "All Commits", "Non-Compliant", "Exemptions", "Self-Approved", "Stale Approvals", "Post-Merge Concerns", "Clean Reverts", "Clean Merges", "Multiple PRs"}
 	require.Len(t, sheets, len(expected))
 	for i, name := range expected {
 		assert.Equal(t, name, sheets[i], "sheet %d", i)
@@ -823,4 +837,163 @@ func TestDetailRowBranchName(t *testing.T) {
 	require.NoError(t, err, "GetDetails")
 	require.Len(t, details, 1)
 	assert.Equal(t, "main", details[0].BranchName)
+}
+
+func TestGlobsToRegex(t *testing.T) {
+	cases := []struct {
+		name   string
+		globs  []string
+		want   string
+		should []string // branch names that must match
+		shouldNot []string // branch names that must not match
+	}{
+		{
+			name:  "default when empty",
+			globs: nil,
+			want:  "^(master|main)$",
+			should:    []string{"master", "main"},
+			shouldNot: []string{"develop", "release/1.0"},
+		},
+		{
+			name:  "exact names only",
+			globs: []string{"master", "trunk"},
+			want:  "^(master|trunk)$",
+			should:    []string{"master", "trunk"},
+			shouldNot: []string{"main", "mastering"},
+		},
+		{
+			name:      "release/* and HF_BF_* patterns",
+			globs:     []string{"master", "main", "release/*", "HF_BF_*"},
+			want:      `^(master|main|release/.*|HF_BF_.*)$`,
+			should:    []string{"master", "main", "release/2026-q1", "release/", "HF_BF_123", "HF_BF_"},
+			shouldNot: []string{"dev", "feature/release/x", "hf_bf_123" /* case-sensitive */},
+		},
+		{
+			name:      "both casings listed explicitly",
+			globs:     []string{"HF_BF_*", "hf_bf_*"},
+			want:      `^(HF_BF_.*|hf_bf_.*)$`,
+			should:    []string{"HF_BF_1", "hf_bf_2"},
+			shouldNot: []string{"Hf_Bf_1"},
+		},
+		{
+			name:   "underscores in pattern are literal (not LIKE wildcards)",
+			globs:  []string{"HF_BF_*"},
+			want:   `^(HF_BF_.*)$`,
+			should: []string{"HF_BF_x"},
+			// Without proper regex escaping, "HFXBFYZ" would match a LIKE
+			// pattern whose `_` is a single-char wildcard. Regex treats `_`
+			// literally, so this must not match.
+			shouldNot: []string{"HFXBFYZ"},
+		},
+		{
+			name:      "regex metacharacters escaped",
+			globs:     []string{"feature.branch", "a+b", "v1.0"},
+			want:      `^(feature\.branch|a\+b|v1\.0)$`,
+			should:    []string{"feature.branch", "a+b", "v1.0"},
+			shouldNot: []string{"featureXbranch", "ab", "v1X0"},
+		},
+		{
+			name:      "? matches single char",
+			globs:     []string{"v1.?"},
+			want:      `^(v1\..)$`,
+			should:    []string{"v1.0", "v1.9"},
+			shouldNot: []string{"v1.", "v1.10"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := globsToRegex(tc.globs)
+			assert.Equal(t, tc.want, got)
+
+			re, err := regexp.Compile(got)
+			require.NoError(t, err, "generated regex must compile")
+			for _, s := range tc.should {
+				assert.True(t, re.MatchString(s), "expected %q to match %s", s, got)
+			}
+			for _, s := range tc.shouldNot {
+				assert.False(t, re.MatchString(s), "expected %q to NOT match %s", s, got)
+			}
+		})
+	}
+}
+
+func TestReporterWithCustomBranches(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	// Insert 3 commits on different branches. Each helper call inserts a
+	// default 'master' row in commit_branches; we remove that and set the
+	// intended branch explicitly.
+	for _, c := range []struct {
+		sha, branch string
+	}{
+		{"mastercommit", "master"},
+		{"releasecommit1", "release/2026-q1"},
+		{"hotfixcommit1", "HF_BF_urgent"},
+		{"featurecommit", "feature/xyz"},
+	} {
+		insertCommit(t, db, "org", "repo", c.sha, "dev", now, 5, 2)
+		insertAuditResult(t, db, "org", "repo", c.sha, false, false, true, true, true, 1, []string{"r1"}, []string{"compliant"})
+		_, err := db.Exec(`DELETE FROM commit_branches WHERE sha=?`, c.sha)
+		require.NoError(t, err)
+		insertCommitBranch(t, db, "org", "repo", c.sha, c.branch)
+	}
+
+	// Default reporter keeps only 'master'.
+	rDefault := New(db)
+	details, err := rDefault.GetDetails(context.Background(), ReportOpts{})
+	require.NoError(t, err)
+	require.Len(t, details, 1)
+	assert.Equal(t, "mastercommit", details[0].SHA)
+
+	// Custom branch list widens the scope.
+	rCustom := NewWithBranches(db, []string{"master", "main", "release/*", "HF_BF_*"})
+	details, err = rCustom.GetDetails(context.Background(), ReportOpts{})
+	require.NoError(t, err)
+	shas := make(map[string]bool)
+	for _, d := range details {
+		shas[d.SHA] = true
+	}
+	assert.True(t, shas["mastercommit"], "master commit visible")
+	assert.True(t, shas["releasecommit1"], "release/* commit visible")
+	assert.True(t, shas["hotfixcommit1"], "HF_BF_* commit visible")
+	assert.False(t, shas["featurecommit"], "feature/xyz commit still excluded")
+}
+
+// Regression guard: re-audit can populate audit_results rows for PR-branch
+// commits that never landed on the default branch. The report layer must
+// filter those out so All Commits / Non-Compliant / Summary aren't polluted
+// with false-positive "no associated PR" rows on ephemeral feature commits.
+func TestGetDetailsFiltersPRBranchOnlyCommits(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	// Real default-branch commit: inserted by helper with branch='master'.
+	insertCommit(t, db, "org1", "repo1", "mainsha01", "dev1", now, 10, 5)
+	insertAuditResult(t, db, "org1", "repo1", "mainsha01", false, false, true, true, true, 1, []string{"r1"}, []string{"compliant"})
+
+	// PR-branch-only commit: overwrite the helper's default 'master' row by
+	// swapping to a feature branch. This simulates a re-audit that wrote an
+	// audit_results row for a commit that never reached master.
+	insertCommit(t, db, "org1", "repo1", "branchsha1", "dev2", now, 3, 2)
+	insertAuditResult(t, db, "org1", "repo1", "branchsha1", false, false, false, false, false, 0, nil, []string{"no associated pull request"})
+	_, err := db.Exec(`DELETE FROM commit_branches WHERE sha='branchsha1'`)
+	require.NoError(t, err)
+	insertCommitBranch(t, db, "org1", "repo1", "branchsha1", "feature/xyz")
+
+	r := New(db)
+
+	// GetDetails: only the master-branch commit shows up.
+	details, err := r.GetDetails(context.Background(), ReportOpts{})
+	require.NoError(t, err)
+	require.Len(t, details, 1)
+	assert.Equal(t, "mainsha01", details[0].SHA)
+
+	// GetSummary: counts only reflect the master-branch commit.
+	summary, err := r.GetSummary(context.Background(), ReportOpts{})
+	require.NoError(t, err)
+	require.Len(t, summary, 1)
+	assert.Equal(t, 1, summary[0].TotalCommits)
+	assert.Equal(t, 1, summary[0].CompliantCount)
+	assert.Equal(t, 0, summary[0].NonCompliantCount)
 }

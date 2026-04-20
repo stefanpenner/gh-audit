@@ -47,6 +47,19 @@ type OrgScope struct {
 // AuditRulesConfig controls what constitutes a compliant commit.
 type AuditRulesConfig struct {
 	RequiredChecks []CheckConfig `yaml:"required_checks"`
+	// AuditBranches is the list of branch names or glob patterns that
+	// count as part of the audited default history. Reports are scoped to
+	// commits on one of these branches; this prevents PR-branch-only
+	// commits (persisted during enrichment for self-approval attribution)
+	// from polluting raw counts after a re-audit.
+	//
+	// Supports `*` (any characters) and `?` (single character) in glob
+	// positions. Examples: "master", "main", "release/*", "HF_BF_*",
+	// "hf_bf_*". Matching is case-sensitive — list both casings if you
+	// need them.
+	//
+	// Default when unset: ["master", "main"].
+	AuditBranches []string `yaml:"audit_branches"`
 }
 
 // CheckConfig describes a required status check.
@@ -126,6 +139,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Sync.InitialLookbackDays <= 0 {
 		c.Sync.InitialLookbackDays = 90
+	}
+	if len(c.AuditRules.AuditBranches) == 0 {
+		c.AuditRules.AuditBranches = []string{"master", "main"}
 	}
 }
 
