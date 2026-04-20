@@ -6,8 +6,19 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/stefanpenner/gh-audit/internal/model"
 )
+
+// enrichCommitFanout bounds concurrent per-commit enrichments inside a single
+// EnrichCommits batch. The outer pipeline already bounds batch concurrency,
+// so this cap keeps goroutine growth linear in batch size without flooding.
+const enrichCommitFanout = 10
+
+// enrichPRFanout bounds concurrent per-PR work within a single commit's
+// enrichment (PR detail, reviews, check runs, PR commits).
+const enrichPRFanout = 5
 
 // APIStats tracks API request counts by endpoint.
 type APIStats struct {
@@ -276,67 +287,130 @@ func (ce *CachingEnricher) getPRCommits(ctx context.Context, org, repo string, p
 
 // EnrichCommits fetches enrichment data for a batch of commits, using
 // in-memory cache, reverse PR index, and DB fallback before hitting the API.
+//
+// Commits in the batch are enriched concurrently (bounded by enrichCommitFanout)
+// and PRs within a single commit are also fetched concurrently (bounded by
+// enrichPRFanout). The caching layer's mutex serializes cache map access, so
+// concurrent enrichment is safe.
 func (ce *CachingEnricher) EnrichCommits(ctx context.Context, org, repo string, shas []string) ([]model.EnrichmentResult, error) {
 	results := make([]model.EnrichmentResult, len(shas))
 
+	eg, ectx := errgroup.WithContext(ctx)
+	eg.SetLimit(enrichCommitFanout)
+
 	for i, sha := range shas {
-		ce.Stats.CommitDetail.Add(1)
-		detail, err := ce.client.GetCommitDetail(ctx, org, repo, sha)
-		if err != nil {
-			return nil, fmt.Errorf("commit %s: %w", sha[:12], err)
-		}
-
-		prs, err := ce.getPRsForCommit(ctx, org, repo, sha)
-		if err != nil {
-			return nil, fmt.Errorf("commit %s PRs: %w", sha[:12], err)
-		}
-
-		var allReviews []model.Review
-		var allCheckRuns []model.CheckRun
-		prBranchCommits := make(map[int][]model.Commit)
-		seenCheckRef := make(map[string]bool)
-
-		for j, pr := range prs {
-			fullPR, err := ce.getPR(ctx, org, repo, pr.Number)
+		eg.Go(func() error {
+			res, err := ce.enrichOneCommit(ectx, org, repo, sha)
 			if err != nil {
-				return nil, fmt.Errorf("commit %s PR #%d detail: %w", sha[:12], pr.Number, err)
+				return fmt.Errorf("commit %s: %w", sha[:12], err)
 			}
-			prs[j].MergedByLogin = fullPR.MergedByLogin
-			if fullPR.HeadSHA != "" {
-				prs[j].HeadSHA = fullPR.HeadSHA
-			}
-			prs[j].HeadBranch = fullPR.HeadBranch
-
-			reviews, err := ce.getReviews(ctx, org, repo, pr.Number)
-			if err != nil {
-				return nil, fmt.Errorf("commit %s PR #%d reviews: %w", sha[:12], pr.Number, err)
-			}
-			allReviews = append(allReviews, reviews...)
-
-			if prs[j].HeadSHA != "" && !seenCheckRef[prs[j].HeadSHA] {
-				seenCheckRef[prs[j].HeadSHA] = true
-				runs, err := ce.getCheckRuns(ctx, org, repo, prs[j].HeadSHA)
-				if err != nil {
-					return nil, fmt.Errorf("commit %s PR #%d check runs: %w", sha[:12], pr.Number, err)
-				}
-				allCheckRuns = append(allCheckRuns, runs...)
-			}
-
-			branchCommits, err := ce.getPRCommits(ctx, org, repo, pr.Number)
-			if err != nil {
-				return nil, fmt.Errorf("commit %s PR #%d pr-commits: %w", sha[:12], pr.Number, err)
-			}
-			prBranchCommits[pr.Number] = branchCommits
-		}
-
-		results[i] = model.EnrichmentResult{
-			Commit:          *detail,
-			PRs:             prs,
-			Reviews:         allReviews,
-			CheckRuns:       allCheckRuns,
-			PRBranchCommits: prBranchCommits,
-		}
+			results[i] = res
+			return nil
+		})
 	}
 
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
 	return results, nil
+}
+
+// prEnrichment holds the per-PR fetch results so the assembly loop can combine
+// them deterministically (check-run dedup preserves ordering).
+type prEnrichment struct {
+	fullPR        *model.PullRequest
+	reviews       []model.Review
+	checkRuns     []model.CheckRun
+	branchCommits []model.Commit
+}
+
+// enrichOneCommit fans out across a commit's PRs; each PR's detail, reviews,
+// check runs, and branch commits are fetched in the same goroutine so we
+// don't explode goroutine count by 4× for tiny wins.
+func (ce *CachingEnricher) enrichOneCommit(ctx context.Context, org, repo, sha string) (model.EnrichmentResult, error) {
+	ce.Stats.CommitDetail.Add(1)
+	detail, err := ce.client.GetCommitDetail(ctx, org, repo, sha)
+	if err != nil {
+		return model.EnrichmentResult{}, err
+	}
+
+	prs, err := ce.getPRsForCommit(ctx, org, repo, sha)
+	if err != nil {
+		return model.EnrichmentResult{}, fmt.Errorf("PRs: %w", err)
+	}
+
+	enrichments := make([]prEnrichment, len(prs))
+
+	eg, ectx := errgroup.WithContext(ctx)
+	eg.SetLimit(enrichPRFanout)
+
+	for j := range prs {
+		pr := prs[j]
+		eg.Go(func() error {
+			fullPR, err := ce.getPR(ectx, org, repo, pr.Number)
+			if err != nil {
+				return fmt.Errorf("PR #%d detail: %w", pr.Number, err)
+			}
+			enrichments[j].fullPR = fullPR
+
+			reviews, err := ce.getReviews(ectx, org, repo, pr.Number)
+			if err != nil {
+				return fmt.Errorf("PR #%d reviews: %w", pr.Number, err)
+			}
+			enrichments[j].reviews = reviews
+
+			headSHA := pr.HeadSHA
+			if fullPR.HeadSHA != "" {
+				headSHA = fullPR.HeadSHA
+			}
+			if headSHA != "" {
+				runs, err := ce.getCheckRuns(ectx, org, repo, headSHA)
+				if err != nil {
+					return fmt.Errorf("PR #%d check runs: %w", pr.Number, err)
+				}
+				enrichments[j].checkRuns = runs
+			}
+
+			branchCommits, err := ce.getPRCommits(ectx, org, repo, pr.Number)
+			if err != nil {
+				return fmt.Errorf("PR #%d pr-commits: %w", pr.Number, err)
+			}
+			enrichments[j].branchCommits = branchCommits
+			return nil
+		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		return model.EnrichmentResult{}, err
+	}
+
+	var allReviews []model.Review
+	var allCheckRuns []model.CheckRun
+	prBranchCommits := make(map[int][]model.Commit)
+	seenCheckRef := make(map[string]bool)
+
+	for j := range prs {
+		e := enrichments[j]
+		if e.fullPR != nil {
+			prs[j].MergedByLogin = e.fullPR.MergedByLogin
+			if e.fullPR.HeadSHA != "" {
+				prs[j].HeadSHA = e.fullPR.HeadSHA
+			}
+			prs[j].HeadBranch = e.fullPR.HeadBranch
+		}
+		allReviews = append(allReviews, e.reviews...)
+		if prs[j].HeadSHA != "" && !seenCheckRef[prs[j].HeadSHA] {
+			seenCheckRef[prs[j].HeadSHA] = true
+			allCheckRuns = append(allCheckRuns, e.checkRuns...)
+		}
+		prBranchCommits[prs[j].Number] = e.branchCommits
+	}
+
+	return model.EnrichmentResult{
+		Commit:          *detail,
+		PRs:             prs,
+		Reviews:         allReviews,
+		CheckRuns:       allCheckRuns,
+		PRBranchCommits: prBranchCommits,
+	}, nil
 }

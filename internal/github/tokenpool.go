@@ -27,6 +27,12 @@ const (
 const rateLimitThreshold = 100
 
 // ManagedToken tracks a single GitHub API token and its rate limit state.
+//
+// inFlight counts requests that have been assigned to this token by Pick but
+// whose responses have not yet returned. It is subtracted from rateRemaining
+// at selection time to prevent herding — if it were not tracked, N concurrent
+// Pick calls issued before any response lands would all see the same
+// rateRemaining and all select the same token.
 type ManagedToken struct {
 	ID            string
 	Kind          TokenKind
@@ -34,6 +40,7 @@ type ManagedToken struct {
 	rateRemaining atomic.Int64
 	rateLimit     atomic.Int64
 	rateResetAt   atomic.Int64 // unix timestamp
+	inFlight      atomic.Int64
 	scopes        []OrgScope
 	disabled      atomic.Bool
 	mu            sync.Mutex
@@ -69,6 +76,38 @@ func (p *TokenPool) Len() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return len(p.tokens)
+}
+
+// PoolSnapshot summarises the pool's current rate-limit budget.
+type PoolSnapshot struct {
+	Total     int
+	Available int
+	Remaining int64
+	Capacity  int64
+}
+
+// Snapshot returns a point-in-time view of remaining rate-limit budget
+// across all tokens. Intended for lightweight telemetry (called every ~30s).
+func (p *TokenPool) Snapshot() PoolSnapshot {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	var s PoolSnapshot
+	s.Total = len(p.tokens)
+	now := time.Now().Unix()
+	for _, t := range p.tokens {
+		if t.disabled.Load() {
+			continue
+		}
+		remaining := t.rateRemaining.Load()
+		s.Remaining += remaining
+		s.Capacity += t.rateLimit.Load()
+		resetAt := t.rateResetAt.Load()
+		if remaining >= rateLimitThreshold || resetAt <= now {
+			s.Available++
+		}
+	}
+	return s
 }
 
 // bearerTransport adds a Bearer authorization header to every request.
@@ -190,12 +229,18 @@ func (p *TokenPool) Pick(ctx context.Context, org, repo string) (*http.Client, e
 
 // tryPick attempts to select a token. Returns (client, zero, nil) on success,
 // (nil, resetTime, nil) if all exhausted, or (nil, zero, err) on hard failure.
+//
+// Selection scores each eligible token by (rateRemaining - inFlight) and picks
+// the highest. Including inFlight prevents herding: if N Pick calls fire
+// concurrently before any response returns, each call increments the chosen
+// token's inFlight so subsequent peers see a reduced score for it and spread
+// across the pool.
 func (p *TokenPool) tryPick(org, repo string) (*http.Client, time.Time, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	var best *ManagedToken
-	var bestRemaining int64 = -1
+	var bestScore int64 = -1
 	var earliestReset time.Time
 	found := false
 
@@ -222,9 +267,10 @@ func (p *TokenPool) tryPick(org, repo string) (*http.Client, time.Time, error) {
 			continue
 		}
 
-		if remaining > bestRemaining {
+		score := remaining - t.inFlight.Load()
+		if score > bestScore {
 			best = t
-			bestRemaining = remaining
+			bestScore = score
 		}
 	}
 
@@ -236,6 +282,10 @@ func (p *TokenPool) tryPick(org, repo string) (*http.Client, time.Time, error) {
 		// All tokens exhausted.
 		return nil, earliestReset, nil
 	}
+
+	// Reserve this request so concurrent Pick callers see reduced headroom on
+	// this token. The transport decrements on RoundTrip completion.
+	best.inFlight.Add(1)
 
 	client := &http.Client{
 		Transport: &rateLimitTransport{
@@ -271,6 +321,8 @@ type rateLimitTransport struct {
 }
 
 func (t *rateLimitTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	defer t.token.inFlight.Add(-1)
+
 	resp, err := t.base.RoundTrip(req)
 	if err != nil {
 		return nil, err

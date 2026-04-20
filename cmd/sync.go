@@ -54,6 +54,15 @@ func newSyncCmd() *cobra.Command {
 			client := ghclient.NewClient(pool, logger)
 			enricher := ghclient.NewCachingEnricher(client, dbConn)
 			pipeline := sync.NewPipeline(client, enricher, dbConn, syncCfg, logger)
+			pipeline.SetTokenStatsFn(func() sync.TokenStatsSnapshot {
+				s := pool.Snapshot()
+				return sync.TokenStatsSnapshot{
+					Total:     s.Total,
+					Available: s.Available,
+					Remaining: s.Remaining,
+					Capacity:  s.Capacity,
+				}
+			})
 			if err := pipeline.Run(cmd.Context()); err != nil {
 				return err
 			}

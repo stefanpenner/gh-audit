@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -62,14 +63,31 @@ type OrgConfig struct {
 	Branches     []string // branch names to audit; empty = default branch only
 }
 
+// TokenStatsSnapshot describes the current budget state of the token pool.
+// A zero-value snapshot means the pool is unknown (telemetry will skip the
+// token section).
+type TokenStatsSnapshot struct {
+	Total     int   // total tokens registered
+	Available int   // tokens not currently rate-limited
+	Remaining int64 // sum of remaining requests across all tokens
+	Capacity  int64 // sum of each token's advertised limit
+}
+
+// TokenStatsFn returns the pool's current stats. Pipeline uses it for
+// periodic telemetry. Optional; nil disables token-pool reporting.
+type TokenStatsFn func() TokenStatsSnapshot
+
 // Pipeline orchestrates the sync of GitHub data into the local database.
 type Pipeline struct {
-	source     GitHubSource
-	enricher   Enricher
-	store      Store
-	config     *SyncConfig
-	logger     *slog.Logger
-	onProgress ProgressCallback
+	source         GitHubSource
+	enricher       Enricher
+	store          Store
+	config         *SyncConfig
+	logger         *slog.Logger
+	onProgress     ProgressCallback
+	tokenStats     TokenStatsFn
+	commitsSynced  atomic.Int64
+	commitsAudited atomic.Int64
 }
 
 // NewPipeline creates a new sync pipeline.
@@ -91,6 +109,84 @@ func (p *Pipeline) SetProgressCallback(cb ProgressCallback) {
 	p.onProgress = cb
 }
 
+// SetTokenStatsFn wires a token-pool snapshot source so the pipeline can log
+// rate-limit headroom periodically. Optional.
+func (p *Pipeline) SetTokenStatsFn(fn TokenStatsFn) {
+	p.tokenStats = fn
+}
+
+// runTelemetry emits throughput and token-pool headroom periodically until
+// the pipeline finishes. Always emits a final line on shutdown so even short
+// syncs leave a record. Safe no-op if the context cancels first.
+func (p *Pipeline) runTelemetry(ctx context.Context, done <-chan struct{}) {
+	const interval = 10 * time.Second
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	start := time.Now()
+	var lastSynced, lastAudited int64
+	lastTick := start
+
+	emit := func(now time.Time, final bool) {
+		synced := p.commitsSynced.Load()
+		audited := p.commitsAudited.Load()
+		windowSec := now.Sub(lastTick).Seconds()
+		if windowSec <= 0 {
+			windowSec = 1
+		}
+		elapsedSec := now.Sub(start).Seconds()
+		if elapsedSec <= 0 {
+			elapsedSec = 1
+		}
+
+		attrs := []any{
+			"elapsed", time.Duration(elapsedSec * float64(time.Second)).Round(time.Second),
+			"commits_synced", synced,
+			"commits_audited", audited,
+			"sync_rate_recent", fmt.Sprintf("%.1f/s", float64(synced-lastSynced)/windowSec),
+			"audit_rate_recent", fmt.Sprintf("%.1f/s", float64(audited-lastAudited)/windowSec),
+			"sync_rate_total", fmt.Sprintf("%.1f/s", float64(synced)/elapsedSec),
+			"audit_rate_total", fmt.Sprintf("%.1f/s", float64(audited)/elapsedSec),
+		}
+		if p.tokenStats != nil {
+			s := p.tokenStats()
+			if s.Total > 0 {
+				used := s.Capacity - s.Remaining
+				pct := 0.0
+				if s.Capacity > 0 {
+					pct = 100.0 * float64(used) / float64(s.Capacity)
+				}
+				attrs = append(attrs,
+					"tokens_available", fmt.Sprintf("%d/%d", s.Available, s.Total),
+					"api_budget_used_pct", fmt.Sprintf("%.1f%%", pct),
+					"api_budget_remaining", s.Remaining,
+					"api_budget_capacity", s.Capacity,
+				)
+			}
+		}
+		msg := "telemetry"
+		if final {
+			msg = "telemetry_final"
+		}
+		p.logger.Info(msg, attrs...)
+		lastSynced, lastAudited = synced, audited
+		lastTick = now
+	}
+
+	for {
+		select {
+		case <-done:
+			emit(time.Now(), true)
+			return
+		case <-ctx.Done():
+			emit(time.Now(), true)
+			return
+		case now := <-t.C:
+			emit(now, false)
+		}
+	}
+}
+
 func (p *Pipeline) reportProgress(prog RepoProgress) {
 	if p.onProgress != nil {
 		p.onProgress(prog)
@@ -105,23 +201,52 @@ type repoWithOrg struct {
 }
 
 // Run executes the full sync pipeline across all configured orgs.
+// resolveExplicitRepos fans out GetRepo across the explicit repo list so the
+// bootstrap for a large sweep (hundreds of --repo flags) doesn't serialize
+// hundreds of API calls. First error short-circuits via errgroup cancellation.
+func (p *Pipeline) resolveExplicitRepos(ctx context.Context, orgCfg OrgConfig, concurrency int) ([]repoWithOrg, error) {
+	resolved := make([]repoWithOrg, len(orgCfg.Repos))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(concurrency)
+	for i, repoName := range orgCfg.Repos {
+		g.Go(func() error {
+			info, err := p.source.GetRepo(gctx, orgCfg.Name, repoName)
+			if err != nil {
+				return fmt.Errorf("fetching repo %s/%s: %w", orgCfg.Name, repoName, err)
+			}
+			resolved[i] = repoWithOrg{repo: info, orgCfg: orgCfg}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return resolved, nil
+}
+
 func (p *Pipeline) Run(ctx context.Context) error {
+	concurrency := p.config.Concurrency
+	if concurrency <= 0 {
+		concurrency = 32
+	}
+
 	var allRepos []repoWithOrg
 
 	for _, orgCfg := range p.config.Orgs {
 		if len(orgCfg.Repos) > 0 {
-			// Explicit repos: fetch metadata from API for each.
-			for _, repoName := range orgCfg.Repos {
-				info, err := p.source.GetRepo(ctx, orgCfg.Name, repoName)
-				if err != nil {
-					return fmt.Errorf("fetching repo %s/%s: %w", orgCfg.Name, repoName, err)
-				}
-				allRepos = append(allRepos, repoWithOrg{
-					repo:   info,
-					orgCfg: orgCfg,
-				})
+			// Explicit repos: fan out GetRepo in parallel so bootstrap on
+			// large repo lists (hundreds+) isn't a serial API stall.
+			resolveStart := time.Now()
+			resolved, err := p.resolveExplicitRepos(ctx, orgCfg, concurrency)
+			if err != nil {
+				return err
 			}
-			p.logger.Info("using explicit repos", "org", orgCfg.Name, "count", len(orgCfg.Repos))
+			allRepos = append(allRepos, resolved...)
+			p.logger.Info("using explicit repos",
+				"org", orgCfg.Name,
+				"count", len(orgCfg.Repos),
+				"resolve_duration", time.Since(resolveStart).Round(time.Millisecond),
+			)
 			continue
 		}
 
@@ -137,28 +262,38 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		}
 	}
 
-	concurrency := p.config.Concurrency
-	if concurrency <= 0 {
-		concurrency = 10
-	}
-
 	writer := NewDBWriter(concurrency * 2)
 	defer writer.Close()
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(concurrency)
 
+	// Start periodic telemetry (throughput + token-pool headroom). Stops when
+	// the sync finishes.
+	telemDone := make(chan struct{})
+	go p.runTelemetry(gctx, telemDone)
+
 	for _, rwo := range allRepos {
 		g.Go(func() error {
 			if err := p.syncRepo(gctx, rwo.repo, rwo.orgCfg, writer); err != nil {
-				p.logger.Error("sync repo failed", "org", rwo.repo.Org, "repo", rwo.repo.Name, "error", err)
+				// Filter cascade noise: if the group was already canceled by a
+				// peer's real failure, this goroutine's ctx-canceled error is
+				// downstream noise, not a new failure. Log at DEBUG so it's
+				// still available but doesn't obscure the root cause.
+				if errors.Is(err, context.Canceled) && gctx.Err() != nil {
+					p.logger.Debug("sync repo aborted (cascade)", "org", rwo.repo.Org, "repo", rwo.repo.Name)
+				} else {
+					p.logger.Error("sync repo failed", "org", rwo.repo.Org, "repo", rwo.repo.Name, "error", err)
+				}
 				return err
 			}
 			return nil
 		})
 	}
 
-	return g.Wait()
+	err := g.Wait()
+	close(telemDone)
+	return err
 }
 
 func (p *Pipeline) syncRepo(ctx context.Context, repo model.RepoInfo, orgCfg OrgConfig, writer *DBWriter) error {
@@ -170,7 +305,11 @@ func (p *Pipeline) syncRepo(ctx context.Context, repo model.RepoInfo, orgCfg Org
 	var errs []error
 	for _, branch := range branches {
 		if err := p.syncRepoBranch(ctx, repo, branch, writer); err != nil {
-			p.logger.Error("sync branch failed", "org", repo.Org, "repo", repo.Name, "branch", branch, "error", err)
+			if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+				p.logger.Debug("sync branch aborted (cascade)", "org", repo.Org, "repo", repo.Name, "branch", branch)
+			} else {
+				p.logger.Error("sync branch failed", "org", repo.Org, "repo", repo.Name, "branch", branch, "error", err)
+			}
 			errs = append(errs, err)
 		}
 	}
@@ -228,6 +367,7 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 	}); err != nil {
 		return fmt.Errorf("upserting commits: %w", err)
 	}
+	p.commitsSynced.Add(int64(len(commits)))
 
 	shas := make([]string, len(commits))
 	for i, c := range commits {
@@ -289,6 +429,7 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 	}); err != nil {
 		return fmt.Errorf("upserting audit results: %w", err)
 	}
+	p.commitsAudited.Add(int64(len(auditResults)))
 
 	// Update sync cursor to latest commit date
 	var latestDate time.Time
@@ -318,7 +459,20 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 	prog.DoneAt = time.Now()
 	p.reportProgress(prog)
 
-	p.logger.Info("sync repo branch done", "org", repo.Org, "repo", repo.Name, "branch", branch, "commits", len(commits), "audited", len(auditResults))
+	doneAttrs := []any{
+		"org", repo.Org, "repo", repo.Name, "branch", branch,
+		"commits", len(commits), "audited", len(auditResults),
+	}
+	if p.tokenStats != nil {
+		s := p.tokenStats()
+		if s.Total > 0 {
+			doneAttrs = append(doneAttrs,
+				"tokens_available", fmt.Sprintf("%d/%d", s.Available, s.Total),
+				"api_budget_remaining", s.Remaining,
+			)
+		}
+	}
+	p.logger.Info("sync repo branch done", doneAttrs...)
 	return nil
 }
 
@@ -335,7 +489,7 @@ func (p *Pipeline) enrichInParallel(ctx context.Context, repo model.RepoInfo, br
 
 	enrichConc := p.config.EnrichConcurrency
 	if enrichConc <= 0 {
-		enrichConc = 4
+		enrichConc = 16
 	}
 
 	eg, ectx := errgroup.WithContext(ctx)

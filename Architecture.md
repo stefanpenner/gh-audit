@@ -233,7 +233,7 @@ commit SHA
          → check name, conclusion
 ```
 
-Enrichment runs in parallel batches (25 commits/batch, bounded by `enrich_concurrency`). All REST endpoints are fully paginated — no silent truncation.
+Enrichment runs in parallel batches (25 commits/batch, bounded by `enrich_concurrency`). Inside a batch, commits are enriched concurrently (bounded by `enrichCommitFanout`, default 10), and PRs within a single commit are fetched concurrently as well (bounded by `enrichPRFanout`, default 5). All REST endpoints are fully paginated — no silent truncation.
 
 Results are deduplicated by primary key before writing:
 
@@ -299,7 +299,7 @@ Classic PAT: the `repo` scope covers all of the above. Fine-grained PAT or GitHu
 ### Rate limit handling
 
 - Tracks `x-ratelimit-remaining` and `x-ratelimit-reset` from response headers
-- Routes each request to the scoped token with the most remaining quota
+- Scores each token by `rateRemaining - inFlight` and picks the highest; the in-flight counter prevents concurrent `Pick` calls from herding onto a single token before any response has landed
 - Blocks and waits for reset when all matching tokens are exhausted (threshold: 100 remaining)
 - Retries on 429 (respects `Retry-After`, defaults to 60s)
 - Detects 403 abuse/secondary rate limit responses
@@ -347,8 +347,8 @@ internal/
 
 ## Concurrency model
 
-- **Repo sync**: `concurrency` goroutines via `errgroup` (default 10)
-- **Enrichment**: `enrich_concurrency` goroutines per repo (default 4)
+- **Repo sync**: `concurrency` goroutines via `errgroup` (default 32)
+- **Enrichment**: `enrich_concurrency` batch goroutines per repo (default 16); each batch additionally fans out across commits (≤10) and PRs (≤5)
 - **DB writes**: Single `DBWriter` goroutine per pipeline run — all writes serialized through a buffered channel
 - **DB reads**: Safe to run concurrently (DuckDB MVCC)
 

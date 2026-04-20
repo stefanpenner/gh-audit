@@ -119,10 +119,10 @@ func (c *Config) applyDefaults() {
 		c.Database = DefaultDBPath()
 	}
 	if c.Sync.Concurrency <= 0 {
-		c.Sync.Concurrency = 10
+		c.Sync.Concurrency = 32
 	}
 	if c.Sync.EnrichConcurrency <= 0 {
-		c.Sync.EnrichConcurrency = 4
+		c.Sync.EnrichConcurrency = 16
 	}
 	if c.Sync.InitialLookbackDays <= 0 {
 		c.Sync.InitialLookbackDays = 90

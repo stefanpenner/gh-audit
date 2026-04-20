@@ -202,7 +202,8 @@ tokens:
 
 			if tt.name == "default values applied correctly" {
 				assert.Equal(t, DefaultDBPath(), cfg.Database)
-				assert.Equal(t, 10, cfg.Sync.Concurrency)
+				assert.Equal(t, 32, cfg.Sync.Concurrency)
+				assert.Equal(t, 16, cfg.Sync.EnrichConcurrency)
 				assert.Equal(t, 90, cfg.Sync.InitialLookbackDays)
 			}
 		})
