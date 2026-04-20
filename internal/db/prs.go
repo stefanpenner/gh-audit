@@ -28,7 +28,7 @@ func (d *DB) UpsertPullRequests(ctx context.Context, prs []model.PullRequest) er
 		}
 	}
 
-	return d.bulkUpsert(ctx, "pull_requests", prColumns, rows)
+	return d.bulkUpsert(ctx, "pull_requests", prColumns, []string{"org", "repo", "number"}, rows)
 }
 
 var reviewColumns = []string{
@@ -51,7 +51,7 @@ func (d *DB) UpsertReviews(ctx context.Context, reviews []model.Review) error {
 		}
 	}
 
-	return d.bulkUpsert(ctx, "reviews", reviewColumns, rows)
+	return d.bulkUpsert(ctx, "reviews", reviewColumns, []string{"org", "repo", "pr_number", "review_id"}, rows)
 }
 
 var checkRunColumns = []string{
@@ -74,7 +74,7 @@ func (d *DB) UpsertCheckRuns(ctx context.Context, checkRuns []model.CheckRun) er
 		}
 	}
 
-	return d.bulkUpsert(ctx, "check_runs", checkRunColumns, rows)
+	return d.bulkUpsert(ctx, "check_runs", checkRunColumns, []string{"org", "repo", "commit_sha", "check_run_id"}, rows)
 }
 
 var commitPRColumns = []string{"org", "repo", "sha", "pr_number"}
@@ -90,7 +90,7 @@ func (d *DB) UpsertCommitPRs(ctx context.Context, org, repo, sha string, prNumbe
 		rows[i] = []driver.Value{org, repo, sha, n}
 	}
 
-	return d.bulkUpsert(ctx, "commit_prs", commitPRColumns, rows)
+	return d.bulkUpsert(ctx, "commit_prs", commitPRColumns, []string{"org", "repo", "sha", "pr_number"}, rows)
 }
 
 // GetPRsForCommit retrieves pull requests associated with a commit via commit_prs.

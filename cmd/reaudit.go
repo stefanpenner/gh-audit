@@ -16,7 +16,10 @@ func newReAuditCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "re-audit",
 		Short: "Re-evaluate audit results using existing enrichment data",
-		Long:  "Re-runs the audit decision tree on all commits without fetching from GitHub. Use after updating audit logic.",
+		Long: "Re-runs the audit decision tree on all commits without fetching from GitHub. Use after updating audit logic.\n\n" +
+			"Note: re-audit cannot populate clean-revert verification. The diff-inverse check for manual reverts\n" +
+			"requires fetching the reverted commit's files from GitHub, which re-audit skips. Run a fresh sync to\n" +
+			"get up-to-date IsCleanRevert / RevertVerification / RevertedSHA values.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := loadConfigOrDefault(cfgFile)
 

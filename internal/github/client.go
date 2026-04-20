@@ -207,6 +207,33 @@ func (c *Client) GetCommitDetail(ctx context.Context, org, repo, sha string) (*m
 	return commit, nil
 }
 
+// GetCommitFiles fetches the per-file patch list for a commit. Used by
+// clean-revert verification to compare the revert's diff against the
+// diff of the commit it claims to revert.
+func (c *Client) GetCommitFiles(ctx context.Context, org, repo, sha string) ([]model.FileDiff, error) {
+	gh, err := c.ghClient(ctx, org, repo)
+	if err != nil {
+		return nil, err
+	}
+
+	rc, _, err := gh.Repositories.GetCommit(ctx, org, repo, sha, nil)
+	if err != nil {
+		return nil, fmt.Errorf("getting commit files %s/%s@%s: %w", org, repo, sha, err)
+	}
+
+	files := make([]model.FileDiff, 0, len(rc.Files))
+	for _, f := range rc.Files {
+		files = append(files, model.FileDiff{
+			Filename:  f.GetFilename(),
+			Status:    f.GetStatus(),
+			Additions: f.GetAdditions(),
+			Deletions: f.GetDeletions(),
+			Patch:     f.GetPatch(),
+		})
+	}
+	return files, nil
+}
+
 // ListCommitPullRequests returns merged PRs associated with a commit.
 func (c *Client) ListCommitPullRequests(ctx context.Context, org, repo, sha string) ([]model.PullRequest, error) {
 	var allPRs []model.PullRequest

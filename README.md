@@ -4,14 +4,40 @@ Proof of Concept: GitHub commit compliance auditor. Verifies that every commit o
 
 ## What it checks
 
-For every commit on configured branches:
+For every commit on configured branches, in this order:
 
-1. **Has an associated merged PR** -- direct pushes are flagged
-2. **Approved on the final commit** -- stale approvals (before force-push) don't count
-3. **Not self-approved** -- reviewer must not be the PR author, commit author, committer, or co-author
-4. **Required checks passed** -- e.g. "Owner Approval" check ran successfully on the PR's head commit
-5. **Bot exemptions** -- configurable list of bot accounts that skip review requirements
-6. **Empty commits** -- flagged but not counted as violations
+1. **Author exemption** -- if the commit's author is in the exempt list **and** every PR-branch contributor is also exempt (no human code in the squash), the commit short-circuits to compliant. See [Exempt authors](#exempt-authors).
+2. **Empty commits** (0 additions / 0 deletions) -- short-circuit to compliant.
+3. **Has an associated merged PR** -- direct pushes are flagged.
+4. **Approved on the final commit at merge time** -- stale approvals (on an earlier force-pushed commit) don't count. Reviews submitted after `pr.merged_at` are excluded (see [Point-in-time compliance](#point-in-time-compliance)).
+5. **Not self-approved** -- reviewer must not be the PR author, commit author, committer, or co-author.
+6. **Required checks passed** -- e.g. "Owner Approval" check ran successfully on the PR's head commit.
+
+### Informational signals (do not change `IsCompliant`)
+
+These flags are recorded on every audit result for separate triage — they surface governance-relevant events that reviewers may want to look at, but the compliance gate remains peer review + required checks.
+
+- **`HasPostMergeConcern`** — a reviewer submitted a `CHANGES_REQUESTED` or `DISMISSED` review **after** the PR merged. The merge itself was compliant at the time; this captures the later concern so it isn't lost. See the `Post-Merge Concerns` XLSX sheet.
+- **`IsCleanRevert` + `RevertVerification`** — classifies a commit that undoes a prior commit. Compliance policy for clean reverts is not yet codified, so they are surfaced without affecting `IsCompliant`. Verification values:
+  - `none` — not a revert
+  - `message-only` — bot auto-revert (`Automatic revert of <sha>..<sha>`), trusted clean by pattern; or a manual revert whose referenced commit could not be fetched
+  - `diff-verified` — manual revert whose per-file patches are the exact inverse of the referenced commit's patches
+  - `diff-mismatch` — manual revert that partially or incorrectly reverses the referenced commit (intervening edits, conflict resolutions, partial revert)
+
+  Auto-reverts and diff-verified manual reverts set `IsCleanRevert = true`. See the `Clean Reverts` XLSX sheet.
+
+### Exempt authors
+
+The `exemptions.authors` config is a list of exact login matches (case-insensitive) that short-circuit the compliance check — **but only when every PR-branch contributor is also exempt**. This matches "bot-merged, no human code" semantics: if a service-account autobot (e.g., translation updater, dep upgrader, auto-revert) authors and merges a PR where every commit on the branch is by the same or another exempt author, no human review is required.
+
+If even a single PR-branch commit is by a non-exempt contributor, the exempt shortcut does **not** fire and the commit falls through to the normal peer-review check. This protects against an exempt author squashing in human code unnoticed.
+
+### Point-in-time compliance
+
+Review states are evaluated **at merge time**, not at query time. Reviews submitted after `pr.merged_at` are excluded from the `has_approval_on_final_commit` decision. This means:
+
+- A reviewer who approves before merge and then flips to `CHANGES_REQUESTED` afterward does **not** retroactively invalidate the merge — the merge is compliant at the time it happened, and the post-merge flip surfaces as `HasPostMergeConcern`.
+- A **retroactive approval** (reviewer APPROVEs a PR days or weeks after it was already merged) is **not** counted as an at-merge approval. gh-audit flags these as non-compliant even though the PR looks "approved" in the current UI.
 
 ## Install
 
@@ -35,38 +61,62 @@ gh-audit sync --repo my-org/my-repo --since 2026-01-01 --until 2026-04-01
 
 # Generate a report
 gh-audit report --only-failures
+
+# Re-evaluate audit results after updating config/rules (no API calls)
+gh-audit re-audit
+
+# Validate your config file
+gh-audit config validate
+
+# Show resolved config
+gh-audit config show
 ```
 
 Token is auto-detected from: `GH_TOKEN` env, `GITHUB_TOKEN` env, then `gh auth token`.
 
 ## How the audit trace works
 
-For each commit on a branch, gh-audit follows a four-step REST API trace to collect the evidence needed for a compliance decision:
+For each commit on a branch, gh-audit runs a REST trace to collect the evidence needed for a compliance decision and the informational signals (post-merge concern, clean revert):
 
 ```
 commit (SHA)
   |
   +-- GET /repos/{owner}/{repo}/commits/{sha}
-  |     -> additions, deletions (empty commit detection)
+  |     -> additions, deletions, commit message, files/patches
+  |     -> empty-commit detection
+  |     -> revert classification (see below)
   |
   +-- GET /repos/{owner}/{repo}/commits/{sha}/pulls
-  |     -> associated merged PRs (number, author, head SHA, merge commit SHA)
+  |     -> associated merged PRs (number, author, head SHA, merge commit SHA, merged_at)
   |
   +-- for each merged PR:
   |     |
+  |     +-- GET /repos/{owner}/{repo}/pulls/{number}        (PR detail)
   |     +-- GET /repos/{owner}/{repo}/pulls/{number}/reviews
-  |     |     -> reviewer login, state (APPROVED/DISMISSED/...), commit ID
-  |     |     -> only reviews on the PR's head SHA count (stale approval protection)
+  |     |     -> reviewer login, state (APPROVED/DISMISSED/CHANGES_REQUESTED/COMMENTED), commit ID, submitted_at
+  |     |     -> only reviews on the PR's head SHA count (stale-approval protection)
+  |     |     -> only reviews submitted before pr.merged_at count (point-in-time)
+  |     |     -> post-merge CHANGES_REQUESTED / DISMISSED -> HasPostMergeConcern
   |     |
   |     +-- GET /repos/{owner}/{repo}/commits/{head_sha}/check-runs
-  |           -> check name, conclusion (success/failure/...)
-  |           -> matched against configured required checks
+  |     |     -> check name, conclusion (success/failure/...)
+  |     |     -> matched against configured required checks
+  |     |
+  |     +-- GET /repos/{owner}/{repo}/pulls/{number}/commits
+  |           -> PR-branch commit authors (for exempt-author short-circuit + self-approval detection)
+  |
+  +-- if commit message classifies as a manual revert:
+  |     +-- GET /repos/{owner}/{repo}/commits/{sha}              (revert's own files)
+  |     +-- GET /repos/{owner}/{repo}/commits/{reverted_sha}     (reverted commit's files)
+  |           -> compare patches file-by-file; set RevertVerification (diff-verified / diff-mismatch)
   |
   +-- compliance decision:
-        has_pr?  ->  has_approval_on_final_commit?  ->  required_checks_passed?
-           |                    |                              |
-           no: FAIL            no: FAIL                       no: FAIL
-           yes: continue       yes: continue                  yes: COMPLIANT
+        is_exempt?  -> COMPLIANT (short-circuit) if all PR-branch authors are exempt too
+        is_empty?   -> COMPLIANT (short-circuit) -- 0 additions, 0 deletions
+        has_pr?                       -> no: FAIL
+        has_approval_on_final_commit? -> no: FAIL (stale or absent approval)
+        required_checks_passed?       -> no: FAIL
+        yes to all                    -> COMPLIANT
 ```
 
 Every REST endpoint is fully paginated. No data is silently truncated -- if a pagination boundary is hit, all pages are fetched.
@@ -89,6 +139,25 @@ A review is considered self-approval if the reviewer matches any of:
 - Co-authors (from `Co-authored-by` trailers)
 
 If the only approvals are self-approvals, the commit is non-compliant.
+
+### Revert classification
+
+A commit is classified into one of five revert categories from its message, and (for manual reverts) verified by comparing diffs:
+
+| Message pattern | Category | Verification | `IsCleanRevert` |
+|---|---|---|---|
+| Anything else | `none` | — | false |
+| `Automatic revert of <new>..<old>` (bot-generated) | auto-revert | `message-only` — trusted by construction | **true** |
+| `Revert "…"` + `This reverts commit <sha>` body, diffs are exact inverses | manual revert | `diff-verified` | **true** |
+| `Revert "…"` + referenced commit exists, diffs do **not** match inversely | manual revert | `diff-mismatch` (intervening edits / partial revert / conflict resolution) | false |
+| `Revert "…"` + referenced commit can't be fetched or parsed | manual revert | `message-only` (fallback) | false |
+| `Revert "Revert "…"` or `Revert "Automatic revert of …"` | revert-of-revert (re-apply) | `none` | false |
+
+The diff-inverse check treats `+` lines and `-` lines as multisets per file. `+++` / `---` file headers and `@@` hunk markers are stripped before comparison. For every filename touched by the revert, the added lines must equal the reverted commit's deleted lines (multiset), and vice versa.
+
+**Why not verify bot reverts?** An auto-revert bot emits clean reverts by construction — its whole job is to produce a pure inverse. Skipping diff verification for auto-reverts keeps the API cost at zero for the common case; manual reverts still pay 2 extra REST calls for their verification.
+
+**Compliance is not affected by revert status.** Clean reverts still go through the normal PR + approval + required-check evaluation. The `IsCleanRevert` / `RevertVerification` fields exist so reviewers can triage reverts separately from novel code in the `Clean Reverts` XLSX sheet.
 
 ## Config file (optional)
 
@@ -116,8 +185,32 @@ sync:
 
 exemptions:
   authors:
+    # [bot] accounts
     - "dependabot[bot]"
     - "renovate[bot]"
+    - "li-auto-merge[bot]"
+    # Automation accounts — match on the full login GitHub returns (e.g. in
+    # GHES enterprise deployments these often carry an org/domain suffix).
+    - "bot-translation"
+    - "bot-i18n-github_LinkedIn"
+```
+
+The exempt shortcut only fires when every PR-branch commit author is also in this list. See [Exempt authors](#exempt-authors).
+
+## Re-audit
+
+`gh-audit re-audit` re-runs the audit decision tree on every commit in the database without making any GitHub API calls. It uses the enrichment data (PRs, reviews, check runs) already stored from a previous sync.
+
+Use this after changing audit rules (e.g. adding a required check) or exempt authors in your config -- no need to re-fetch everything from GitHub.
+
+## Config management
+
+```bash
+# Check that your config file is valid YAML with correct structure
+gh-audit config validate
+
+# Print the fully resolved config (useful for debugging token scoping)
+gh-audit config show
 ```
 
 ## Reports
@@ -142,7 +235,7 @@ gh-audit report --repo my-org/my-repo --since 2026-01-01 --until 2026-04-01
 
 ### XLSX output
 
-The `--format xlsx` output produces a workbook with 7 sheets:
+The `--format xlsx` output produces a workbook with 9 sheets:
 
 | Sheet | Purpose |
 |---|---|
@@ -152,6 +245,8 @@ The `--format xlsx` output produces a workbook with 7 sheets:
 | **Exemptions** | Bot and empty commits with exemption reasons |
 | **Self-Approved** | Commits where the only approval came from a code contributor |
 | **Stale Approvals** | Commits merged after approval became stale (force-push after review) |
+| **Post-Merge Concerns** | PRs where a reviewer flipped to CHANGES_REQUESTED / DISMISSED after merge |
+| **Clean Reverts** | Bot auto-reverts and diff-verified manual reverts — triage separately from novel code |
 | **Multiple PRs** | Commits associated with more than one PR (one row per commit-PR pair) |
 
 ## Architecture
@@ -222,7 +317,15 @@ Multiple tokens (PAT, App, or a mix) can be configured. The token pool:
 - Retries on 429 (respecting `Retry-After` header)
 - Disables tokens permanently on 401 (invalid credentials)
 
-GitHub REST API: 5,000 requests/hour per token. Typical cost per commit: ~5 requests (detail + PRs list + PR detail + reviews + check runs). One token audits ~1,000 commits/hour. Multiple tokens multiply throughput linearly.
+GitHub REST API: 5,000 requests/hour per PAT (higher for GitHub Apps). Typical cost per commit: ~6 requests (commit detail + PRs list + PR detail + reviews + check runs + PR commits). Commits that are manual reverts add 2 more requests for diff-inverse verification. One token audits ~800-1,000 commits/hour. Multiple tokens multiply throughput linearly.
+
+The pipeline emits periodic telemetry every 10 seconds showing commits/sec rates and per-pool API budget headroom:
+
+```
+level=INFO msg=telemetry elapsed=30s commits_synced=244 commits_audited=54 \
+  sync_rate_recent=8.1/s audit_rate_recent=1.8/s sync_rate_total=8.1/s \
+  tokens_available=6/6 api_budget_used_pct=53.0% api_budget_remaining=32896 api_budget_capacity=60000
+```
 
 ## Global flags
 

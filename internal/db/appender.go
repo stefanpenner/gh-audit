@@ -15,7 +15,12 @@ import (
 // The Appender API is significantly faster than multi-value INSERT for bulk
 // loads, but does not support upsert semantics directly. This function bridges
 // the gap by appending into a staging table first, then merging.
-func (d *DB) bulkUpsert(ctx context.Context, table string, columns []string, rows [][]driver.Value) error {
+//
+// pkColumns is the target table's primary key. The merge deduplicates rows
+// within the staging table by PK (last-wins via ROW_NUMBER) before the
+// INSERT OR REPLACE, because DuckDB does not resolve intra-source duplicates
+// — two staging rows with the same PK would trigger a constraint error.
+func (d *DB) bulkUpsert(ctx context.Context, table string, columns []string, pkColumns []string, rows [][]driver.Value) error {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -69,11 +74,21 @@ func (d *DB) bulkUpsert(ctx context.Context, table string, columns []string, row
 		return err
 	}
 
-	// Merge staging data into the target table.
-	merge := fmt.Sprintf(
-		`INSERT OR REPLACE INTO %s (%s) SELECT %s FROM %s`,
-		table, colList, colList, staging,
-	)
+	// Merge staging data into the target table. Deduplicate staging rows by
+	// primary key so intra-source duplicates don't trip the target's PK
+	// constraint (DuckDB's INSERT OR REPLACE only reconciles source↔target).
+	var merge string
+	if len(pkColumns) > 0 {
+		merge = fmt.Sprintf(
+			`INSERT OR REPLACE INTO %s (%s) SELECT %s FROM %s QUALIFY ROW_NUMBER() OVER (PARTITION BY %s) = 1`,
+			table, colList, colList, staging, strings.Join(pkColumns, ", "),
+		)
+	} else {
+		merge = fmt.Sprintf(
+			`INSERT OR REPLACE INTO %s (%s) SELECT %s FROM %s`,
+			table, colList, colList, staging,
+		)
+	}
 	if _, err := conn.ExecContext(ctx, merge); err != nil {
 		return fmt.Errorf("merge staging into %s: %w", table, err)
 	}

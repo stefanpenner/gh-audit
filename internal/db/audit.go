@@ -30,6 +30,8 @@ type AuditRow struct {
 var auditResultColumns = []string{
 	"org", "repo", "sha", "is_empty_commit", "is_bot", "is_exempt_author",
 	"has_pr", "pr_number", "pr_count", "has_final_approval", "has_stale_approval",
+	"has_post_merge_concern",
+	"is_clean_revert", "revert_verification", "reverted_sha",
 	"is_self_approved", "approver_logins", "owner_approval_check", "is_compliant",
 	"reasons", "merge_strategy", "pr_commit_author_logins", "commit_href", "pr_href",
 }
@@ -46,7 +48,10 @@ func (d *DB) UpsertAuditResults(ctx context.Context, results []model.AuditResult
 		rows[i] = []driver.Value{
 			r.Org, r.Repo, r.SHA,
 			r.IsEmptyCommit, r.IsBot, r.IsExemptAuthor, r.HasPR, r.PRNumber, r.PRCount,
-			r.HasFinalApproval, r.HasStaleApproval, r.IsSelfApproved,
+			r.HasFinalApproval, r.HasStaleApproval,
+			r.HasPostMergeConcern,
+			r.IsCleanRevert, nullIfEmpty(r.RevertVerification), nullIfEmpty(r.RevertedSHA),
+			r.IsSelfApproved,
 			toAnySlice(r.ApproverLogins),
 			nullIfEmpty(r.OwnerApprovalCheck), r.IsCompliant,
 			toAnySlice(r.Reasons),
@@ -56,7 +61,7 @@ func (d *DB) UpsertAuditResults(ctx context.Context, results []model.AuditResult
 		}
 	}
 
-	return d.bulkUpsert(ctx, "audit_results", auditResultColumns, rows)
+	return d.bulkUpsert(ctx, "audit_results", auditResultColumns, []string{"org", "repo", "sha"}, rows)
 }
 
 // toAnySlice converts a []string to []any for the DuckDB Appender LIST type.
@@ -179,6 +184,8 @@ func (d *DB) GetAuditResults(ctx context.Context, opts AuditQueryOpts) ([]AuditR
 	q := fmt.Sprintf(`
 		SELECT a.org, a.repo, a.sha, a.is_empty_commit, a.is_bot, a.is_exempt_author, a.has_pr, a.pr_number,
 		       COALESCE(a.pr_count, 0), a.has_final_approval, COALESCE(a.has_stale_approval, false),
+		       COALESCE(a.has_post_merge_concern, false),
+		       COALESCE(a.is_clean_revert, false), COALESCE(a.revert_verification, ''), COALESCE(a.reverted_sha, ''),
 		       a.is_self_approved, a.approver_logins, COALESCE(a.owner_approval_check::TEXT, ''), a.is_compliant,
 		       a.reasons, COALESCE(a.merge_strategy, ''), a.commit_href, a.pr_href, a.audited_at,
 		       COALESCE(c.author_login, ''), COALESCE(c.committed_at, '1970-01-01'::TIMESTAMP), COALESCE(c.message, '')
@@ -201,6 +208,8 @@ func (d *DB) GetAuditResults(ctx context.Context, opts AuditQueryOpts) ([]AuditR
 			&row.Org, &row.Repo, &row.SHA,
 			&row.IsEmptyCommit, &row.IsBot, &row.IsExemptAuthor, &row.HasPR, &row.PRNumber,
 			&row.PRCount, &row.HasFinalApproval, &row.HasStaleApproval,
+			&row.HasPostMergeConcern,
+			&row.IsCleanRevert, &row.RevertVerification, &row.RevertedSHA,
 			&row.IsSelfApproved, &approvers, &row.OwnerApprovalCheck,
 			&row.IsCompliant, &reasons, &row.MergeStrategy, &row.CommitHref, &row.PRHref, &row.AuditedAt,
 			&row.AuthorLogin, &row.CommittedAt, &row.Message,

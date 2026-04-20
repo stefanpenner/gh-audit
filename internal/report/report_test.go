@@ -116,6 +116,10 @@ CREATE TABLE IF NOT EXISTS audit_results (
 	pr_count             INTEGER DEFAULT 0,
 	has_final_approval   BOOLEAN,
 	has_stale_approval   BOOLEAN DEFAULT false,
+	has_post_merge_concern BOOLEAN DEFAULT false,
+	is_clean_revert      BOOLEAN DEFAULT false,
+	revert_verification  TEXT,
+	reverted_sha         TEXT,
 	approver_logins      TEXT[],
 	owner_approval_check TEXT,
 	is_compliant         BOOLEAN,
@@ -514,7 +518,7 @@ func TestGenerateXLSXLargeDataset(t *testing.T) {
 	assert.Greater(t, info.Size(), int64(0))
 }
 
-func TestGenerateXLSXHasSevenSheets(t *testing.T) {
+func TestGenerateXLSXHasExpectedSheets(t *testing.T) {
 	db := setupTestDB(t)
 	now := time.Now().Truncate(time.Second)
 
@@ -538,7 +542,7 @@ func TestGenerateXLSXHasSevenSheets(t *testing.T) {
 	defer xf.Close()
 
 	sheets := xf.GetSheetList()
-	expected := []string{"Summary", "All Commits", "Non-Compliant", "Exemptions", "Self-Approved", "Stale Approvals", "Multiple PRs"}
+	expected := []string{"Summary", "All Commits", "Non-Compliant", "Exemptions", "Self-Approved", "Stale Approvals", "Post-Merge Concerns", "Clean Reverts", "Multiple PRs"}
 	require.Len(t, sheets, len(expected))
 	for i, name := range expected {
 		assert.Equal(t, name, sheets[i], "sheet %d", i)

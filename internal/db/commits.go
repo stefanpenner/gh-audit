@@ -31,7 +31,7 @@ func (d *DB) UpsertCommits(ctx context.Context, commits []model.Commit) error {
 		}
 	}
 
-	return d.bulkUpsert(ctx, "commits", commitColumns, rows)
+	return d.bulkUpsert(ctx, "commits", commitColumns, []string{"org", "repo", "sha"}, rows)
 }
 
 var commitBranchColumns = []string{"org", "repo", "sha", "branch"}
@@ -47,7 +47,7 @@ func (d *DB) UpsertCommitBranches(ctx context.Context, org, repo string, shas []
 		rows[i] = []driver.Value{org, repo, sha, branch}
 	}
 
-	return d.bulkUpsert(ctx, "commit_branches", commitBranchColumns, rows)
+	return d.bulkUpsert(ctx, "commit_branches", commitBranchColumns, []string{"org", "repo", "sha", "branch"}, rows)
 }
 
 // GetUnauditedCommits returns commits in org/repo that have no corresponding audit_results row.
@@ -159,7 +159,7 @@ func (d *DB) UpsertCoAuthors(ctx context.Context, commits []model.Commit) error 
 	if len(rows) == 0 {
 		return nil
 	}
-	return d.bulkUpsert(ctx, "co_authors", coAuthorColumns, rows)
+	return d.bulkUpsert(ctx, "co_authors", coAuthorColumns, []string{"org", "repo", "sha", "email"}, rows)
 }
 
 func nullIfEmptyStr(s string) any {
@@ -172,7 +172,7 @@ func nullIfEmptyStr(s string) any {
 // GetCoAuthors returns co-authors for a single commit.
 func (d *DB) GetCoAuthors(ctx context.Context, org, repo, sha string) ([]model.CoAuthor, error) {
 	rows, err := d.DB.QueryContext(ctx,
-		`SELECT COALESCE(name, ''), email, COALESCE(login, '') FROM co_authors WHERE org = ? AND repo = ? AND sha = ?`,
+		`SELECT COALESCE(name, ''), email, COALESCE(login, '') FROM co_authors WHERE org = ? AND repo = ? AND sha = ? ORDER BY COALESCE(name, ''), email`,
 		org, repo, sha)
 	if err != nil {
 		return nil, fmt.Errorf("query co-authors: %w", err)
@@ -200,7 +200,7 @@ func (d *DB) loadCoAuthorsForCommits(ctx context.Context, commits []model.Commit
 	repo := commits[0].Repo
 
 	rows, err := d.DB.QueryContext(ctx,
-		`SELECT sha, COALESCE(name, ''), email, COALESCE(login, '') FROM co_authors WHERE org = ? AND repo = ?`,
+		`SELECT sha, COALESCE(name, ''), email, COALESCE(login, '') FROM co_authors WHERE org = ? AND repo = ? ORDER BY sha, COALESCE(name, ''), email`,
 		org, repo)
 	if err != nil {
 		return fmt.Errorf("query co-authors for %s/%s: %w", org, repo, err)

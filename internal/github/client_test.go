@@ -400,10 +400,10 @@ func TestParseCoAuthors(t *testing.T) {
 			message: "feat: stuff\n\n" +
 				"Co-Authored-By: Bot Account <bot@example.com>\n" +
 				"Co-authored-by: Bot Account <Bot@example.com>\n" +
-				"Co-authored-by: svc-deploy <svc-deploy@example.com>",
+				"Co-authored-by: bot-deploy <bot-deploy@example.com>",
 			want:   2,
-			names:  []string{"Bot Account", "svc-deploy"},
-			emails: []string{"bot@example.com", "svc-deploy@example.com"},
+			names:  []string{"Bot Account", "bot-deploy"},
+			emails: []string{"bot@example.com", "bot-deploy@example.com"},
 		},
 	}
 

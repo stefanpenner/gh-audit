@@ -63,19 +63,20 @@ func TestEvaluateCommit(t *testing.T) {
 	}
 
 	tests := []struct {
-		name              string
-		commit            model.Commit
-		enrichment        model.EnrichmentResult
-		exemptAuthors     []string
-		requiredChecks    []RequiredCheck
-		wantCompliant     bool
-		wantBot           bool
-		wantExempt        bool
-		wantEmpty         bool
-		wantHasPR         bool
-		wantSelfApproved  bool
-		wantStaleApproval bool
-		wantReasons       []string
+		name                 string
+		commit               model.Commit
+		enrichment           model.EnrichmentResult
+		exemptAuthors        []string
+		requiredChecks       []RequiredCheck
+		wantCompliant        bool
+		wantBot              bool
+		wantExempt           bool
+		wantEmpty            bool
+		wantHasPR            bool
+		wantSelfApproved     bool
+		wantStaleApproval    bool
+		wantPostMergeConcern bool
+		wantReasons          []string
 	}{
 		{
 			name:   "normal compliant commit",
@@ -643,6 +644,181 @@ func TestEvaluateCommit(t *testing.T) {
 			wantHasPR:      true,
 			wantReasons:    []string{"compliant"},
 		},
+		// --- Post-merge concern tracking ---
+		//
+		// Point-in-time compliance: reviews submitted after pr.MergedAt are
+		// ignored for the latest-state-wins decision, and post-merge
+		// CHANGES_REQUESTED / DISMISSED reviews set HasPostMergeConcern.
+		{
+			name:   "approved before merge, CHANGES_REQUESTED after merge → compliant + post-merge concern",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{basePR},
+				Reviews: []model.Review{
+					approvedReview, // submitted at `now`, matches pr.MergedAt — included (Before is strict)
+					{
+						Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2,
+						ReviewerLogin: "reviewer1", State: "CHANGES_REQUESTED",
+						CommitID: "head123", SubmittedAt: now.Add(time.Minute),
+					},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks:       requiredChecks,
+			wantCompliant:        true,
+			wantHasPR:            true,
+			wantPostMergeConcern: true,
+			wantReasons:          []string{"compliant"},
+		},
+		{
+			name:   "approved before merge, DISMISSED after merge → compliant + post-merge concern",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{basePR},
+				Reviews: []model.Review{
+					approvedReview,
+					{
+						Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 3,
+						ReviewerLogin: "reviewer1", State: "DISMISSED",
+						CommitID: "head123", SubmittedAt: now.Add(2 * time.Minute),
+					},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks:       requiredChecks,
+			wantCompliant:        true,
+			wantHasPR:            true,
+			wantPostMergeConcern: true,
+			wantReasons:          []string{"compliant"},
+		},
+		{
+			name:   "approved before merge, COMMENTED after merge → compliant, no concern",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{basePR},
+				Reviews: []model.Review{
+					approvedReview,
+					{
+						Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 4,
+						ReviewerLogin: "reviewer2", State: "COMMENTED",
+						CommitID: "head123", SubmittedAt: now.Add(time.Minute),
+					},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks:       requiredChecks,
+			wantCompliant:        true,
+			wantHasPR:            true,
+			wantPostMergeConcern: false,
+			wantReasons:          []string{"compliant"},
+		},
+		{
+			name:   "open PR (no MergedAt) with later CHANGES_REQUESTED → no concern, non-compliant",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{func() model.PullRequest {
+					p := basePR
+					p.Merged = false
+					p.MergedAt = time.Time{}
+					return p
+				}()},
+				Reviews: []model.Review{
+					approvedReview,
+					{
+						Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 5,
+						ReviewerLogin: "reviewer1", State: "CHANGES_REQUESTED",
+						CommitID: "head123", SubmittedAt: now.Add(time.Minute),
+					},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks:       requiredChecks,
+			wantCompliant:        false,
+			wantHasPR:            true,
+			wantPostMergeConcern: false,
+			wantReasons:          []string{"no approval on final commit (PR #42)"},
+		},
+		// --- Clean-revert wire-up ---
+		//
+		// Cheap pass-through: the enricher sets IsCleanRevert / RevertVerification /
+		// RevertedSHA on EnrichmentResult; EvaluateCommit copies those fields onto
+		// AuditResult regardless of compliance path. Purely informational.
+		{
+			name: "enrichment marks auto-revert clean — result carries the flag",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs:       []model.PullRequest{basePR},
+				Reviews:   []model.Review{approvedReview},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+
+				IsCleanRevert:      true,
+				RevertVerification: "message-only",
+				RevertedSHA:        "abcdef1234567890abcdef1234567890abcdef12",
+			},
+			requiredChecks: requiredChecks,
+			wantCompliant:  true,
+			wantHasPR:      true,
+			wantReasons:    []string{"compliant"},
+		},
+		{
+			name: "enrichment marks diff-verified manual revert — result carries the flag",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs:       []model.PullRequest{basePR},
+				Reviews:   []model.Review{approvedReview},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+
+				IsCleanRevert:      true,
+				RevertVerification: "diff-verified",
+				RevertedSHA:        "1234567890abcdef1234567890abcdef12345678",
+			},
+			requiredChecks: requiredChecks,
+			wantCompliant:  true,
+			wantHasPR:      true,
+			wantReasons:    []string{"compliant"},
+		},
+		{
+			name: "enrichment marks diff-mismatch — IsCleanRevert stays false but verification recorded",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs:       []model.PullRequest{basePR},
+				Reviews:   []model.Review{approvedReview},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+
+				IsCleanRevert:      false,
+				RevertVerification: "diff-mismatch",
+				RevertedSHA:        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			},
+			requiredChecks: requiredChecks,
+			wantCompliant:  true,
+			wantHasPR:      true,
+			wantReasons:    []string{"compliant"},
+		},
+		{
+			name:   "reviewer flipped before merge stays non-compliant (unchanged behaviour)",
+			commit: baseCommit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{func() model.PullRequest {
+					p := basePR
+					p.MergedAt = now.Add(5 * time.Minute)
+					return p
+				}()},
+				Reviews: []model.Review{
+					approvedReview, // APPROVED at `now`
+					{
+						Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 6,
+						ReviewerLogin: "reviewer1", State: "CHANGES_REQUESTED",
+						CommitID: "head123", SubmittedAt: now.Add(2 * time.Minute),
+					},
+				},
+				CheckRuns: []model.CheckRun{ownerApprovalCheck},
+			},
+			requiredChecks:       requiredChecks,
+			wantCompliant:        false,
+			wantHasPR:            true,
+			wantPostMergeConcern: false,
+			wantReasons:          []string{"no approval on final commit (PR #42)"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -656,6 +832,11 @@ func TestEvaluateCommit(t *testing.T) {
 			assert.Equal(t, tt.wantHasPR, result.HasPR, "HasPR")
 			assert.Equal(t, tt.wantSelfApproved, result.IsSelfApproved, "IsSelfApproved")
 			assert.Equal(t, tt.wantStaleApproval, result.HasStaleApproval, "HasStaleApproval")
+			assert.Equal(t, tt.wantPostMergeConcern, result.HasPostMergeConcern, "HasPostMergeConcern")
+			// Clean-revert pass-through: whatever the enrichment set must land on the result.
+			assert.Equal(t, tt.enrichment.IsCleanRevert, result.IsCleanRevert, "IsCleanRevert")
+			assert.Equal(t, tt.enrichment.RevertVerification, result.RevertVerification, "RevertVerification")
+			assert.Equal(t, tt.enrichment.RevertedSHA, result.RevertedSHA, "RevertedSHA")
 			if tt.wantReasons != nil {
 				require.Equal(t, tt.wantReasons, result.Reasons, "Reasons")
 			}

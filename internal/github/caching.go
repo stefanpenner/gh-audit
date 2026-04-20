@@ -22,20 +22,22 @@ const enrichPRFanout = 5
 
 // APIStats tracks API request counts by endpoint.
 type APIStats struct {
-	CommitDetail atomic.Int64
-	CommitPRs    atomic.Int64
-	PRDetail     atomic.Int64
-	Reviews      atomic.Int64
-	CheckRuns    atomic.Int64
-	PRCommits    atomic.Int64
-	CacheHits    atomic.Int64
-	DBHits       atomic.Int64
+	CommitDetail       atomic.Int64
+	CommitPRs          atomic.Int64
+	PRDetail           atomic.Int64
+	Reviews            atomic.Int64
+	CheckRuns          atomic.Int64
+	PRCommits          atomic.Int64
+	RevertVerification atomic.Int64 // GetCommitFiles calls made for clean-revert diff check
+	CacheHits          atomic.Int64
+	DBHits             atomic.Int64
 }
 
 // Total returns the total number of API requests made.
 func (s *APIStats) Total() int64 {
 	return s.CommitDetail.Load() + s.CommitPRs.Load() + s.PRDetail.Load() +
-		s.Reviews.Load() + s.CheckRuns.Load() + s.PRCommits.Load()
+		s.Reviews.Load() + s.CheckRuns.Load() + s.PRCommits.Load() +
+		s.RevertVerification.Load()
 }
 
 // EnrichmentCache provides read access to previously-synced enrichment data.
@@ -406,11 +408,63 @@ func (ce *CachingEnricher) enrichOneCommit(ctx context.Context, org, repo, sha s
 		prBranchCommits[prs[j].Number] = e.branchCommits
 	}
 
-	return model.EnrichmentResult{
+	result := model.EnrichmentResult{
 		Commit:          *detail,
 		PRs:             prs,
 		Reviews:         allReviews,
 		CheckRuns:       allCheckRuns,
 		PRBranchCommits: prBranchCommits,
-	}, nil
+	}
+
+	// Classify & verify clean-revert status. Auto-reverts trusted by pattern;
+	// manual reverts verified by comparing file patches.
+	ce.classifyRevert(ctx, org, repo, sha, &result)
+
+	return result, nil
+}
+
+// classifyRevert inspects the commit's message and, for manual reverts,
+// fetches the reverted commit's files and checks that the revert's diff is
+// an exact inverse. Populates the IsCleanRevert / RevertVerification /
+// RevertedSHA fields on the result.
+func (ce *CachingEnricher) classifyRevert(ctx context.Context, org, repo, sha string, result *model.EnrichmentResult) {
+	kind, revertedSHA := ParseRevert(result.Commit.Message)
+	switch kind {
+	case NotRevert, RevertOfRevert:
+		result.RevertVerification = "none"
+		return
+	case AutoRevert:
+		result.IsCleanRevert = true
+		result.RevertVerification = "message-only"
+		result.RevertedSHA = revertedSHA
+		return
+	case ManualRevert:
+		result.RevertedSHA = revertedSHA
+		if revertedSHA == "" {
+			// Message matched the prefix but no `This reverts commit <sha>`
+			// trailer was found — we can't verify, so we mark as
+			// message-only + not clean.
+			result.RevertVerification = "message-only"
+			return
+		}
+		// Need both R's files and A's files to diff-verify.
+		ce.Stats.RevertVerification.Add(1)
+		revertFiles, err := ce.client.GetCommitFiles(ctx, org, repo, sha)
+		if err != nil {
+			result.RevertVerification = "message-only"
+			return
+		}
+		ce.Stats.RevertVerification.Add(1)
+		revertedFiles, err := ce.client.GetCommitFiles(ctx, org, repo, revertedSHA)
+		if err != nil {
+			result.RevertVerification = "message-only"
+			return
+		}
+		if IsCleanRevertDiff(revertFiles, revertedFiles) {
+			result.IsCleanRevert = true
+			result.RevertVerification = "diff-verified"
+		} else {
+			result.RevertVerification = "diff-mismatch"
+		}
+	}
 }

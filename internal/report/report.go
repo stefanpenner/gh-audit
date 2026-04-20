@@ -35,18 +35,20 @@ type ReportOpts struct {
 
 // SummaryRow is a per-repo compliance summary.
 type SummaryRow struct {
-	Org                string  `json:"org"`
-	Repo               string  `json:"repo"`
-	TotalCommits       int     `json:"total_commits"`
-	CompliantCount     int     `json:"compliant_count"`
-	NonCompliantCount  int     `json:"non_compliant_count"`
-	BotCount           int     `json:"bot_count"`
-	ExemptCount        int     `json:"exempt_count"`
-	EmptyCount         int     `json:"empty_count"`
-	SelfApprovedCount  int     `json:"self_approved_count"`
-	StaleApprovalCount int     `json:"stale_approval_count"`
-	MultiplePRCount    int     `json:"multiple_pr_count"`
-	CompliancePct      float64 `json:"compliance_pct"`
+	Org                    string  `json:"org"`
+	Repo                   string  `json:"repo"`
+	TotalCommits           int     `json:"total_commits"`
+	CompliantCount         int     `json:"compliant_count"`
+	NonCompliantCount      int     `json:"non_compliant_count"`
+	BotCount               int     `json:"bot_count"`
+	ExemptCount            int     `json:"exempt_count"`
+	EmptyCount             int     `json:"empty_count"`
+	SelfApprovedCount      int     `json:"self_approved_count"`
+	StaleApprovalCount     int     `json:"stale_approval_count"`
+	PostMergeConcernCount  int     `json:"post_merge_concern_count"`
+	CleanRevertCount       int     `json:"clean_revert_count"`
+	MultiplePRCount        int     `json:"multiple_pr_count"`
+	CompliancePct          float64 `json:"compliance_pct"`
 }
 
 // DetailRow is a single commit's audit detail.
@@ -63,6 +65,10 @@ type DetailRow struct {
 	IsEmptyCommit      bool      `json:"is_empty_commit"`
 	IsSelfApproved     bool      `json:"is_self_approved"`
 	HasStaleApproval   bool      `json:"has_stale_approval"`
+	HasPostMergeConcern bool     `json:"has_post_merge_concern"`
+	IsCleanRevert      bool      `json:"is_clean_revert"`
+	RevertVerification string    `json:"revert_verification"`
+	RevertedSHA        string    `json:"reverted_sha"`
 	HasPR              bool      `json:"has_pr"`
 	PRNumber           int       `json:"pr_number"`
 	PRCount            int       `json:"pr_count"`
@@ -114,6 +120,8 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 			COUNT(*) FILTER (WHERE a.is_empty_commit = true) AS empty_count,
 			COUNT(*) FILTER (WHERE a.is_self_approved = true) AS self_approved_count,
 			COUNT(*) FILTER (WHERE COALESCE(a.has_stale_approval, false) = true) AS stale_approval_count,
+			COUNT(*) FILTER (WHERE COALESCE(a.has_post_merge_concern, false) = true) AS post_merge_concern_count,
+			COUNT(*) FILTER (WHERE COALESCE(a.is_clean_revert, false) = true) AS clean_revert_count,
 			COUNT(*) FILTER (WHERE COALESCE(a.pr_count, 0) > 1) AS multiple_pr_count
 		FROM audit_results a
 		JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
@@ -144,7 +152,7 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 		var s SummaryRow
 		if err := rows.Scan(&s.Org, &s.Repo, &s.TotalCommits,
 			&s.CompliantCount, &s.NonCompliantCount, &s.BotCount, &s.ExemptCount, &s.EmptyCount,
-			&s.SelfApprovedCount, &s.StaleApprovalCount, &s.MultiplePRCount); err != nil {
+			&s.SelfApprovedCount, &s.StaleApprovalCount, &s.PostMergeConcernCount, &s.CleanRevertCount, &s.MultiplePRCount); err != nil {
 			return nil, fmt.Errorf("scan summary: %w", err)
 		}
 		if s.TotalCommits > 0 {
@@ -171,6 +179,10 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			a.is_empty_commit,
 			COALESCE(a.is_self_approved, false),
 			COALESCE(a.has_stale_approval, false),
+			COALESCE(a.has_post_merge_concern, false),
+			COALESCE(a.is_clean_revert, false),
+			COALESCE(a.revert_verification, ''),
+			COALESCE(a.reverted_sha, ''),
 			a.has_pr,
 			COALESCE(a.pr_number, 0),
 			COALESCE(a.pr_count, 0),
@@ -223,7 +235,9 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 		if err := rows.Scan(
 			&d.Org, &d.Repo, &d.SHA, &d.AuthorLogin, &d.CommitterLogin, &d.CommittedAt,
 			&d.Message, &d.IsBot, &d.IsExemptAuthor, &d.IsEmptyCommit, &d.IsSelfApproved,
-			&d.HasStaleApproval, &d.HasPR, &d.PRNumber, &d.PRCount, &d.PRHref, &d.MergedByLogin,
+			&d.HasStaleApproval, &d.HasPostMergeConcern,
+			&d.IsCleanRevert, &d.RevertVerification, &d.RevertedSHA,
+			&d.HasPR, &d.PRNumber, &d.PRCount, &d.PRHref, &d.MergedByLogin,
 			&d.HasFinalApproval, &d.ApproverLogins,
 			&d.OwnerApprovalCheck, &d.IsCompliant, &d.Reasons, &d.MergeStrategy, &d.PRCommitAuthorLogins, &d.CommitHref, &d.BranchName,
 		); err != nil {
@@ -240,12 +254,12 @@ func (r *Reporter) FormatTable(w io.Writer, summary []SummaryRow, details []Deta
 
 	// Summary section
 	fmt.Fprintln(tw, "=== SUMMARY ===")
-	fmt.Fprintln(tw, "Org\tRepo\tTotal\tCompliant\tNon-Compliant\tCompliance %\tBots\tExempt\tEmpty\tSelf-Approved\tStale Approvals\tMultiple PRs")
+	fmt.Fprintln(tw, "Org\tRepo\tTotal\tCompliant\tNon-Compliant\tCompliance %\tBots\tExempt\tEmpty\tSelf-Approved\tStale Approvals\tPost-Merge Concerns\tClean Reverts\tMultiple PRs")
 	for _, s := range summary {
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%.1f%%\t%d\t%d\t%d\t%d\t%d\t%d\n",
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%.1f%%\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
 			s.Org, s.Repo, s.TotalCommits, s.CompliantCount, s.NonCompliantCount,
 			s.CompliancePct, s.BotCount, s.ExemptCount, s.EmptyCount, s.SelfApprovedCount,
-			s.StaleApprovalCount, s.MultiplePRCount)
+			s.StaleApprovalCount, s.PostMergeConcernCount, s.CleanRevertCount, s.MultiplePRCount)
 	}
 	fmt.Fprintln(tw)
 
@@ -280,7 +294,8 @@ func (r *Reporter) FormatCSV(w io.Writer, details []DetailRow) error {
 		"Compliant", "Reasons", "Merge Strategy", "PR Commit Authors",
 		"Date", "Branch", "Message",
 		"Is Bot", "Is Empty",
-		"No PR", "Stale Approval", "Self-Approved Flag", "No Approval",
+		"No PR", "Stale Approval", "Post-Merge Concern", "Clean Revert", "Revert Verification", "Reverted SHA",
+		"Self-Approved Flag", "No Approval",
 		"Commit Link",
 	}
 	if err := cw.Write(header); err != nil {
@@ -306,6 +321,10 @@ func (r *Reporter) FormatCSV(w io.Writer, details []DetailRow) error {
 			fmt.Sprintf("%v", d.IsEmptyCommit),
 			fmt.Sprintf("%v", !d.HasPR),
 			fmt.Sprintf("%v", d.HasStaleApproval),
+			fmt.Sprintf("%v", d.HasPostMergeConcern),
+			fmt.Sprintf("%v", d.IsCleanRevert),
+			d.RevertVerification,
+			d.RevertedSHA,
 			fmt.Sprintf("%v", d.IsSelfApproved),
 			fmt.Sprintf("%v", !d.HasFinalApproval && !d.IsSelfApproved),
 			d.CommitHref,

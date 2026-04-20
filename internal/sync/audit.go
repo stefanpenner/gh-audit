@@ -22,6 +22,12 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		CommitHref: commit.Href,
 	}
 
+	// Clean-revert signal is informational and orthogonal to compliance. Copy
+	// it early so every return path surfaces it.
+	result.IsCleanRevert = enrichment.IsCleanRevert
+	result.RevertVerification = enrichment.RevertVerification
+	result.RevertedSHA = enrichment.RevertedSHA
+
 	// Detect bot authors (informational — login ending in [bot])
 	if strings.HasSuffix(strings.ToLower(commit.AuthorLogin), "[bot]") {
 		result.IsBot = true
@@ -73,6 +79,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	var bestApprovers []string
 	var bestSelfApproved bool
 	var bestStaleApproval bool
+	var bestPostMergeConcern bool
 	var bestPRCommitAuthors []string
 
 	for i := range enrichment.PRs {
@@ -94,14 +101,24 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		}
 
 		// Per-reviewer last-state tracking: for each reviewer on the final commit,
-		// keep only their most recent review. A DISMISSED review overrides an
-		// earlier APPROVED from the same reviewer (SOX requirement).
+		// keep only their most recent review submitted at or before merge time.
+		// A DISMISSED review overrides an earlier APPROVED from the same reviewer
+		// (SOX requirement). Reviews after MergedAt are excluded so compliance
+		// reflects the point-in-time state at merge; post-merge activity is
+		// tracked separately via HasPostMergeConcern.
 		latestByReviewer := make(map[string]model.Review)
+		hasPostMergeConcern := false
 		for _, review := range enrichment.Reviews {
 			if review.PRNumber != pr.Number || review.CommitID != pr.HeadSHA {
 				continue
 			}
 			if review.ReviewerLogin == "" {
+				continue
+			}
+			if !pr.MergedAt.IsZero() && review.SubmittedAt.After(pr.MergedAt) {
+				if review.State == "CHANGES_REQUESTED" || review.State == "DISMISSED" {
+					hasPostMergeConcern = true
+				}
 				continue
 			}
 			existing, exists := latestByReviewer[review.ReviewerLogin]
@@ -158,6 +175,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		if hasApprovalOnFinal && ownerApprovalOK {
 			result.IsCompliant = true
 			result.HasFinalApproval = true
+			result.HasPostMergeConcern = hasPostMergeConcern
 			result.ApproverLogins = prApprovers
 			result.OwnerApprovalCheck = ownerApprovalStatus
 			result.PRNumber = pr.Number
@@ -175,6 +193,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 			bestApprovers = prApprovers
 			bestSelfApproved = hasSelfApproval && !hasApprovalOnFinal
 			bestStaleApproval = hasStaleApproval
+			bestPostMergeConcern = hasPostMergeConcern
 			bestPRCommitAuthors = prCommitAuthors
 		}
 	}
@@ -183,14 +202,19 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	result.IsCompliant = false
 	result.IsSelfApproved = bestSelfApproved
 	result.HasStaleApproval = bestStaleApproval
+	result.HasPostMergeConcern = bestPostMergeConcern
 	if bestPR != nil {
 		result.PRNumber = bestPR.Number
 		result.PRHref = bestPR.Href
 		result.ApproverLogins = bestApprovers
-		// Use per-reviewer last-state tracking for fallback too
+		// Use per-reviewer last-state tracking for fallback too, with the same
+		// merged-at cutoff used in the per-PR loop.
 		fallbackLatest := make(map[string]model.Review)
 		for _, review := range enrichment.Reviews {
 			if review.PRNumber != bestPR.Number || review.CommitID != bestPR.HeadSHA || review.ReviewerLogin == "" {
+				continue
+			}
+			if !bestPR.MergedAt.IsZero() && review.SubmittedAt.After(bestPR.MergedAt) {
 				continue
 			}
 			existing, exists := fallbackLatest[review.ReviewerLogin]
