@@ -16,6 +16,9 @@ var noreplyRe = regexp.MustCompile(`^(?:\d+\+)?([^@]+)@users\.noreply\.github\.c
 
 // ParseCoAuthors extracts co-authors from "Co-authored-by" trailers in commit messages.
 // GitHub login is resolved from noreply email addresses when possible.
+// Duplicate trailers (same email, compared case-insensitively) are collapsed
+// to the first occurrence — commit messages frequently repeat a co-author
+// across the body and the final trailer block.
 func ParseCoAuthors(message string) []CoAuthor {
 	if !strings.Contains(strings.ToLower(message), "co-authored-by") {
 		return nil
@@ -25,13 +28,18 @@ func ParseCoAuthors(message string) []CoAuthor {
 		return nil
 	}
 	coAuthors := make([]CoAuthor, 0, len(matches))
+	seen := make(map[string]struct{}, len(matches))
 	for _, m := range matches {
 		email := strings.TrimSpace(m[2])
-		login := LoginFromNoreplyEmail(email)
+		key := strings.ToLower(email)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
 		coAuthors = append(coAuthors, CoAuthor{
 			Name:  strings.TrimSpace(m[1]),
 			Email: email,
-			Login: login,
+			Login: LoginFromNoreplyEmail(email),
 		})
 	}
 	return coAuthors
