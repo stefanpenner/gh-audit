@@ -1345,19 +1345,19 @@ func TestEvaluateCommit_LazyStatsFetcher(t *testing.T) {
 }
 
 func TestEvaluateCommit_RevertWaivers(t *testing.T) {
-	// R1 — clean revert. A diff-verified clean revert is compliant on its
-	// own, regardless of whether the reverted commit was compliant. R2 —
-	// GitHub-server-created revert. A revert-prefixed commit with committer
-	// == web-flow and a verified signature is compliant even when its diff
-	// doesn't match (conflict-resolved reverts). Both rules evaluate each
-	// commit standalone — see TODO.md for the stricter cross-commit variant.
+	// The only revert waiver is "clean revert": a diff-verified clean
+	// revert is compliant standalone. Everything else — conflict-resolved
+	// reverts, message-only, revert-of-revert, hand-crafted without
+	// verification — falls through to the normal PR-approval rules. See
+	// TODO.md for deferred variants (re-apply diff verification,
+	// cross-commit chain).
 	const revertedSHA = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
 	mergedAt := time.Now().Add(-time.Hour)
 	revertPR := model.PullRequest{Org: "o", Repo: "r", Number: 7, HeadSHA: "head-7", MergedAt: mergedAt, Href: "https://example/pr/7"}
 	baseCommit := model.Commit{Org: "o", Repo: "r", SHA: "revert-sha", AuthorLogin: "dev-a", Additions: 5, Deletions: 5}
 	baseEnrichment := model.EnrichmentResult{PRs: []model.PullRequest{revertPR}}
 
-	t.Run("R1: diff-verified clean revert is compliant standalone", func(t *testing.T) {
+	t.Run("diff-verified clean revert is compliant standalone", func(t *testing.T) {
 		enrichment := baseEnrichment
 		enrichment.IsCleanRevert = true
 		enrichment.RevertVerification = "diff-verified"
@@ -1370,7 +1370,7 @@ func TestEvaluateCommit_RevertWaivers(t *testing.T) {
 		assert.Contains(t, result.Reasons[0], "a1b2c3d4e5f6", "reason cites the reverted sha prefix")
 	})
 
-	t.Run("R1: auto-revert without a reverted SHA is still compliant", func(t *testing.T) {
+	t.Run("auto-revert without a reverted SHA is still compliant", func(t *testing.T) {
 		enrichment := baseEnrichment
 		enrichment.IsCleanRevert = true
 		enrichment.RevertVerification = "message-only"
@@ -1380,10 +1380,10 @@ func TestEvaluateCommit_RevertWaivers(t *testing.T) {
 		assert.Contains(t, result.Reasons[0], "clean revert")
 	})
 
-	t.Run("R1 does NOT fire when IsCleanRevert=false", func(t *testing.T) {
-		// "message-only" ManualRevert that failed diff verification: the
-		// revert prefix is in the message but we never confirmed inverse.
-		// Must fall through to PR-approval path (which has no approval).
+	t.Run("message-only / diff-mismatch manual revert does NOT waive", func(t *testing.T) {
+		// The revert prefix is in the message but we never confirmed the
+		// diff is a pure inverse. Must fall through to PR-approval path
+		// (which has no approval).
 		commit := baseCommit
 		commit.Message = `Revert "some change"` + "\n\nThis reverts commit abc123."
 		enrichment := baseEnrichment
@@ -1391,74 +1391,44 @@ func TestEvaluateCommit_RevertWaivers(t *testing.T) {
 		enrichment.RevertVerification = "diff-mismatch"
 		enrichment.RevertedSHA = revertedSHA
 		result := EvaluateCommit(commit, enrichment, nil, nil, nil)
-		assert.False(t, result.IsCompliant, "message-only / diff-mismatch reverts must not auto-waive")
+		assert.False(t, result.IsCompliant)
 	})
 
-	t.Run("R2: web-flow + verified ManualRevert is compliant", func(t *testing.T) {
+	t.Run("conflict-resolved GH-UI revert (web-flow + verified, diff mismatch) does NOT waive", func(t *testing.T) {
+		// This is the scenario that previously waived under R2. Dropped
+		// deliberately: conflict resolution introduces new code that
+		// wasn't on master before, so a human should eyeball it.
 		commit := baseCommit
 		commit.Message = `Revert "feature X"` + "\n\nThis reverts commit a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2."
 		commit.CommitterLogin = "web-flow"
 		commit.IsVerified = true
-		result := EvaluateCommit(commit, baseEnrichment, nil, nil, nil)
-		assert.True(t, result.IsCompliant)
-		require.Len(t, result.Reasons, 1)
-		assert.Contains(t, result.Reasons[0], "GitHub-server revert")
-		assert.Contains(t, result.Reasons[0], "web-flow")
-		assert.Contains(t, result.Reasons[0], "a1b2c3d4e5f6")
+		enrichment := baseEnrichment
+		enrichment.IsCleanRevert = false
+		enrichment.RevertVerification = "diff-mismatch"
+		enrichment.RevertedSHA = revertedSHA
+		result := EvaluateCommit(commit, enrichment, nil, nil, nil)
+		assert.False(t, result.IsCompliant, "provenance alone is not enough — diff must verify")
 	})
 
-	t.Run("R2: web-flow + verified RevertOfRevert is compliant", func(t *testing.T) {
-		// "Revert \"Revert \"...\"\"" — re-apply via GitHub UI. Still a
-		// revert-kind commit, still trusted by provenance.
+	t.Run("revert-of-revert (web-flow + verified) does NOT waive", func(t *testing.T) {
+		// Re-applying previously-reverted code. Even via GH UI, the
+		// decision to put it back should be reviewed.
 		commit := baseCommit
 		commit.Message = `Revert "Revert \"feature X\""`
 		commit.CommitterLogin = "web-flow"
 		commit.IsVerified = true
 		result := EvaluateCommit(commit, baseEnrichment, nil, nil, nil)
-		assert.True(t, result.IsCompliant)
-		assert.Contains(t, result.Reasons[0], "GitHub-server revert")
-	})
-
-	t.Run("R2: missing web-flow committer does NOT waive", func(t *testing.T) {
-		commit := baseCommit
-		commit.Message = `Revert "feature X"` + "\n\nThis reverts commit abc."
-		commit.CommitterLogin = "some-human"
-		commit.IsVerified = true
-		result := EvaluateCommit(commit, baseEnrichment, nil, nil, nil)
-		assert.False(t, result.IsCompliant, "committer must be web-flow for R2")
-	})
-
-	t.Run("R2: missing verified signature does NOT waive", func(t *testing.T) {
-		commit := baseCommit
-		commit.Message = `Revert "feature X"` + "\n\nThis reverts commit abc."
-		commit.CommitterLogin = "web-flow"
-		commit.IsVerified = false
-		result := EvaluateCommit(commit, baseEnrichment, nil, nil, nil)
-		assert.False(t, result.IsCompliant, "signature verification is required for R2")
-	})
-
-	t.Run("R2: non-revert message does NOT waive even if web-flow+verified", func(t *testing.T) {
-		// Guardrail against rule #2 becoming a blanket "web-flow commits
-		// are compliant" waiver. Only revert-kind commits qualify.
-		commit := baseCommit
-		commit.Message = "Add feature Y" // not a revert
-		commit.CommitterLogin = "web-flow"
-		commit.IsVerified = true
-		result := EvaluateCommit(commit, baseEnrichment, nil, nil, nil)
-		assert.False(t, result.IsCompliant, "non-revert commits must not be waived by R2")
+		assert.False(t, result.IsCompliant)
 	})
 
 	t.Run("no cross-commit lookup: reverts do NOT depend on prior verdicts", func(t *testing.T) {
-		// A standalone clean revert is compliant regardless of what the
-		// reverted commit looked like. This is the deferred-work boundary
+		// A clean revert is compliant regardless of the reverted
+		// commit's audit state — this is the deferred-work boundary
 		// documented in TODO.md.
 		enrichment := baseEnrichment
 		enrichment.IsCleanRevert = true
 		enrichment.RevertVerification = "diff-verified"
 		enrichment.RevertedSHA = revertedSHA
-		// Even if the reverted commit were non-compliant, we don't know
-		// about it here — EvaluateCommit no longer accepts a priorAudit
-		// lookup. The result should still be compliant.
 		result := EvaluateCommit(baseCommit, enrichment, nil, nil, nil)
 		assert.True(t, result.IsCompliant)
 	})
@@ -1478,54 +1448,41 @@ func TestEvaluateRevertCompliance(t *testing.T) {
 		reasonHint string
 	}{
 		{
-			name:       "R1 fires on IsCleanRevert=true with reverted SHA",
+			name:       "fires on IsCleanRevert=true with reverted SHA",
 			commit:     model.Commit{Message: revertMsg},
 			enrichment: model.EnrichmentResult{IsCleanRevert: true, RevertedSHA: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"},
 			want:       true,
 			reasonHint: "clean revert of",
 		},
 		{
-			name:       "R1 fires on IsCleanRevert=true without reverted SHA",
+			name:       "fires on IsCleanRevert=true without reverted SHA (auto-revert)",
 			commit:     model.Commit{Message: "Automatic revert of abc..def"},
 			enrichment: model.EnrichmentResult{IsCleanRevert: true},
 			want:       true,
 			reasonHint: "clean revert",
 		},
 		{
-			name:       "R2 fires on revert message + web-flow + verified",
+			name:       "no waiver: revert message + web-flow + verified but diff-mismatch",
 			commit:     model.Commit{Message: revertMsg, CommitterLogin: "web-flow", IsVerified: true},
-			enrichment: model.EnrichmentResult{},
-			want:       true,
-			reasonHint: "GitHub-server revert",
-		},
-		{
-			name:       "R2 fires even when committer case differs (case-insensitive)",
-			commit:     model.Commit{Message: revertMsg, CommitterLogin: "Web-Flow", IsVerified: true},
-			enrichment: model.EnrichmentResult{},
-			want:       true,
-		},
-		{
-			name:       "no waiver: non-revert commit with web-flow + verified",
-			commit:     model.Commit{Message: "Add feature Y", CommitterLogin: "web-flow", IsVerified: true},
-			enrichment: model.EnrichmentResult{},
-			want:       false,
-		},
-		{
-			name:       "no waiver: revert message, non-web-flow committer",
-			commit:     model.Commit{Message: revertMsg, CommitterLogin: "human", IsVerified: true},
-			enrichment: model.EnrichmentResult{},
-			want:       false,
-		},
-		{
-			name:       "no waiver: revert message, web-flow, unverified",
-			commit:     model.Commit{Message: revertMsg, CommitterLogin: "web-flow", IsVerified: false},
-			enrichment: model.EnrichmentResult{},
-			want:       false,
-		},
-		{
-			name:       "no waiver: message-only ManualRevert (IsCleanRevert=false)",
-			commit:     model.Commit{Message: revertMsg},
 			enrichment: model.EnrichmentResult{IsCleanRevert: false, RevertVerification: "diff-mismatch"},
+			want:       false,
+		},
+		{
+			name:       "no waiver: message-only ManualRevert",
+			commit:     model.Commit{Message: revertMsg},
+			enrichment: model.EnrichmentResult{IsCleanRevert: false, RevertVerification: "message-only"},
+			want:       false,
+		},
+		{
+			name:       "no waiver: non-revert commit",
+			commit:     model.Commit{Message: "Add feature Y"},
+			enrichment: model.EnrichmentResult{IsCleanRevert: false},
+			want:       false,
+		},
+		{
+			name:       "no waiver: revert-of-revert (never classified clean)",
+			commit:     model.Commit{Message: `Revert "Revert \"feature X\""`, CommitterLogin: "web-flow", IsVerified: true},
+			enrichment: model.EnrichmentResult{IsCleanRevert: false},
 			want:       false,
 		},
 	}

@@ -251,22 +251,20 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	if applyEmptyCommitFallback(&result, &commit, fetchStats) {
 		return result
 	}
-	// Revert waivers — each evaluated standalone (no cross-commit lookup).
-	// See TODO.md for the stricter "reverted commit must also be compliant"
-	// variant that we've deferred.
+	// Revert waiver — clean revert only. Evaluated standalone (no
+	// cross-commit lookup). See TODO.md for the stricter "reverted commit
+	// must also be compliant" variant.
 	//
-	// R1 — clean revert. IsCleanRevert == true means one of:
+	// IsCleanRevert == true means one of:
 	//   - AutoRevert (bot-generated, trusted by construction), OR
 	//   - ManualRevert whose diff was verified as the exact inverse of the
 	//     reverted commit (revert_verification == "diff-verified").
 	// A clean revert puts bytes back that were already on master, so it
-	// needs no fresh review.
-	//
-	// R2 — GitHub-server-created revert. Any revert-prefixed commit whose
-	// committer is `web-flow` AND signature is GitHub-verified came through
-	// the "Revert" button on github.com: only GitHub's server can produce a
-	// web-flow-signed commit. Provenance substitutes for a diff match, so
-	// this also covers the conflict-resolved revert case where R1 fails.
+	// needs no fresh review. Every other revert shape (conflict-resolved,
+	// message-only, revert-of-revert, hand-crafted without verification)
+	// falls through to the normal PR-approval rules — the bytes landing on
+	// master aren't proven equivalent to previously-reviewed bytes, so a
+	// human should eyeball the change.
 	if revertCompliant, reason := evaluateRevertCompliance(commit, enrichment); revertCompliant {
 		result.IsCompliant = true
 		result.HasFinalApproval = false
@@ -325,41 +323,24 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	return result
 }
 
-// webFlowCommitter is GitHub's server-side committer login for commits
-// produced by UI actions (merge button, Revert button, edit-in-browser).
-// Paired with a verified signature it's a strong provenance guard — only
-// GitHub holds the web-flow signing key.
-const webFlowCommitter = "web-flow"
-
-// evaluateRevertCompliance returns (true, reason) iff the commit qualifies
-// for one of the revert waivers:
+// evaluateRevertCompliance returns (true, reason) iff the commit is a clean
+// revert — either an AutoRevert (trusted by construction) or a ManualRevert
+// whose diff was verified as the exact inverse of the reverted commit.
+// Returns (false, "") otherwise.
 //
-//	R1 — clean revert (bot auto-revert or diff-verified manual revert).
-//	R2 — revert-prefixed commit whose committer is web-flow AND whose
-//	     signature is GitHub-verified (came from the Revert button on
-//	     github.com; covers conflict-resolved reverts where R1 fails).
-//
-// Returns (false, "") otherwise. Each rule is evaluated standalone —
-// the reverted commit's compliance is NOT consulted (see TODO.md for the
-// stricter variant).
+// Conflict-resolved GH-UI reverts intentionally do NOT waive here — the
+// diff is no longer a pure inverse, so reviewers should eyeball the
+// conflict resolution. Revert-of-revert is likewise not treated as clean
+// (content is coming *back* onto master, not off it). See TODO.md for
+// deferred variants (re-apply diff verification, cross-commit chain).
 func evaluateRevertCompliance(commit model.Commit, enrichment model.EnrichmentResult) (bool, string) {
-	if enrichment.IsCleanRevert {
-		if enrichment.RevertedSHA != "" {
-			return true, fmt.Sprintf("clean revert of %s", truncateSHA(enrichment.RevertedSHA))
-		}
-		return true, "clean revert"
-	}
-	kind, revertedSHA := github.ParseRevert(commit.Message)
-	if kind == github.NotRevert {
+	if !enrichment.IsCleanRevert {
 		return false, ""
 	}
-	if !strings.EqualFold(commit.CommitterLogin, webFlowCommitter) || !commit.IsVerified {
-		return false, ""
+	if enrichment.RevertedSHA != "" {
+		return true, fmt.Sprintf("clean revert of %s", truncateSHA(enrichment.RevertedSHA))
 	}
-	if revertedSHA != "" {
-		return true, fmt.Sprintf("GitHub-server revert of %s (web-flow, verified)", truncateSHA(revertedSHA))
-	}
-	return true, "GitHub-server revert (web-flow, verified)"
+	return true, "clean revert"
 }
 
 // truncateSHA returns the first 12 chars of a git SHA, or the full string

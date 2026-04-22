@@ -147,17 +147,15 @@ A commit is **compliant** if at least one associated PR has:
 
 If multiple PRs exist for a commit, gh-audit picks the one closest to compliant for reporting. The total number of associated PRs is recorded (`pr_count`) and commits with `pr_count > 1` appear in the dedicated "Multiple PRs" report sheet.
 
-### 8. Revert waivers (standalone)
+### 8. Clean-revert waiver (standalone)
 
-If the primary verdict above is **non-compliant**, two last checks run. Both are evaluated per-commit — neither looks at the reverted commit's audit verdict (see `TODO.md` for the deferred cross-commit variant).
+If the primary verdict above is **non-compliant**, one last check runs. It is evaluated per-commit — it does not look at the reverted commit's audit verdict (see `TODO.md` for the deferred cross-commit variant).
 
-**R1 — clean revert.** A `IsCleanRevert=true` commit is **compliant**. The signal means one of:
+A `IsCleanRevert=true` commit is **compliant**. The signal means one of:
 - `AutoRevert` — bot-generated, trusted by construction.
 - `ManualRevert` whose diff was verified as the exact inverse of the reverted commit (`revert_verification = "diff-verified"`).
 
-Message-only / diff-mismatch manual reverts do **not** qualify — we can't prove the revert is clean, so they fall through to non-compliant.
-
-**R2 — GitHub-server-created revert.** A commit whose message matches a revert prefix AND whose committer is `web-flow` AND whose signature is GitHub-verified is **compliant**. Only GitHub's server can produce a web-flow-signed commit, so provenance substitutes for diff verification. Covers conflict-resolved reverts from the github.com "Revert" button where `IsCleanRevertDiff` rejects the diff but the byte path is still trustworthy.
+Every other revert shape — conflict-resolved (`diff-mismatch`), message-only, revert-of-revert, hand-crafted — falls through to the normal PR-approval rules. Provenance signals like `committer == web-flow` or a verified signature are **not** sufficient on their own: if the diff isn't a pure inverse, there are bytes on master that weren't there before, and those bytes deserve review.
 
 ```
 non-compliant verdict from rules 1–7
@@ -165,14 +163,8 @@ non-compliant verdict from rules 1–7
       ▼
 IsCleanRevert == true?
       │
-      yes ──▶ IsCompliant=true, reason="clean revert of <sha12>"  [R1]
-      │
-      no  ──▶ ParseRevert != NotRevert AND
-              committer == "web-flow" AND
-              IsVerified == true?
-                yes → IsCompliant=true,
-                      reason="GitHub-server revert of <sha12> (web-flow, verified)"  [R2]
-                no  → stay non-compliant
+      yes ──▶ IsCompliant=true, reason="clean revert of <sha12>"
+      no  ──▶ stay non-compliant (PR-approval reasons preserved)
 ```
 
 ```
