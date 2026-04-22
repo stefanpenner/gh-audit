@@ -5,253 +5,363 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/xuri/excelize/v2"
 )
 
-// GenerateXLSX creates a multi-sheet XLSX workbook with audit report data.
+// Sheet names — kept as constants so tests and callers stay in sync with
+// builder code. Order here is the order they appear in the workbook.
+const (
+	SheetREADME         = "README"
+	SheetActionQueue    = "Action Queue"
+	SheetSummary        = "Summary"
+	SheetByRule         = "By Rule"
+	SheetByAuthor       = "By Author"
+	SheetDecisionMatrix = "Decision Matrix"
+	SheetWaiversLog     = "Waivers Log"
+	SheetMultiplePRs    = "Multiple PRs"
+)
+
+// xlsxBuilder bundles the workbook and the shared styles so each per-sheet
+// builder doesn't re-create them.
+type xlsxBuilder struct {
+	f          *excelize.File
+	linkStyle  int
+	headerBlue int
+	headerRed  int
+	headerGrey int
+	boldStyle  int
+	outcomeStyles map[RuleOutcome]int
+}
+
+// GenerateXLSX creates the 3-layer audit workbook: Action → Overview → Trace.
 func (r *Reporter) GenerateXLSX(ctx context.Context, opts ReportOpts, outputPath string) error {
 	summary, err := r.GetSummary(ctx, opts)
 	if err != nil {
 		return fmt.Errorf("getting summary: %w", err)
 	}
-
 	details, err := r.GetDetails(ctx, opts)
 	if err != nil {
 		return fmt.Errorf("getting details: %w", err)
 	}
-
-	// Get non-compliant and exemptions
-	failureOpts := opts
-	failureOpts.OnlyFailures = true
-	nonCompliant, err := r.GetDetails(ctx, failureOpts)
+	byAuthor, err := r.GetByAuthor(ctx, opts)
 	if err != nil {
-		return fmt.Errorf("getting non-compliant: %w", err)
+		return fmt.Errorf("getting by-author: %w", err)
 	}
-
 	multiplePRs, err := r.GetMultiplePRDetails(ctx, opts)
 	if err != nil {
 		return fmt.Errorf("getting multiple PR details: %w", err)
 	}
 
-	var exemptions []DetailRow
-	var selfApproved []DetailRow
-	var staleApprovals []DetailRow
-	var postMergeConcerns []DetailRow
-	var cleanReverts []DetailRow
-	var cleanMerges []DetailRow
-	for _, d := range details {
-		if d.IsExemptAuthor || d.IsBot || d.IsEmptyCommit {
-			exemptions = append(exemptions, d)
-		}
-		if d.IsSelfApproved {
-			selfApproved = append(selfApproved, d)
-		}
-		if d.HasStaleApproval {
-			staleApprovals = append(staleApprovals, d)
-		}
-		if d.HasPostMergeConcern {
-			postMergeConcerns = append(postMergeConcerns, d)
-		}
-		if d.IsCleanRevert {
-			cleanReverts = append(cleanReverts, d)
-		}
-		if d.IsCleanMerge {
-			cleanMerges = append(cleanMerges, d)
-		}
-	}
-
 	f := excelize.NewFile()
 	defer f.Close()
 
-	linkStyle, _ := f.NewStyle(&excelize.Style{
-		Font: &excelize.Font{Color: "0563C1", Underline: "single"},
-	})
-
-	// --- Sheet 1: Summary ---
-	summarySheet := "Summary"
-	f.SetSheetName("Sheet1", summarySheet)
-
-	if err := writeSummarySheet(f, summarySheet, summary, opts); err != nil {
-		return fmt.Errorf("writing summary sheet: %w", err)
+	b, err := newBuilder(f)
+	if err != nil {
+		return err
 	}
 
-	// --- Sheet 2: All Commits (StreamWriter for large datasets) ---
-	allSheet := "All Commits"
-	if _, err := f.NewSheet(allSheet); err != nil {
-		return fmt.Errorf("creating all commits sheet: %w", err)
-	}
-	if err := writeAllCommitsSheet(f, allSheet, details, linkStyle); err != nil {
-		return fmt.Errorf("writing all commits sheet: %w", err)
+	f.SetSheetName("Sheet1", SheetREADME)
+	if err := b.writeREADME(opts); err != nil {
+		return fmt.Errorf("README: %w", err)
 	}
 
-	// --- Sheet 3: Non-Compliant (normal writer for hyperlinks) ---
-	ncSheet := "Non-Compliant"
-	if _, err := f.NewSheet(ncSheet); err != nil {
-		return fmt.Errorf("creating non-compliant sheet: %w", err)
-	}
-	// Sort non-compliant by date descending (already ordered from query, but ensure)
-	sort.Slice(nonCompliant, func(i, j int) bool {
-		return nonCompliant[i].CommittedAt.After(nonCompliant[j].CommittedAt)
-	})
-	if err := writeNonCompliantSheet(f, ncSheet, nonCompliant, linkStyle); err != nil {
-		return fmt.Errorf("writing non-compliant sheet: %w", err)
+	for _, name := range []string{SheetActionQueue, SheetSummary, SheetByRule, SheetByAuthor, SheetDecisionMatrix, SheetWaiversLog, SheetMultiplePRs} {
+		if _, err := f.NewSheet(name); err != nil {
+			return fmt.Errorf("creating %s: %w", name, err)
+		}
 	}
 
-	// --- Sheet 4: Exemptions (normal writer for hyperlinks) ---
-	exSheet := "Exemptions"
-	if _, err := f.NewSheet(exSheet); err != nil {
-		return fmt.Errorf("creating exemptions sheet: %w", err)
+	if err := b.writeActionQueue(details); err != nil {
+		return fmt.Errorf("%s: %w", SheetActionQueue, err)
 	}
-	if err := writeExemptionsSheet(f, exSheet, exemptions, linkStyle); err != nil {
-		return fmt.Errorf("writing exemptions sheet: %w", err)
+	if err := b.writeSummary(summary, opts); err != nil {
+		return fmt.Errorf("%s: %w", SheetSummary, err)
 	}
-
-	// --- Sheet 5: Self-Approved (normal writer for hyperlinks) ---
-	saSheet := "Self-Approved"
-	if _, err := f.NewSheet(saSheet); err != nil {
-		return fmt.Errorf("creating self-approved sheet: %w", err)
+	if err := b.writeByRule(details); err != nil {
+		return fmt.Errorf("%s: %w", SheetByRule, err)
 	}
-	if err := writeSelfApprovedSheet(f, saSheet, selfApproved, linkStyle); err != nil {
-		return fmt.Errorf("writing self-approved sheet: %w", err)
+	if err := b.writeByAuthor(byAuthor); err != nil {
+		return fmt.Errorf("%s: %w", SheetByAuthor, err)
 	}
-
-	// --- Sheet 6: Stale Approvals ---
-	staleSheet := "Stale Approvals"
-	if _, err := f.NewSheet(staleSheet); err != nil {
-		return fmt.Errorf("creating stale approvals sheet: %w", err)
+	if err := b.writeDecisionMatrix(details); err != nil {
+		return fmt.Errorf("%s: %w", SheetDecisionMatrix, err)
 	}
-	if err := writeStaleApprovalsSheet(f, staleSheet, staleApprovals, linkStyle); err != nil {
-		return fmt.Errorf("writing stale approvals sheet: %w", err)
+	if err := b.writeWaiversLog(details); err != nil {
+		return fmt.Errorf("%s: %w", SheetWaiversLog, err)
+	}
+	if err := b.writeMultiplePRs(multiplePRs); err != nil {
+		return fmt.Errorf("%s: %w", SheetMultiplePRs, err)
 	}
 
-	// --- Sheet: Post-Merge Concerns ---
-	pmcSheet := "Post-Merge Concerns"
-	if _, err := f.NewSheet(pmcSheet); err != nil {
-		return fmt.Errorf("creating post-merge concerns sheet: %w", err)
-	}
-	if err := writePostMergeConcernsSheet(f, pmcSheet, postMergeConcerns, linkStyle); err != nil {
-		return fmt.Errorf("writing post-merge concerns sheet: %w", err)
-	}
-
-	// --- Sheet: Clean Reverts ---
-	crSheet := "Clean Reverts"
-	if _, err := f.NewSheet(crSheet); err != nil {
-		return fmt.Errorf("creating clean reverts sheet: %w", err)
-	}
-	if err := writeCleanRevertsSheet(f, crSheet, cleanReverts, linkStyle); err != nil {
-		return fmt.Errorf("writing clean reverts sheet: %w", err)
-	}
-
-	// --- Sheet: Clean Merges ---
-	cmSheet := "Clean Merges"
-	if _, err := f.NewSheet(cmSheet); err != nil {
-		return fmt.Errorf("creating clean merges sheet: %w", err)
-	}
-	if err := writeCleanMergesSheet(f, cmSheet, cleanMerges, linkStyle); err != nil {
-		return fmt.Errorf("writing clean merges sheet: %w", err)
-	}
-
-	// --- Sheet 7: Multiple PRs ---
-	mpSheet := "Multiple PRs"
-	if _, err := f.NewSheet(mpSheet); err != nil {
-		return fmt.Errorf("creating multiple PRs sheet: %w", err)
-	}
-	if err := writeMultiplePRsSheet(f, mpSheet, multiplePRs, linkStyle); err != nil {
-		return fmt.Errorf("writing multiple PRs sheet: %w", err)
+	// Open on Action Queue by default — it's the sheet auditors live in.
+	if idx, err := f.GetSheetIndex(SheetActionQueue); err == nil {
+		f.SetActiveSheet(idx)
 	}
 
 	return f.SaveAs(outputPath)
 }
 
-func writeSummarySheet(f *excelize.File, sheet string, summary []SummaryRow, opts ReportOpts) error {
-	headers := []string{"Org", "Repo", "Total Commits", "Compliant", "Non-Compliant", "Compliance %", "Bots", "Exempt", "Empty", "Self-Approved", "Stale Approvals", "Post-Merge Concerns", "Clean Reverts", "Clean Merges", "Multiple PRs"}
-
-	// Date range subtitle in row 1
-	dateRange := "Report Period: All Time"
-	if !opts.Since.IsZero() || !opts.Until.IsZero() {
-		since := "beginning"
-		until := "present"
-		if !opts.Since.IsZero() {
-			since = opts.Since.Format("2006-01-02")
-		}
-		if !opts.Until.IsZero() {
-			until = opts.Until.Format("2006-01-02")
-		}
-		dateRange = fmt.Sprintf("Report Period: %s to %s", since, until)
-	}
-
-	subtitleStyle, err := f.NewStyle(&excelize.Style{
-		Font:      &excelize.Font{Bold: true, Size: 12},
-		Alignment: &excelize.Alignment{Horizontal: "left"},
+func newBuilder(f *excelize.File) (*xlsxBuilder, error) {
+	linkStyle, err := f.NewStyle(&excelize.Style{
+		Font: &excelize.Font{Color: "0563C1", Underline: "single"},
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	f.SetCellValue(sheet, "A1", dateRange)
-	f.SetCellStyle(sheet, "A1", "A1", subtitleStyle)
-
-	// Header style
-	headerStyle, err := f.NewStyle(&excelize.Style{
+	blueHeader, err := f.NewStyle(&excelize.Style{
 		Font:      &excelize.Font{Bold: true, Color: "FFFFFF"},
 		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"4472C4"}},
 		Alignment: &excelize.Alignment{Horizontal: "center"},
 	})
 	if err != nil {
-		return err
+		return nil, err
+	}
+	redHeader, err := f.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Bold: true, Color: "FFFFFF"},
+		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"CC4444"}},
+		Alignment: &excelize.Alignment{Horizontal: "center"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	greyHeader, err := f.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Bold: true, Color: "FFFFFF"},
+		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"707070"}},
+		Alignment: &excelize.Alignment{Horizontal: "center"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	bold, err := f.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true}})
+	if err != nil {
+		return nil, err
 	}
 
-	// Write headers in row 2
-	headerRow := 2
+	mk := func(bg, fg string) int {
+		s, _ := f.NewStyle(&excelize.Style{
+			Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{bg}},
+			Font:      &excelize.Font{Color: fg},
+			Alignment: &excelize.Alignment{Horizontal: "center"},
+		})
+		return s
+	}
+	outcomeStyles := map[RuleOutcome]int{
+		OutcomePass:    mk("C6EFCE", "006100"),
+		OutcomeFail:    mk("FFC7CE", "9C0006"),
+		OutcomeMissing: mk("FFE699", "7F5A00"),
+		OutcomeWaived:  mk("D9E7F9", "1F4E79"),
+		OutcomeSkip:    mk("E7E6E6", "595959"),
+		OutcomeNA:      mk("F2F2F2", "7F7F7F"),
+	}
+
+	return &xlsxBuilder{
+		f:             f,
+		linkStyle:     linkStyle,
+		headerBlue:    blueHeader,
+		headerRed:     redHeader,
+		headerGrey:    greyHeader,
+		boldStyle:     bold,
+		outcomeStyles: outcomeStyles,
+	}, nil
+}
+
+// --- README ---------------------------------------------------------------
+
+func (b *xlsxBuilder) writeREADME(opts ReportOpts) error {
+	sheet := SheetREADME
+	f := b.f
+
+	title, _ := f.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true, Size: 16}})
+	h2, _ := f.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true, Size: 12}})
+	body, _ := f.NewStyle(&excelize.Style{Alignment: &excelize.Alignment{WrapText: true, Vertical: "top"}})
+
+	lines := []struct {
+		text  string
+		style int
+	}{
+		{"gh-audit compliance report", title},
+		{fmt.Sprintf("Generated: %s", time.Now().UTC().Format("2006-01-02 15:04 MST")), 0},
+		{reportPeriod(opts), 0},
+		{"", 0},
+		{"How to read this workbook", h2},
+		{"• Action Queue — prioritized list of commits that need attention. Start here.", body},
+		{"• Summary — per-repo totals and compliance %. Filterable overview.", body},
+		{"• By Rule — which rules trigger most across the scanned set.", body},
+		{"• By Author — per-author rollup to spot patterns.", body},
+		{"• Decision Matrix — every commit × every rule (pass/fail/skip/n-a/missing/waived). Autofilter on any rule column to drill in.", body},
+		{"• Waivers Log — commits auto-approved by R1/R2/R8 or classified as clean merges. Evidence of what the tool did NOT flag and why.", body},
+		{"• Multiple PRs — commits associated with more than one PR.", body},
+		{"", 0},
+		{"Rule legend", h2},
+		{"R1 Exempt — author is in the configured exemption list", body},
+		{"R2 Empty — commit has 0 additions and 0 deletions", body},
+		{"R3 HasPR — commit is associated with a merged pull request", body},
+		{"R4 FinalApproval — a non-self APPROVED review exists on the PR's final commit", body},
+		{"R4b Stale — approval exists but only on pre-force-push SHAs", body},
+		{"R4c PostMergeConcern — CHANGES_REQUESTED or DISMISSED submitted after merge (informational)", body},
+		{"R5 SelfApproval — the only approver is the code author / committer / co-author", body},
+		{"R6 OwnerCheck — required status check (e.g. Owner Approval) configured for this repo", body},
+		{"R7 Verdict — overall compliance verdict from the audit pipeline", body},
+		{"R8 RevertWaiver — clean-revert waiver applied (bot auto-revert or diff-verified manual revert)", body},
+		{"", 0},
+		{"Cell outcomes", h2},
+		{"pass — rule evaluated and passed", body},
+		{"fail — rule evaluated and failed (contributes to non-compliance unless waived)", body},
+		{"skip — rule did not apply to this commit (e.g. R1/R2 inactive)", body},
+		{"n/a — rule could not evaluate (e.g. R4/R5 when there's no PR)", body},
+		{"missing — required status check was never reported", body},
+		{"waived — rule waived the verdict (R1 exempt author, R2 empty, R8 clean revert)", body},
+		{"", 0},
+		{"Full rule definitions: Architecture.md § What gh-audit detects.", body},
+	}
+
+	for i, line := range lines {
+		cell := cellName(1, i+1)
+		f.SetCellValue(sheet, cell, line.text)
+		if line.style != 0 {
+			f.SetCellStyle(sheet, cell, cell, line.style)
+		}
+	}
+	f.SetColWidth(sheet, "A", "A", 110)
+	return nil
+}
+
+func reportPeriod(opts ReportOpts) string {
+	if opts.Since.IsZero() && opts.Until.IsZero() {
+		return "Report period: all time"
+	}
+	since, until := "beginning", "present"
+	if !opts.Since.IsZero() {
+		since = opts.Since.Format("2006-01-02")
+	}
+	if !opts.Until.IsZero() {
+		until = opts.Until.Format("2006-01-02")
+	}
+	return fmt.Sprintf("Report period: %s to %s", since, until)
+}
+
+// --- Action Queue ---------------------------------------------------------
+
+func (b *xlsxBuilder) writeActionQueue(details []DetailRow) error {
+	sheet := SheetActionQueue
+	f := b.f
+
+	headers := []string{
+		"Priority", "Severity", "Repo", "SHA", "PR #", "Author", "Merged By",
+		"Failing Rule", "Prescribed Action", "Days Since Commit", "Resolution", "Notes",
+	}
+
+	type queueRow struct {
+		d        DetailRow
+		severity Severity
+		rule     string
+		action   string
+	}
+	var queue []queueRow
+	for _, d := range details {
+		o := DeriveRuleOutcomes(d)
+		if !o.RequiresAction() {
+			continue
+		}
+		sev, rule, act := SynthesizeAction(d, o)
+		queue = append(queue, queueRow{d: d, severity: sev, rule: rule, action: act})
+	}
+
+	sort.SliceStable(queue, func(i, j int) bool {
+		if ri, rj := severityRank(queue[i].severity), severityRank(queue[j].severity); ri != rj {
+			return ri > rj
+		}
+		if queue[i].d.Repo != queue[j].d.Repo {
+			return queue[i].d.Org+"/"+queue[i].d.Repo < queue[j].d.Org+"/"+queue[j].d.Repo
+		}
+		return queue[i].d.CommittedAt.After(queue[j].d.CommittedAt)
+	})
+
+	b.writeHeaderRow(sheet, headers, b.headerRed)
+
+	now := time.Now()
+	for i, q := range queue {
+		row := i + 2
+		d := q.d
+		f.SetCellValue(sheet, cellName(1, row), i+1)
+		f.SetCellValue(sheet, cellName(2, row), string(q.severity))
+		f.SetCellValue(sheet, cellName(3, row), d.Org+"/"+d.Repo)
+		b.writeSHACell(sheet, cellName(4, row), d.SHA, d.CommitHref)
+		b.writePRCell(sheet, cellName(5, row), d.PRNumber, d.PRHref)
+		f.SetCellValue(sheet, cellName(6, row), sanitizeCell(d.AuthorLogin))
+		f.SetCellValue(sheet, cellName(7, row), sanitizeCell(d.MergedByLogin))
+		f.SetCellValue(sheet, cellName(8, row), q.rule)
+		f.SetCellValue(sheet, cellName(9, row), sanitizeCell(q.action))
+		if !d.CommittedAt.IsZero() {
+			f.SetCellValue(sheet, cellName(10, row), int(now.Sub(d.CommittedAt).Hours()/24))
+		}
+		// Resolution + Notes intentionally blank for auditor use.
+	}
+
+	b.finalizeSheet(sheet, headers, len(queue))
+	widths := []float64{8, 10, 25, 12, 8, 18, 18, 22, 50, 12, 25, 30}
+	applyWidths(f, sheet, widths)
+	return nil
+}
+
+// --- Summary --------------------------------------------------------------
+
+func (b *xlsxBuilder) writeSummary(summary []SummaryRow, opts ReportOpts) error {
+	sheet := SheetSummary
+	f := b.f
+
+	headers := []string{
+		"Org", "Repo", "Total", "Compliant", "Non-Compliant", "Compliance %",
+		"Action Queue", "Waived",
+		"R3 NoPR", "R4 NoFinal", "R6 OwnerFail",
+		"Self-Approved", "Stale", "Post-Merge", "Clean Reverts", "Clean Merges",
+		"Bots", "Exempt", "Empty", "Multiple PRs",
+	}
+
+	subtitleStyle, _ := f.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Bold: true, Size: 12},
+		Alignment: &excelize.Alignment{Horizontal: "left"},
+	})
+	f.SetCellValue(sheet, "A1", reportPeriod(opts))
+	f.SetCellStyle(sheet, "A1", "A1", subtitleStyle)
+
 	for col, h := range headers {
-		cell, _ := excelize.CoordinatesToCellName(col+1, headerRow)
+		cell := cellName(col+1, 2)
 		f.SetCellValue(sheet, cell, h)
-		f.SetCellStyle(sheet, cell, cell, headerStyle)
+		f.SetCellStyle(sheet, cell, cell, b.headerBlue)
 	}
 
-	// Conditional formatting styles
 	pctFmt := "0.0"
 	greenStyle, _ := f.NewStyle(&excelize.Style{
-		Fill:         excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"C6EFCE"}},
-		Font:         &excelize.Font{Color: "006100"},
-		CustomNumFmt: &pctFmt,
+		Fill: excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"C6EFCE"}},
+		Font: &excelize.Font{Color: "006100"}, CustomNumFmt: &pctFmt,
 	})
 	yellowStyle, _ := f.NewStyle(&excelize.Style{
-		Fill:         excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"FFEB9C"}},
-		Font:         &excelize.Font{Color: "9C5700"},
-		CustomNumFmt: &pctFmt,
+		Fill: excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"FFEB9C"}},
+		Font: &excelize.Font{Color: "9C5700"}, CustomNumFmt: &pctFmt,
 	})
 	redStyle, _ := f.NewStyle(&excelize.Style{
-		Fill:         excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"FFC7CE"}},
-		Font:         &excelize.Font{Color: "9C0006"},
-		CustomNumFmt: &pctFmt,
+		Fill: excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"FFC7CE"}},
+		Font: &excelize.Font{Color: "9C0006"}, CustomNumFmt: &pctFmt,
 	})
 
-	// Write data rows (starting at row 3)
-	// Columns: Org, Repo, Total, Compliant, Non-Compliant, Compliance%,
-	//          then informational tags: Bots, Exempt, Empty, Self-Approved
 	for i, s := range summary {
 		row := i + 3
-		f.SetCellValue(sheet, cellName(1, row), s.Org)
-		f.SetCellValue(sheet, cellName(2, row), s.Repo)
-		f.SetCellValue(sheet, cellName(3, row), s.TotalCommits)
-		f.SetCellValue(sheet, cellName(4, row), s.CompliantCount)
-		f.SetCellValue(sheet, cellName(5, row), s.NonCompliantCount)
-
+		vals := []any{
+			s.Org, s.Repo, s.TotalCommits, s.CompliantCount, s.NonCompliantCount,
+			s.CompliancePct,
+			s.ActionQueueCount, s.WaivedCount,
+			s.R3NoPRCount, s.R4NoFinalCount, s.R6OwnerFailCount,
+			s.SelfApprovedCount, s.StaleApprovalCount, s.PostMergeConcernCount,
+			s.CleanRevertCount, s.CleanMergeCount,
+			s.BotCount, s.ExemptCount, s.EmptyCount, s.MultiplePRCount,
+		}
+		for c, v := range vals {
+			f.SetCellValue(sheet, cellName(c+1, row), v)
+		}
 		pctCell := cellName(6, row)
-		f.SetCellValue(sheet, pctCell, s.CompliancePct)
-
-		f.SetCellValue(sheet, cellName(7, row), s.BotCount)
-		f.SetCellValue(sheet, cellName(8, row), s.ExemptCount)
-		f.SetCellValue(sheet, cellName(9, row), s.EmptyCount)
-		f.SetCellValue(sheet, cellName(10, row), s.SelfApprovedCount)
-		f.SetCellValue(sheet, cellName(11, row), s.StaleApprovalCount)
-		f.SetCellValue(sheet, cellName(12, row), s.PostMergeConcernCount)
-		f.SetCellValue(sheet, cellName(13, row), s.CleanRevertCount)
-		f.SetCellValue(sheet, cellName(14, row), s.CleanMergeCount)
-		f.SetCellValue(sheet, cellName(15, row), s.MultiplePRCount)
-
 		switch {
 		case s.CompliancePct >= 100:
 			f.SetCellStyle(sheet, pctCell, pctCell, greenStyle)
@@ -262,838 +372,374 @@ func writeSummarySheet(f *excelize.File, sheet string, summary []SummaryRow, opt
 		}
 	}
 
-	// Totals row with SUM formulas
 	if len(summary) > 0 {
 		totalsRow := len(summary) + 3
-		totalStyle, _ := f.NewStyle(&excelize.Style{
-			Font: &excelize.Font{Bold: true},
-		})
-
 		f.SetCellValue(sheet, cellName(1, totalsRow), "TOTAL")
-
-		// SUM formulas for count columns (3-5 = Total/Compliant/Non-Compliant, 7-15 = tags)
-		for _, col := range []int{3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15} {
+		// SUM all numeric columns except Compliance %.
+		for _, col := range []int{3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20} {
 			colLetter, _ := excelize.ColumnNumberToName(col)
-			formula := fmt.Sprintf("SUM(%s%d:%s%d)", colLetter, 3, colLetter, totalsRow-1)
-			f.SetCellFormula(sheet, cellName(col, totalsRow), formula)
+			f.SetCellFormula(sheet, cellName(col, totalsRow),
+				fmt.Sprintf("SUM(%s3:%s%d)", colLetter, colLetter, totalsRow-1))
 		}
-
-		// Compliance % in column 6: Compliant / Total * 100
-		colD, _ := excelize.ColumnNumberToName(4) // Compliant
-		colC, _ := excelize.ColumnNumberToName(3) // Total
-		pctFormula := fmt.Sprintf("IF(%s%d>0,ROUND(%s%d/%s%d*100,1),0)", colC, totalsRow, colD, totalsRow, colC, totalsRow)
-		f.SetCellFormula(sheet, cellName(6, totalsRow), pctFormula)
-
-		totalPctStyle, _ := f.NewStyle(&excelize.Style{
-			Font:         &excelize.Font{Bold: true},
-			CustomNumFmt: &pctFmt,
+		colC, _ := excelize.ColumnNumberToName(3)
+		colD, _ := excelize.ColumnNumberToName(4)
+		f.SetCellFormula(sheet, cellName(6, totalsRow),
+			fmt.Sprintf("IF(%s%d>0,ROUND(%s%d/%s%d*100,1),0)", colC, totalsRow, colD, totalsRow, colC, totalsRow))
+		pctStyle, _ := f.NewStyle(&excelize.Style{
+			Font: &excelize.Font{Bold: true}, CustomNumFmt: &pctFmt,
 		})
 		for col := 1; col <= len(headers); col++ {
 			c := cellName(col, totalsRow)
 			if col == 6 {
-				f.SetCellStyle(sheet, c, c, totalPctStyle)
+				f.SetCellStyle(sheet, c, c, pctStyle)
 			} else {
-				f.SetCellStyle(sheet, c, c, totalStyle)
+				f.SetCellStyle(sheet, c, c, b.boldStyle)
 			}
 		}
 	}
 
-	// Freeze header rows (row 1 is subtitle, row 2 is header)
-	f.SetPanes(sheet, &excelize.Panes{
-		Freeze:      true,
-		Split:       false,
-		XSplit:      0,
-		YSplit:      2,
-		TopLeftCell: "A3",
-		ActivePane:  "bottomLeft",
-	})
-
-	// Column widths
-	widths := []float64{15, 30, 15, 12, 15, 15, 10, 10, 10, 15, 16, 18, 14, 14, 14}
-	for i, w := range widths {
-		colName, _ := excelize.ColumnNumberToName(i + 1)
-		f.SetColWidth(sheet, colName, colName, w)
-	}
-
+	f.SetPanes(sheet, &excelize.Panes{Freeze: true, YSplit: 2, TopLeftCell: "A3", ActivePane: "bottomLeft"})
+	widths := []float64{14, 28, 8, 11, 14, 12, 12, 8, 10, 11, 13, 13, 8, 12, 14, 13, 8, 8, 8, 12}
+	applyWidths(f, sheet, widths)
 	return nil
 }
 
-// detailHeaders returns the standard column headers for detail sheets.
-func detailHeaders() []string {
-	return []string{
-		"Org", "Repo", "SHA", "PR #",
-		"Author", "Committer", "Merged By", "Approver",
-		"Approved?", "Self-Approved?", "Owner Approval",
-		"Compliant?", "Reasons", "Merge Strategy", "PR Commit Authors",
-		"Date", "Branch", "Message",
-		"No PR", "Stale Approval", "Post-Merge Concern", "Clean Revert", "Revert Verification",
-		"Clean Merge", "Merge Verification",
-		"Self-Approved", "No Approval",
-		"Annotations",
-		"Other PRs",
-	}
+// --- By Rule --------------------------------------------------------------
+
+type byRuleAgg struct {
+	rule          string
+	name          string
+	fires         int
+	compliantOut  int
+	nonCompOut    int
+	waived        int
+	repoCounts    map[string]int
+	authorCounts  map[string]int
 }
 
-// writeAllCommitsSheet writes all commits with clickable hyperlinks on SHA and PR columns.
-func writeAllCommitsSheet(f *excelize.File, sheet string, details []DetailRow, linkStyle int) error {
-	headers := detailHeaders()
+func (b *xlsxBuilder) writeByRule(details []DetailRow) error {
+	sheet := SheetByRule
+	f := b.f
 
-	headerStyle, err := f.NewStyle(&excelize.Style{
-		Font:      &excelize.Font{Bold: true, Color: "FFFFFF"},
-		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"4472C4"}},
-		Alignment: &excelize.Alignment{Horizontal: "center"},
-	})
-	if err != nil {
-		return err
+	rules := []struct {
+		id, name string
+		fires    func(DetailRow, RuleOutcomes) (fire, waived bool)
+	}{
+		{"R1 Exempt", "Exempt author waiver", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R1Exempt == OutcomeWaived, o.R1Exempt == OutcomeWaived }},
+		{"R2 Empty", "Empty-commit waiver", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R2Empty == OutcomeWaived, o.R2Empty == OutcomeWaived }},
+		{"R3 HasPR", "Missing associated PR", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R3HasPR == OutcomeFail, false }},
+		{"R4 FinalApproval", "No approval on final commit", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R4FinalApproval == OutcomeFail, false }},
+		{"R4b Stale", "Stale approval (pre-force-push)", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R4bStale == OutcomeFail, false }},
+		{"R4c PostMergeConcern", "Post-merge reviewer concern", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R4cPostMergeConcern == OutcomeFail, false }},
+		{"R5 SelfApproval", "Only approver is a code contributor", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R5SelfApproval == OutcomeFail, false }},
+		{"R6 OwnerCheck", "Required status check failing/missing", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R6OwnerCheck == OutcomeFail || o.R6OwnerCheck == OutcomeMissing, false }},
+		{"R7 Verdict", "Overall non-compliant verdict", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R7Verdict == OutcomeFail, false }},
+		{"R8 RevertWaiver", "Clean-revert waiver", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R8RevertWaiver == OutcomeWaived, o.R8RevertWaiver == OutcomeWaived }},
 	}
 
-	// Write headers
-	for col, h := range headers {
-		cell := cellName(col+1, 1)
-		f.SetCellValue(sheet, cell, h)
-		f.SetCellStyle(sheet, cell, cell, headerStyle)
+	aggs := make([]*byRuleAgg, len(rules))
+	for i, r := range rules {
+		aggs[i] = &byRuleAgg{rule: r.id, name: r.name, repoCounts: map[string]int{}, authorCounts: map[string]int{}}
 	}
 
-	// Write data rows with hyperlinks
-	for i, d := range details {
-		writeDetailRowWithHyperlinks(f, sheet, i+2, d, linkStyle)
-	}
-
-	// Auto-filter
-	lastCell := cellName(len(headers), max(len(details)+1, 1))
-	f.AutoFilter(sheet, "A1:"+lastCell, nil)
-
-	// Freeze header row
-	f.SetPanes(sheet, &excelize.Panes{
-		Freeze:      true,
-		Split:       false,
-		XSplit:      0,
-		YSplit:      1,
-		TopLeftCell: "A2",
-		ActivePane:  "bottomLeft",
-	})
-
-	setDetailColumnWidths(f, sheet, len(headers))
-
-	return nil
-}
-
-// writeNonCompliantSheet writes non-compliant rows with red header and a Resolution column.
-func writeNonCompliantSheet(f *excelize.File, sheet string, details []DetailRow, linkStyle int) error {
-	headers := append(detailHeaders(), "Resolution")
-
-	headerStyle, err := f.NewStyle(&excelize.Style{
-		Font:      &excelize.Font{Bold: true, Color: "FFFFFF"},
-		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"CC4444"}},
-		Alignment: &excelize.Alignment{Horizontal: "center"},
-	})
-	if err != nil {
-		return err
-	}
-
-	// Write headers
-	for col, h := range headers {
-		cell := cellName(col+1, 1)
-		f.SetCellValue(sheet, cell, h)
-		f.SetCellStyle(sheet, cell, cell, headerStyle)
-	}
-
-	// Write data rows with hyperlinks
-	for i, d := range details {
-		row := i + 2
-		writeDetailRowWithHyperlinks(f, sheet, row, d, linkStyle)
-		// Resolution column is empty (for auditor notes)
-		f.SetCellValue(sheet, cellName(len(headers), row), "")
-	}
-
-	// Auto-filter
-	lastCell := cellName(len(headers), max(len(details)+1, 1))
-	f.AutoFilter(sheet, "A1:"+lastCell, nil)
-
-	// Freeze header row
-	f.SetPanes(sheet, &excelize.Panes{
-		Freeze:      true,
-		Split:       false,
-		XSplit:      0,
-		YSplit:      1,
-		TopLeftCell: "A2",
-		ActivePane:  "bottomLeft",
-	})
-
-	setDetailColumnWidths(f, sheet, len(headers))
-
-	return nil
-}
-
-// writeExemptionsSheet writes exempted rows (bots, empty commits) with green header.
-func writeExemptionsSheet(f *excelize.File, sheet string, details []DetailRow, linkStyle int) error {
-	headers := append(detailHeaders(), "Exemption Reason")
-
-	headerStyle, err := f.NewStyle(&excelize.Style{
-		Font:      &excelize.Font{Bold: true, Color: "FFFFFF"},
-		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"228B22"}},
-		Alignment: &excelize.Alignment{Horizontal: "center"},
-	})
-	if err != nil {
-		return err
-	}
-
-	// Write headers
-	for col, h := range headers {
-		cell := cellName(col+1, 1)
-		f.SetCellValue(sheet, cell, h)
-		f.SetCellStyle(sheet, cell, cell, headerStyle)
-	}
-
-	// Write data rows
-	for i, d := range details {
-		row := i + 2
-		writeDetailRowWithHyperlinks(f, sheet, row, d, linkStyle)
-
-		// Exemption reason
-		reason := ""
-		if d.IsExemptAuthor {
-			reason = "Exempt author: " + d.AuthorLogin
-		} else if d.IsBot {
-			reason = "Bot author: " + d.AuthorLogin
-		} else if d.IsEmptyCommit {
-			reason = "Empty commit"
+	for _, d := range details {
+		o := DeriveRuleOutcomes(d)
+		for i, r := range rules {
+			fire, waived := r.fires(d, o)
+			if !fire {
+				continue
+			}
+			a := aggs[i]
+			a.fires++
+			if waived {
+				a.waived++
+			}
+			if d.IsCompliant {
+				a.compliantOut++
+			} else {
+				a.nonCompOut++
+			}
+			a.repoCounts[d.Org+"/"+d.Repo]++
+			a.authorCounts[d.AuthorLogin]++
 		}
-		f.SetCellValue(sheet, cellName(len(headers), row), reason)
 	}
 
-	// Auto-filter
-	lastCell := cellName(len(headers), max(len(details)+1, 1))
-	f.AutoFilter(sheet, "A1:"+lastCell, nil)
+	headers := []string{"Rule", "Description", "Fires", "Compliant Outcomes", "Non-Compliant Outcomes", "Waived", "Top Repo", "Top Author"}
+	b.writeHeaderRow(sheet, headers, b.headerBlue)
 
-	// Freeze header row
-	f.SetPanes(sheet, &excelize.Panes{
-		Freeze:      true,
-		Split:       false,
-		XSplit:      0,
-		YSplit:      1,
-		TopLeftCell: "A2",
-		ActivePane:  "bottomLeft",
-	})
+	for i, a := range aggs {
+		row := i + 2
+		f.SetCellValue(sheet, cellName(1, row), a.rule)
+		f.SetCellValue(sheet, cellName(2, row), a.name)
+		f.SetCellValue(sheet, cellName(3, row), a.fires)
+		f.SetCellValue(sheet, cellName(4, row), a.compliantOut)
+		f.SetCellValue(sheet, cellName(5, row), a.nonCompOut)
+		f.SetCellValue(sheet, cellName(6, row), a.waived)
+		f.SetCellValue(sheet, cellName(7, row), topKey(a.repoCounts))
+		f.SetCellValue(sheet, cellName(8, row), topKey(a.authorCounts))
+	}
 
-	setDetailColumnWidths(f, sheet, len(headers))
-
+	b.finalizeSheet(sheet, headers, len(aggs))
+	widths := []float64{22, 38, 8, 18, 22, 10, 28, 22}
+	applyWidths(f, sheet, widths)
 	return nil
 }
 
-// writeSelfApprovedSheet writes self-approved rows with orange/amber header.
-func writeSelfApprovedSheet(f *excelize.File, sheet string, details []DetailRow, linkStyle int) error {
+func topKey(m map[string]int) string {
+	best, bestN := "", 0
+	for k, n := range m {
+		if n > bestN || (n == bestN && k < best) {
+			best, bestN = k, n
+		}
+	}
+	if best == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s (%d)", best, bestN)
+}
+
+// --- By Author ------------------------------------------------------------
+
+func (b *xlsxBuilder) writeByAuthor(rows []ByAuthorRow) error {
+	sheet := SheetByAuthor
+	f := b.f
+
+	headers := []string{"Author", "Commits", "Non-Compliant", "Self-Approved", "Stale", "Post-Merge", "Compliance %"}
+	b.writeHeaderRow(sheet, headers, b.headerBlue)
+
+	pctFmt := "0.0"
+	pctStyle, _ := f.NewStyle(&excelize.Style{CustomNumFmt: &pctFmt})
+
+	for i, r := range rows {
+		row := i + 2
+		f.SetCellValue(sheet, cellName(1, row), sanitizeCell(r.Author))
+		f.SetCellValue(sheet, cellName(2, row), r.Commits)
+		f.SetCellValue(sheet, cellName(3, row), r.NonCompliant)
+		f.SetCellValue(sheet, cellName(4, row), r.SelfApproved)
+		f.SetCellValue(sheet, cellName(5, row), r.StaleApproval)
+		f.SetCellValue(sheet, cellName(6, row), r.PostMergeConcern)
+		pctCell := cellName(7, row)
+		f.SetCellValue(sheet, pctCell, r.CompliancePct)
+		f.SetCellStyle(sheet, pctCell, pctCell, pctStyle)
+	}
+
+	b.finalizeSheet(sheet, headers, len(rows))
+	widths := []float64{22, 10, 14, 14, 10, 12, 13}
+	applyWidths(f, sheet, widths)
+	return nil
+}
+
+// --- Decision Matrix ------------------------------------------------------
+
+func (b *xlsxBuilder) writeDecisionMatrix(details []DetailRow) error {
+	sheet := SheetDecisionMatrix
+	f := b.f
+
 	headers := []string{
-		"Org", "Repo", "SHA", "Author", "Reviewer", "Date", "PR #",
-		"Branch", "Merge Verification", "Message",
+		// Identity
+		"Repo", "SHA", "PR #", "PR Count", "Author", "Merged By", "Date", "Branch", "Merge Strategy",
+		// Rules
+		"R1 Exempt", "R2 Empty", "R3 HasPR", "R4 FinalApproval", "R4b Stale", "R4c PostMerge", "R5 SelfApproval", "R6 OwnerCheck", "R7 Verdict", "R8 RevertWaiver",
+		// Evidence
+		"Approvers", "Reverted SHA", "Revert Verification", "Merge Verification", "Annotations", "Reasons",
+		// Action
+		"Severity", "Action",
 	}
+	b.writeHeaderRow(sheet, headers, b.headerBlue)
 
-	headerStyle, err := f.NewStyle(&excelize.Style{
-		Font:      &excelize.Font{Bold: true, Color: "FFFFFF"},
-		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"E67E00"}},
-		Alignment: &excelize.Alignment{Horizontal: "center"},
-	})
-	if err != nil {
-		return err
-	}
-
-	// Write headers
-	for col, h := range headers {
-		cell := cellName(col+1, 1)
-		f.SetCellValue(sheet, cell, h)
-		f.SetCellStyle(sheet, cell, cell, headerStyle)
-	}
-
-	// Write data rows
 	for i, d := range details {
 		row := i + 2
+		o := DeriveRuleOutcomes(d)
+		sev, _, action := SynthesizeAction(d, o)
 
-		shaCell := cellName(3, row)
-		shaDisplay := d.SHA
-		if len(shaDisplay) > 8 {
-			shaDisplay = shaDisplay[:8]
-		}
-		if d.CommitHref != "" {
-			f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, escapeFormulaURL(d.CommitHref), shaDisplay))
-			f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
-		} else {
-			f.SetCellValue(sheet, shaCell, shaDisplay)
-		}
-
-		f.SetCellValue(sheet, cellName(1, row), d.Org)
-		f.SetCellValue(sheet, cellName(2, row), d.Repo)
-		f.SetCellValue(sheet, cellName(4, row), sanitizeCell(d.AuthorLogin))
-		f.SetCellValue(sheet, cellName(5, row), sanitizeCell(d.ApproverLogins))
-		f.SetCellValue(sheet, cellName(6, row), d.CommittedAt.Format("2006-01-02 15:04"))
-
-		// PR # with hyperlink
-		prCell := cellName(7, row)
-		if d.PRNumber > 0 {
-			if d.PRHref != "" {
-				f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, escapeFormulaURL(d.PRHref), d.PRNumber))
-				f.SetCellStyle(sheet, prCell, prCell, linkStyle)
-			} else {
-				f.SetCellValue(sheet, prCell, fmt.Sprintf("#%d", d.PRNumber))
-			}
-		}
-
+		f.SetCellValue(sheet, cellName(1, row), d.Org+"/"+d.Repo)
+		b.writeSHACell(sheet, cellName(2, row), d.SHA, d.CommitHref)
+		b.writePRCell(sheet, cellName(3, row), d.PRNumber, d.PRHref)
+		f.SetCellValue(sheet, cellName(4, row), d.PRCount)
+		f.SetCellValue(sheet, cellName(5, row), sanitizeCell(d.AuthorLogin))
+		f.SetCellValue(sheet, cellName(6, row), sanitizeCell(d.MergedByLogin))
+		f.SetCellValue(sheet, cellName(7, row), d.CommittedAt.Format("2006-01-02 15:04"))
 		f.SetCellValue(sheet, cellName(8, row), sanitizeCell(d.BranchName))
-		f.SetCellValue(sheet, cellName(9, row), d.MergeVerification)
-		f.SetCellValue(sheet, cellName(10, row), sanitizeCell(truncate(d.Message, 80)))
-	}
+		f.SetCellValue(sheet, cellName(9, row), d.MergeStrategy)
 
-	// Auto-filter
-	lastCell := cellName(len(headers), max(len(details)+1, 1))
-	f.AutoFilter(sheet, "A1:"+lastCell, nil)
-
-	// Freeze header row
-	f.SetPanes(sheet, &excelize.Panes{
-		Freeze:      true,
-		Split:       false,
-		XSplit:      0,
-		YSplit:      1,
-		TopLeftCell: "A2",
-		ActivePane:  "bottomLeft",
-	})
-
-	widths := []float64{12, 25, 12, 15, 15, 18, 8, 20, 18, 40}
-	for i, w := range widths {
-		colName, _ := excelize.ColumnNumberToName(i + 1)
-		f.SetColWidth(sheet, colName, colName, w)
-	}
-
-	return nil
-}
-
-// writeDetailRowWithHyperlinks writes a single detail row using the normal (non-streaming)
-// writer, enabling hyperlinks on SHA and PR columns.
-func writeDetailRowWithHyperlinks(f *excelize.File, sheet string, row int, d DetailRow, linkStyle int) {
-	shaDisplay := d.SHA
-	if len(shaDisplay) > 8 {
-		shaDisplay = shaDisplay[:8]
-	}
-
-	msg := truncate(d.Message, 80)
-	dateStr := d.CommittedAt.Format("2006-01-02 15:04")
-
-	approvedStr := "No"
-	if d.HasFinalApproval {
-		approvedStr = "Yes"
-	}
-	compliantStr := "No"
-	if d.IsCompliant {
-		compliantStr = "Yes"
-	}
-	selfApprovedStr := "No"
-	if d.IsSelfApproved {
-		selfApprovedStr = "Yes"
-	}
-
-	// Location: Org, Repo, SHA, PR #
-	f.SetCellValue(sheet, cellName(1, row), d.Org)
-	f.SetCellValue(sheet, cellName(2, row), d.Repo)
-	shaCell := cellName(3, row)
-	if d.CommitHref != "" {
-		f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, escapeFormulaURL(d.CommitHref), shaDisplay))
-		f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
-	} else {
-		f.SetCellValue(sheet, shaCell, shaDisplay)
-	}
-	prCell := cellName(4, row)
-	if d.PRNumber > 0 {
-		if d.PRHref != "" {
-			f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, escapeFormulaURL(d.PRHref), d.PRNumber))
-			f.SetCellStyle(sheet, prCell, prCell, linkStyle)
-		} else {
-			f.SetCellValue(sheet, prCell, fmt.Sprintf("#%d", d.PRNumber))
+		// Rule columns with conditional styling.
+		outcomes := []RuleOutcome{
+			o.R1Exempt, o.R2Empty, o.R3HasPR, o.R4FinalApproval, o.R4bStale, o.R4cPostMergeConcern,
+			o.R5SelfApproval, o.R6OwnerCheck, o.R7Verdict, o.R8RevertWaiver,
 		}
-	}
-
-	// People: Author, Committer, Merged By, Approver
-	f.SetCellValue(sheet, cellName(5, row), sanitizeCell(d.AuthorLogin))
-	f.SetCellValue(sheet, cellName(6, row), sanitizeCell(d.CommitterLogin))
-	f.SetCellValue(sheet, cellName(7, row), sanitizeCell(d.MergedByLogin))
-	f.SetCellValue(sheet, cellName(8, row), sanitizeCell(d.ApproverLogins))
-
-	// Approval
-	f.SetCellValue(sheet, cellName(9, row), approvedStr)
-	f.SetCellValue(sheet, cellName(10, row), selfApprovedStr)
-	f.SetCellValue(sheet, cellName(11, row), d.OwnerApprovalCheck)
-
-	// Result
-	f.SetCellValue(sheet, cellName(12, row), compliantStr)
-	f.SetCellValue(sheet, cellName(13, row), sanitizeCell(d.Reasons))
-	f.SetCellValue(sheet, cellName(14, row), d.MergeStrategy)
-	f.SetCellValue(sheet, cellName(15, row), sanitizeCell(d.PRCommitAuthorLogins))
-
-	// Context: Date, Branch, Message
-	f.SetCellValue(sheet, cellName(16, row), dateStr)
-	f.SetCellValue(sheet, cellName(17, row), sanitizeCell(d.BranchName))
-	f.SetCellValue(sheet, cellName(18, row), sanitizeCell(msg))
-
-	// Binary reason columns for filtering/sorting
-	f.SetCellValue(sheet, cellName(19, row), boolToYesNo(!d.HasPR))
-	f.SetCellValue(sheet, cellName(20, row), boolToYesNo(d.HasStaleApproval))
-	f.SetCellValue(sheet, cellName(21, row), boolToYesNo(d.HasPostMergeConcern))
-	f.SetCellValue(sheet, cellName(22, row), boolToYesNo(d.IsCleanRevert))
-	f.SetCellValue(sheet, cellName(23, row), d.RevertVerification)
-	f.SetCellValue(sheet, cellName(24, row), boolToYesNo(d.IsCleanMerge))
-	f.SetCellValue(sheet, cellName(25, row), d.MergeVerification)
-	f.SetCellValue(sheet, cellName(26, row), boolToYesNo(d.IsSelfApproved))
-	f.SetCellValue(sheet, cellName(27, row), boolToYesNo(!d.HasFinalApproval && !d.IsSelfApproved))
-
-	// Annotations — informational tags attached by the detector pass
-	// (automation markers, etc.). See internal/sync/annotations.go.
-	f.SetCellValue(sheet, cellName(28, row), sanitizeCell(d.Annotations))
-
-	// Other PRs — commits with more than one associated PR. Excel cells
-	// support one hyperlink each; we link to the first other PR and list
-	// all numbers as the display text. The "Multiple PRs" sheet is the
-	// canonical place to click through each.
-	if len(d.OtherPRs) > 0 {
-		cell := cellName(29, row)
-		parts := make([]string, len(d.OtherPRs))
-		for i, op := range d.OtherPRs {
-			parts[i] = fmt.Sprintf("#%d", op.Number)
-		}
-		display := strings.Join(parts, ", ")
-		if href := d.OtherPRs[0].Href; href != "" {
-			f.SetCellFormula(sheet, cell, fmt.Sprintf(`HYPERLINK("%s","%s")`, escapeFormulaURL(href), display))
-			f.SetCellStyle(sheet, cell, cell, linkStyle)
-		} else {
-			f.SetCellValue(sheet, cell, display)
-		}
-	}
-}
-
-// writeStaleApprovalsSheet writes commits where approval existed but was stale (pre-force-push).
-func writeStaleApprovalsSheet(f *excelize.File, sheet string, details []DetailRow, linkStyle int) error {
-	headers := []string{
-		"Org", "Repo", "SHA", "Author", "Date", "PR #",
-		"Branch", "Approvers", "Merge Verification", "Compliant?", "Reasons", "Message",
-	}
-
-	headerStyle, err := f.NewStyle(&excelize.Style{
-		Font:      &excelize.Font{Bold: true, Color: "FFFFFF"},
-		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"B85C00"}},
-		Alignment: &excelize.Alignment{Horizontal: "center"},
-	})
-	if err != nil {
-		return err
-	}
-
-	for col, h := range headers {
-		cell := cellName(col+1, 1)
-		f.SetCellValue(sheet, cell, h)
-		f.SetCellStyle(sheet, cell, cell, headerStyle)
-	}
-
-	for i, d := range details {
-		row := i + 2
-
-		shaCell := cellName(3, row)
-		shaDisplay := d.SHA
-		if len(shaDisplay) > 8 {
-			shaDisplay = shaDisplay[:8]
-		}
-		if d.CommitHref != "" {
-			f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, escapeFormulaURL(d.CommitHref), shaDisplay))
-			f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
-		} else {
-			f.SetCellValue(sheet, shaCell, shaDisplay)
-		}
-
-		f.SetCellValue(sheet, cellName(1, row), d.Org)
-		f.SetCellValue(sheet, cellName(2, row), d.Repo)
-		f.SetCellValue(sheet, cellName(4, row), d.AuthorLogin)
-		f.SetCellValue(sheet, cellName(5, row), d.CommittedAt.Format("2006-01-02 15:04"))
-
-		prCell := cellName(6, row)
-		if d.PRNumber > 0 {
-			if d.PRHref != "" {
-				f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, escapeFormulaURL(d.PRHref), d.PRNumber))
-				f.SetCellStyle(sheet, prCell, prCell, linkStyle)
-			} else {
-				f.SetCellValue(sheet, prCell, fmt.Sprintf("#%d", d.PRNumber))
+		for j, oc := range outcomes {
+			cell := cellName(10+j, row)
+			f.SetCellValue(sheet, cell, string(oc))
+			if style, ok := b.outcomeStyles[oc]; ok {
+				f.SetCellStyle(sheet, cell, cell, style)
 			}
 		}
 
-		f.SetCellValue(sheet, cellName(7, row), sanitizeCell(d.BranchName))
-		f.SetCellValue(sheet, cellName(8, row), sanitizeCell(d.ApproverLogins))
-		f.SetCellValue(sheet, cellName(9, row), d.MergeVerification)
-		compliantStr := "No"
-		if d.IsCompliant {
-			compliantStr = "Yes"
-		}
-		f.SetCellValue(sheet, cellName(10, row), compliantStr)
-		f.SetCellValue(sheet, cellName(11, row), sanitizeCell(d.Reasons))
-		f.SetCellValue(sheet, cellName(12, row), sanitizeCell(truncate(d.Message, 80)))
-	}
-
-	lastCell := cellName(len(headers), max(len(details)+1, 1))
-	f.AutoFilter(sheet, "A1:"+lastCell, nil)
-
-	f.SetPanes(sheet, &excelize.Panes{
-		Freeze: true, XSplit: 0, YSplit: 1,
-		TopLeftCell: "A2", ActivePane: "bottomLeft",
-	})
-
-	widths := []float64{12, 25, 12, 15, 18, 8, 20, 20, 18, 10, 40, 40}
-	for i, w := range widths {
-		colName, _ := excelize.ColumnNumberToName(i + 1)
-		f.SetColWidth(sheet, colName, colName, w)
-	}
-
-	return nil
-}
-
-// writePostMergeConcernsSheet writes commits where a reviewer submitted a
-// CHANGES_REQUESTED or DISMISSED review after the PR merged. Informational
-// — compliance may still be true because the review state at merge was clean.
-func writePostMergeConcernsSheet(f *excelize.File, sheet string, details []DetailRow, linkStyle int) error {
-	headers := []string{
-		"Org", "Repo", "SHA", "Author", "Date", "PR #",
-		"Branch", "Approvers", "Merge Verification", "Compliant?", "Reasons", "Message",
-	}
-
-	headerStyle, err := f.NewStyle(&excelize.Style{
-		Font:      &excelize.Font{Bold: true, Color: "FFFFFF"},
-		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"8B4789"}},
-		Alignment: &excelize.Alignment{Horizontal: "center"},
-	})
-	if err != nil {
-		return err
-	}
-
-	for col, h := range headers {
-		cell := cellName(col+1, 1)
-		f.SetCellValue(sheet, cell, h)
-		f.SetCellStyle(sheet, cell, cell, headerStyle)
-	}
-
-	for i, d := range details {
-		row := i + 2
-
-		shaCell := cellName(3, row)
-		shaDisplay := d.SHA
-		if len(shaDisplay) > 8 {
-			shaDisplay = shaDisplay[:8]
-		}
-		if d.CommitHref != "" {
-			f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, escapeFormulaURL(d.CommitHref), shaDisplay))
-			f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
-		} else {
-			f.SetCellValue(sheet, shaCell, shaDisplay)
-		}
-
-		f.SetCellValue(sheet, cellName(1, row), d.Org)
-		f.SetCellValue(sheet, cellName(2, row), d.Repo)
-		f.SetCellValue(sheet, cellName(4, row), d.AuthorLogin)
-		f.SetCellValue(sheet, cellName(5, row), d.CommittedAt.Format("2006-01-02 15:04"))
-
-		prCell := cellName(6, row)
-		if d.PRNumber > 0 {
-			if d.PRHref != "" {
-				f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, escapeFormulaURL(d.PRHref), d.PRNumber))
-				f.SetCellStyle(sheet, prCell, prCell, linkStyle)
-			} else {
-				f.SetCellValue(sheet, prCell, fmt.Sprintf("#%d", d.PRNumber))
-			}
-		}
-
-		f.SetCellValue(sheet, cellName(7, row), sanitizeCell(d.BranchName))
-		f.SetCellValue(sheet, cellName(8, row), sanitizeCell(d.ApproverLogins))
-		f.SetCellValue(sheet, cellName(9, row), d.MergeVerification)
-		compliantStr := "No"
-		if d.IsCompliant {
-			compliantStr = "Yes"
-		}
-		f.SetCellValue(sheet, cellName(10, row), compliantStr)
-		f.SetCellValue(sheet, cellName(11, row), sanitizeCell(d.Reasons))
-		f.SetCellValue(sheet, cellName(12, row), sanitizeCell(truncate(d.Message, 80)))
-	}
-
-	lastCell := cellName(len(headers), max(len(details)+1, 1))
-	f.AutoFilter(sheet, "A1:"+lastCell, nil)
-
-	f.SetPanes(sheet, &excelize.Panes{
-		Freeze: true, XSplit: 0, YSplit: 1,
-		TopLeftCell: "A2", ActivePane: "bottomLeft",
-	})
-
-	widths := []float64{12, 25, 12, 15, 18, 8, 20, 20, 18, 10, 40, 40}
-	for i, w := range widths {
-		colName, _ := excelize.ColumnNumberToName(i + 1)
-		f.SetColWidth(sheet, colName, colName, w)
-	}
-
-	return nil
-}
-
-// writeCleanRevertsSheet writes commits that are verified clean reverts
-// (bot auto-revert or diff-verified manual revert). Informational — compliance
-// may still be true; clean-revert policy is tracked separately from approval.
-func writeCleanRevertsSheet(f *excelize.File, sheet string, details []DetailRow, linkStyle int) error {
-	headers := []string{
-		"Org", "Repo", "SHA", "Author", "Date", "PR #",
-		"Branch", "Reverted SHA", "Verification", "Merge Verification", "Compliant?", "Message",
-	}
-
-	headerStyle, err := f.NewStyle(&excelize.Style{
-		Font:      &excelize.Font{Bold: true, Color: "FFFFFF"},
-		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"5B9BD5"}},
-		Alignment: &excelize.Alignment{Horizontal: "center"},
-	})
-	if err != nil {
-		return err
-	}
-
-	for col, h := range headers {
-		cell := cellName(col+1, 1)
-		f.SetCellValue(sheet, cell, h)
-		f.SetCellStyle(sheet, cell, cell, headerStyle)
-	}
-
-	for i, d := range details {
-		row := i + 2
-
-		shaCell := cellName(3, row)
-		shaDisplay := d.SHA
-		if len(shaDisplay) > 8 {
-			shaDisplay = shaDisplay[:8]
-		}
-		if d.CommitHref != "" {
-			f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, escapeFormulaURL(d.CommitHref), shaDisplay))
-			f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
-		} else {
-			f.SetCellValue(sheet, shaCell, shaDisplay)
-		}
-
-		f.SetCellValue(sheet, cellName(1, row), d.Org)
-		f.SetCellValue(sheet, cellName(2, row), d.Repo)
-		f.SetCellValue(sheet, cellName(4, row), d.AuthorLogin)
-		f.SetCellValue(sheet, cellName(5, row), d.CommittedAt.Format("2006-01-02 15:04"))
-
-		prCell := cellName(6, row)
-		if d.PRNumber > 0 {
-			if d.PRHref != "" {
-				f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, escapeFormulaURL(d.PRHref), d.PRNumber))
-				f.SetCellStyle(sheet, prCell, prCell, linkStyle)
-			} else {
-				f.SetCellValue(sheet, prCell, fmt.Sprintf("#%d", d.PRNumber))
-			}
-		}
-
-		f.SetCellValue(sheet, cellName(7, row), sanitizeCell(d.BranchName))
-
-		// Reverted SHA — hyperlink to the reverted commit.
-		revSHACell := cellName(8, row)
+		f.SetCellValue(sheet, cellName(20, row), sanitizeCell(d.ApproverLogins))
 		if d.RevertedSHA != "" {
 			revShort := d.RevertedSHA
 			if len(revShort) > 8 {
 				revShort = revShort[:8]
 			}
-			// Construct commit URL from the repo; the reverted commit may or
-			// may not be the same repo (almost always is in practice).
-			revHref := fmt.Sprintf("https://github.com/%s/%s/commit/%s", d.Org, d.Repo, d.RevertedSHA)
-			f.SetCellFormula(sheet, revSHACell, fmt.Sprintf(`HYPERLINK("%s","%s")`, escapeFormulaURL(revHref), revShort))
-			f.SetCellStyle(sheet, revSHACell, revSHACell, linkStyle)
+			href := fmt.Sprintf("https://github.com/%s/%s/commit/%s", d.Org, d.Repo, d.RevertedSHA)
+			cell := cellName(21, row)
+			f.SetCellFormula(sheet, cell, fmt.Sprintf(`HYPERLINK("%s","%s")`, escapeFormulaURL(href), revShort))
+			f.SetCellStyle(sheet, cell, cell, b.linkStyle)
 		}
-
-		f.SetCellValue(sheet, cellName(9, row), d.RevertVerification)
-		f.SetCellValue(sheet, cellName(10, row), d.MergeVerification)
-
-		compliantStr := "No"
-		if d.IsCompliant {
-			compliantStr = "Yes"
-		}
-		f.SetCellValue(sheet, cellName(11, row), compliantStr)
-		f.SetCellValue(sheet, cellName(12, row), sanitizeCell(truncate(d.Message, 80)))
+		f.SetCellValue(sheet, cellName(22, row), d.RevertVerification)
+		f.SetCellValue(sheet, cellName(23, row), d.MergeVerification)
+		f.SetCellValue(sheet, cellName(24, row), sanitizeCell(d.Annotations))
+		f.SetCellValue(sheet, cellName(25, row), sanitizeCell(d.Reasons))
+		f.SetCellValue(sheet, cellName(26, row), string(sev))
+		f.SetCellValue(sheet, cellName(27, row), sanitizeCell(action))
 	}
 
 	lastCell := cellName(len(headers), max(len(details)+1, 1))
 	f.AutoFilter(sheet, "A1:"+lastCell, nil)
-
+	// Freeze header row AND first 3 columns so rule columns scroll
+	// horizontally against fixed Repo/SHA/PR identity.
 	f.SetPanes(sheet, &excelize.Panes{
-		Freeze: true, XSplit: 0, YSplit: 1,
-		TopLeftCell: "A2", ActivePane: "bottomLeft",
+		Freeze: true, XSplit: 3, YSplit: 1,
+		TopLeftCell: "D2", ActivePane: "bottomRight",
 	})
-
-	widths := []float64{12, 25, 12, 15, 18, 8, 20, 12, 16, 18, 10, 50}
-	for i, w := range widths {
-		colName, _ := excelize.ColumnNumberToName(i + 1)
-		f.SetColWidth(sheet, colName, colName, w)
-	}
-
+	widths := []float64{22, 12, 8, 8, 16, 16, 18, 18, 14, 10, 10, 10, 16, 10, 14, 14, 14, 10, 14, 24, 14, 18, 18, 22, 40, 10, 40}
+	applyWidths(f, sheet, widths)
 	return nil
 }
 
-// writeCleanMergesSheet writes commits that are verified clean merges — two
-// parents, no conflict-resolution or post-merge edit (files[] empty).
-// Informational — compliance may still be true; clean-merge policy is
-// tracked separately from approval.
-func writeCleanMergesSheet(f *excelize.File, sheet string, details []DetailRow, linkStyle int) error {
-	headers := []string{
-		"Org", "Repo", "SHA", "Author", "Date", "PR #",
-		"Branch", "Merge Verification", "Compliant?", "Message",
-	}
+// --- Waivers Log ----------------------------------------------------------
 
-	headerStyle, err := f.NewStyle(&excelize.Style{
-		Font:      &excelize.Font{Bold: true, Color: "FFFFFF"},
-		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"4A7F4A"}},
-		Alignment: &excelize.Alignment{Horizontal: "center"},
-	})
-	if err != nil {
-		return err
-	}
+func (b *xlsxBuilder) writeWaiversLog(details []DetailRow) error {
+	sheet := SheetWaiversLog
+	f := b.f
 
-	for col, h := range headers {
-		cell := cellName(col+1, 1)
-		f.SetCellValue(sheet, cell, h)
-		f.SetCellStyle(sheet, cell, cell, headerStyle)
-	}
+	headers := []string{"Repo", "SHA", "Waiver Type", "Evidence", "Author", "Date", "PR #", "Message"}
+	b.writeHeaderRow(sheet, headers, b.headerGrey)
 
-	for i, d := range details {
-		row := i + 2
-
-		shaCell := cellName(3, row)
-		shaDisplay := d.SHA
-		if len(shaDisplay) > 8 {
-			shaDisplay = shaDisplay[:8]
-		}
-		if d.CommitHref != "" {
-			f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, escapeFormulaURL(d.CommitHref), shaDisplay))
-			f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
-		} else {
-			f.SetCellValue(sheet, shaCell, shaDisplay)
+	row := 2
+	for _, d := range details {
+		// A single commit may carry several waiver tags — emit one row per.
+		emit := func(kind, evidence string) {
+			f.SetCellValue(sheet, cellName(1, row), d.Org+"/"+d.Repo)
+			b.writeSHACell(sheet, cellName(2, row), d.SHA, d.CommitHref)
+			f.SetCellValue(sheet, cellName(3, row), kind)
+			f.SetCellValue(sheet, cellName(4, row), sanitizeCell(evidence))
+			f.SetCellValue(sheet, cellName(5, row), sanitizeCell(d.AuthorLogin))
+			f.SetCellValue(sheet, cellName(6, row), d.CommittedAt.Format("2006-01-02 15:04"))
+			b.writePRCell(sheet, cellName(7, row), d.PRNumber, d.PRHref)
+			f.SetCellValue(sheet, cellName(8, row), sanitizeCell(truncate(d.Message, 80)))
+			row++
 		}
 
-		f.SetCellValue(sheet, cellName(1, row), d.Org)
-		f.SetCellValue(sheet, cellName(2, row), d.Repo)
-		f.SetCellValue(sheet, cellName(4, row), d.AuthorLogin)
-		f.SetCellValue(sheet, cellName(5, row), d.CommittedAt.Format("2006-01-02 15:04"))
-
-		prCell := cellName(6, row)
-		if d.PRNumber > 0 {
-			if d.PRHref != "" {
-				f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, escapeFormulaURL(d.PRHref), d.PRNumber))
-				f.SetCellStyle(sheet, prCell, prCell, linkStyle)
-			} else {
-				f.SetCellValue(sheet, prCell, fmt.Sprintf("#%d", d.PRNumber))
+		if d.IsExemptAuthor {
+			emit("exempt-author", "author "+d.AuthorLogin+" in exemptions config")
+		}
+		if d.IsEmptyCommit {
+			emit("empty-commit", "0 additions / 0 deletions")
+		}
+		if d.IsCleanRevert {
+			ev := "clean revert"
+			if d.RevertedSHA != "" {
+				ev = fmt.Sprintf("reverts %s (%s)", shortSHA(d.RevertedSHA), d.RevertVerification)
 			}
+			emit("clean-revert", ev)
 		}
-
-		f.SetCellValue(sheet, cellName(7, row), sanitizeCell(d.BranchName))
-		f.SetCellValue(sheet, cellName(8, row), d.MergeVerification)
-
-		compliantStr := "No"
-		if d.IsCompliant {
-			compliantStr = "Yes"
+		if d.IsCleanMerge {
+			emit("clean-merge", "2-parent web-flow merge, verified signature")
 		}
-		f.SetCellValue(sheet, cellName(9, row), compliantStr)
-		f.SetCellValue(sheet, cellName(10, row), sanitizeCell(truncate(d.Message, 80)))
+		if d.IsBot && !d.IsExemptAuthor {
+			emit("bot", "author login ends in [bot]")
+		}
 	}
 
-	lastCell := cellName(len(headers), max(len(details)+1, 1))
-	f.AutoFilter(sheet, "A1:"+lastCell, nil)
-
-	f.SetPanes(sheet, &excelize.Panes{
-		Freeze: true, XSplit: 0, YSplit: 1,
-		TopLeftCell: "A2", ActivePane: "bottomLeft",
-	})
-
-	widths := []float64{12, 25, 12, 15, 18, 8, 20, 18, 10, 50}
-	for i, w := range widths {
-		colName, _ := excelize.ColumnNumberToName(i + 1)
-		f.SetColWidth(sheet, colName, colName, w)
-	}
-
+	dataRows := row - 2
+	b.finalizeSheet(sheet, headers, dataRows)
+	widths := []float64{22, 12, 16, 48, 16, 18, 8, 50}
+	applyWidths(f, sheet, widths)
 	return nil
 }
 
-// writeMultiplePRsSheet writes commits that have more than one associated PR.
-func writeMultiplePRsSheet(f *excelize.File, sheet string, rows []MultiplePRRow, linkStyle int) error {
-	headers := []string{
-		"Org", "Repo", "SHA", "Commit Author", "Date",
-		"PR Count", "PR #", "PR Title", "PR Author", "Merged By", "Audited PR?",
-	}
+// --- Multiple PRs ---------------------------------------------------------
 
-	headerStyle, err := f.NewStyle(&excelize.Style{
-		Font:      &excelize.Font{Bold: true, Color: "FFFFFF"},
-		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"7030A0"}},
-		Alignment: &excelize.Alignment{Horizontal: "center"},
-	})
-	if err != nil {
-		return err
-	}
+func (b *xlsxBuilder) writeMultiplePRs(rows []MultiplePRRow) error {
+	sheet := SheetMultiplePRs
+	f := b.f
 
-	for col, h := range headers {
-		cell := cellName(col+1, 1)
-		f.SetCellValue(sheet, cell, h)
-		f.SetCellStyle(sheet, cell, cell, headerStyle)
-	}
+	headers := []string{"Repo", "SHA", "Commit Author", "Date", "PR Count", "PR #", "PR Title", "PR Author", "Merged By", "Audited PR?"}
+	b.writeHeaderRow(sheet, headers, b.headerBlue)
 
 	for i, m := range rows {
-		row := i + 2
-
-		shaCell := cellName(3, row)
-		shaDisplay := m.SHA
-		if len(shaDisplay) > 8 {
-			shaDisplay = shaDisplay[:8]
-		}
-		if m.CommitHref != "" {
-			f.SetCellFormula(sheet, shaCell, fmt.Sprintf(`HYPERLINK("%s","%s")`, escapeFormulaURL(m.CommitHref), shaDisplay))
-			f.SetCellStyle(sheet, shaCell, shaCell, linkStyle)
-		} else {
-			f.SetCellValue(sheet, shaCell, shaDisplay)
-		}
-
-		f.SetCellValue(sheet, cellName(1, row), m.Org)
-		f.SetCellValue(sheet, cellName(2, row), m.Repo)
-		f.SetCellValue(sheet, cellName(4, row), m.AuthorLogin)
-		f.SetCellValue(sheet, cellName(5, row), m.CommittedAt.Format("2006-01-02 15:04"))
-		f.SetCellValue(sheet, cellName(6, row), m.PRCount)
-
-		prCell := cellName(7, row)
-		if m.PRHref != "" {
-			f.SetCellFormula(sheet, prCell, fmt.Sprintf(`HYPERLINK("%s","#%d")`, escapeFormulaURL(m.PRHref), m.PRNumber))
-			f.SetCellStyle(sheet, prCell, prCell, linkStyle)
-		} else {
-			f.SetCellValue(sheet, prCell, fmt.Sprintf("#%d", m.PRNumber))
-		}
-
-		f.SetCellValue(sheet, cellName(8, row), sanitizeCell(truncate(m.PRTitle, 60)))
-		f.SetCellValue(sheet, cellName(9, row), sanitizeCell(m.PRAuthorLogin))
-		f.SetCellValue(sheet, cellName(10, row), sanitizeCell(m.PRMergedBy))
-		auditedStr := "No"
-		if m.IsAuditedPR {
-			auditedStr = "Yes"
-		}
-		f.SetCellValue(sheet, cellName(11, row), auditedStr)
+		r := i + 2
+		f.SetCellValue(sheet, cellName(1, r), m.Org+"/"+m.Repo)
+		b.writeSHACell(sheet, cellName(2, r), m.SHA, m.CommitHref)
+		f.SetCellValue(sheet, cellName(3, r), sanitizeCell(m.AuthorLogin))
+		f.SetCellValue(sheet, cellName(4, r), m.CommittedAt.Format("2006-01-02 15:04"))
+		f.SetCellValue(sheet, cellName(5, r), m.PRCount)
+		b.writePRCell(sheet, cellName(6, r), m.PRNumber, m.PRHref)
+		f.SetCellValue(sheet, cellName(7, r), sanitizeCell(truncate(m.PRTitle, 60)))
+		f.SetCellValue(sheet, cellName(8, r), sanitizeCell(m.PRAuthorLogin))
+		f.SetCellValue(sheet, cellName(9, r), sanitizeCell(m.PRMergedBy))
+		f.SetCellValue(sheet, cellName(10, r), boolToYesNo(m.IsAuditedPR))
 	}
 
-	lastCell := cellName(len(headers), max(len(rows)+1, 1))
-	f.AutoFilter(sheet, "A1:"+lastCell, nil)
-
-	f.SetPanes(sheet, &excelize.Panes{
-		Freeze: true, XSplit: 0, YSplit: 1,
-		TopLeftCell: "A2", ActivePane: "bottomLeft",
-	})
-
-	widths := []float64{12, 25, 12, 15, 18, 10, 8, 40, 15, 15, 12}
-	for i, w := range widths {
-		colName, _ := excelize.ColumnNumberToName(i + 1)
-		f.SetColWidth(sheet, colName, colName, w)
-	}
-
+	b.finalizeSheet(sheet, headers, len(rows))
+	widths := []float64{22, 12, 18, 18, 10, 8, 40, 16, 16, 12}
+	applyWidths(f, sheet, widths)
 	return nil
 }
 
-func setDetailColumnWidths(f *excelize.File, sheet string, numCols int) {
-	widths := []float64{12, 25, 12, 10, 15, 15, 15, 20, 10, 14, 15, 10, 40, 14, 25, 18, 20, 40, 8, 14, 18, 12, 18, 12, 18, 14, 13, 20, 22}
-	for i := 0; i < numCols && i < len(widths); i++ {
+// --- Shared helpers -------------------------------------------------------
+
+func (b *xlsxBuilder) writeHeaderRow(sheet string, headers []string, style int) {
+	for col, h := range headers {
+		cell := cellName(col+1, 1)
+		b.f.SetCellValue(sheet, cell, h)
+		b.f.SetCellStyle(sheet, cell, cell, style)
+	}
+}
+
+func (b *xlsxBuilder) finalizeSheet(sheet string, headers []string, dataRows int) {
+	lastCell := cellName(len(headers), max(dataRows+1, 1))
+	b.f.AutoFilter(sheet, "A1:"+lastCell, nil)
+	b.f.SetPanes(sheet, &excelize.Panes{
+		Freeze: true, YSplit: 1, TopLeftCell: "A2", ActivePane: "bottomLeft",
+	})
+}
+
+func (b *xlsxBuilder) writeSHACell(sheet, cell, sha, href string) {
+	display := shortSHA(sha)
+	if href == "" {
+		b.f.SetCellValue(sheet, cell, display)
+		return
+	}
+	b.f.SetCellFormula(sheet, cell, fmt.Sprintf(`HYPERLINK("%s","%s")`, escapeFormulaURL(href), display))
+	b.f.SetCellStyle(sheet, cell, cell, b.linkStyle)
+}
+
+func (b *xlsxBuilder) writePRCell(sheet, cell string, number int, href string) {
+	if number <= 0 {
+		return
+	}
+	display := fmt.Sprintf("#%d", number)
+	if href == "" {
+		b.f.SetCellValue(sheet, cell, display)
+		return
+	}
+	b.f.SetCellFormula(sheet, cell, fmt.Sprintf(`HYPERLINK("%s","%s")`, escapeFormulaURL(href), display))
+	b.f.SetCellStyle(sheet, cell, cell, b.linkStyle)
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 8 {
+		return sha[:8]
+	}
+	return sha
+}
+
+func applyWidths(f *excelize.File, sheet string, widths []float64) {
+	for i, w := range widths {
 		colName, _ := excelize.ColumnNumberToName(i + 1)
-		f.SetColWidth(sheet, colName, colName, widths[i])
+		f.SetColWidth(sheet, colName, colName, w)
 	}
 }
 

@@ -408,19 +408,23 @@ The `report` command queries `audit_results` joined with `commits` and `pull_req
 - **table**: ASCII summary + details to stdout
 - **csv**: Per-commit rows with all fields
 - **json**: `{ summary: [...], details: [...] }`
-- **xlsx**: 10-sheet workbook with hyperlinks, conditional formatting, and auto-filters:
-  1. **Summary** — per-repo compliance rollup with counts and percentages
-  2. **All Commits** — every commit with clickable SHA and PR links; an "Other PRs" column lists additional associated PR numbers with a hyperlink to the first (see the "Multiple PRs" sheet for the full breakdown)
-  3. **Non-Compliant** — failures with empty Resolution column for auditor notes
-  4. **Exemptions** — bots, exempt authors, empty commits
-  5. **Self-Approved** — commits where the only approval came from a code contributor
-  6. **Stale Approvals** — commits merged after approval became stale (force-push after review)
-  7. **Post-Merge Concerns** — commits where a reviewer submitted `CHANGES_REQUESTED` or `DISMISSED` *after* merge (`HasPostMergeConcern=true`); orthogonal to compliance
-  8. **Clean Reverts** — diff-verified reverts (`AutoRevert` or `ManualRevert` with `revert_verification = diff-verified`), all of which are flipped compliant by rule 8's R1 waiver
-  9. **Clean Merges** — 2-parent merge commits whose message matches a recognised merge prefix (`ClassifyMerge = CleanMerge`)
-  10. **Multiple PRs** — commits associated with more than one PR (one row per commit-PR pair)
+- **xlsx**: 8-sheet workbook organized as three layers — Action → Overview → Trace/Evidence. Each sheet has a single, distinct purpose; the same commit is never fragmented across multiple sheets.
 
-Summary columns are partitioned: `Total = Compliant + Non-Compliant`. Bots, Exempt, Empty, Self-Approved, Stale Approvals, Post-Merge Concerns, Clean Reverts, Clean Merges, and Multiple PRs are cross-cutting annotations that overlap with the primary partition.
+  **Layer 1 — Action**
+  1. **README** — legend for rule codes (R1..R8), cell-outcome values, and report period. Static; one-screen orientation for new auditors.
+  2. **Action Queue** — prioritized list of commits requiring action. Rows are non-compliant commits with no waiver (R1 exempt / R2 empty / R8 clean revert). Sorted by severity desc, then repo, then commit date desc. Columns: Priority, Severity (High/Medium/Low), Repo, SHA, PR #, Author, Merged By, Failing Rule, Prescribed Action, Days Since Commit, Resolution, Notes. Severity and action are synthesized by `SynthesizeAction` (`internal/report/rules.go`) from the primary failing rule.
+
+  **Layer 2 — Overview (filterable totals)**
+  3. **Summary** — per-repo rollup with `Total = Compliant + Non-Compliant`. Beyond the primary partition, columns cover waived (R1/R2/R8 + clean-merge), per-rule fire counts (R3 NoPR, R4 NoFinal, R6 OwnerFail), and informational tags (Self-Approved, Stale, Post-Merge, Clean Reverts, Clean Merges, Bots, Exempt, Empty, Multiple PRs). Compliance % is color-coded; a TOTAL row carries SUM/IF formulas.
+  4. **By Rule** — triage pivot with one row per rule (R1..R8) showing fires, compliant vs non-compliant outcomes, waived, top repo, top author. Answers "which rule drags the fleet?".
+  5. **By Author** — per-author rollup (Commits / Non-Compliant / Self-Approved / Stale / Post-Merge / Compliance %). Sorted by non-compliant desc. Coaching/pattern view.
+
+  **Layer 3 — Trace & Evidence**
+  6. **Decision Matrix** — one row per commit, one column per rule. Cells are `pass` / `fail` / `skip` / `n/a` / `missing` / `waived`, color-coded. Freezes first 3 columns (Repo / SHA / PR #) so rule columns scroll horizontally against fixed identity. Autofilter on any rule column produces per-rule drill-downs — replaces the old dedicated Self-Approved / Stale / Post-Merge / Clean Reverts / Clean Merges sheets.
+  7. **Waivers Log** — one row per waiver tag (exempt-author / empty-commit / clean-revert / clean-merge / bot) with the evidence that led the tool to skip full evaluation. Required for defending the report: shows what the tool did NOT flag and why.
+  8. **Multiple PRs** — one row per commit-PR pair for commits with `pr_count > 1`.
+
+Rule outcomes in the Decision Matrix are derived by `DeriveRuleOutcomes` (`internal/report/rules.go`) from the stored `audit_results` booleans — no additional SQL runs. The derivation mirrors the decision order in `internal/sync/audit.go` (R1 → R2 → R3 → R4 → R5 → R6 → R7 → R8); any change to the audit logic must be reflected there.
 
 ## Package structure
 
@@ -452,8 +456,9 @@ internal/
   model/
     types.go                 Domain types (Commit, PR, Review, CheckRun, AuditResult, EnrichmentResult)
   report/
-    report.go                Summary/detail queries, table/csv/json formatting
-    xlsx.go                  10-sheet XLSX generation
+    report.go                Summary/detail/by-author queries, table/csv/json formatting
+    rules.go                 DeriveRuleOutcomes + SynthesizeAction — per-commit rule trace and action synthesis
+    xlsx.go                  8-sheet XLSX generation (README, Action Queue, Summary, By Rule, By Author, Decision Matrix, Waivers Log, Multiple PRs)
   sync/
     pipeline.go              Orchestration (discover → fetch → enrich → audit)
     audit.go                 EvaluateCommit decision tree (rules 1–8)

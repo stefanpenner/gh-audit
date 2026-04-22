@@ -37,22 +37,44 @@ type ReportOpts struct {
 }
 
 // SummaryRow is a per-repo compliance summary.
+//
+// Fields fall into four groups:
+//   - primary partition: Total = Compliant + Non-Compliant
+//   - waiver tags: Bot / Exempt / Empty / CleanRevert / CleanMerge
+//   - per-rule fires: R3..R6 count how many commits tripped each rule
+//   - derived aggregates: ActionQueueCount, WaivedCount, CompliancePct
 type SummaryRow struct {
-	Org                    string  `json:"org"`
-	Repo                   string  `json:"repo"`
-	TotalCommits           int     `json:"total_commits"`
-	CompliantCount         int     `json:"compliant_count"`
-	NonCompliantCount      int     `json:"non_compliant_count"`
-	BotCount               int     `json:"bot_count"`
-	ExemptCount            int     `json:"exempt_count"`
-	EmptyCount             int     `json:"empty_count"`
-	SelfApprovedCount      int     `json:"self_approved_count"`
-	StaleApprovalCount     int     `json:"stale_approval_count"`
-	PostMergeConcernCount  int     `json:"post_merge_concern_count"`
-	CleanRevertCount       int     `json:"clean_revert_count"`
-	CleanMergeCount        int     `json:"clean_merge_count"`
-	MultiplePRCount        int     `json:"multiple_pr_count"`
-	CompliancePct          float64 `json:"compliance_pct"`
+	Org                   string  `json:"org"`
+	Repo                  string  `json:"repo"`
+	TotalCommits          int     `json:"total_commits"`
+	CompliantCount        int     `json:"compliant_count"`
+	NonCompliantCount     int     `json:"non_compliant_count"`
+	BotCount              int     `json:"bot_count"`
+	ExemptCount           int     `json:"exempt_count"`
+	EmptyCount            int     `json:"empty_count"`
+	SelfApprovedCount     int     `json:"self_approved_count"`
+	StaleApprovalCount    int     `json:"stale_approval_count"`
+	PostMergeConcernCount int     `json:"post_merge_concern_count"`
+	CleanRevertCount      int     `json:"clean_revert_count"`
+	CleanMergeCount       int     `json:"clean_merge_count"`
+	MultiplePRCount       int     `json:"multiple_pr_count"`
+	ActionQueueCount      int     `json:"action_queue_count"`
+	WaivedCount           int     `json:"waived_count"`
+	R3NoPRCount           int     `json:"r3_no_pr_count"`
+	R4NoFinalCount        int     `json:"r4_no_final_count"`
+	R6OwnerFailCount      int     `json:"r6_owner_fail_count"`
+	CompliancePct         float64 `json:"compliance_pct"`
+}
+
+// ByAuthorRow is a per-author rollup used by the "By Author" sheet.
+type ByAuthorRow struct {
+	Author                string  `json:"author"`
+	Commits               int     `json:"commits"`
+	NonCompliant          int     `json:"non_compliant"`
+	SelfApproved          int     `json:"self_approved"`
+	StaleApproval         int     `json:"stale_approval"`
+	PostMergeConcern      int     `json:"post_merge_concern"`
+	CompliancePct         float64 `json:"compliance_pct"`
 }
 
 // An OtherPR is a PR associated with a commit other than the audited one.
@@ -218,7 +240,22 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 			COUNT(*) FILTER (WHERE COALESCE(a.has_post_merge_concern, false) = true) AS post_merge_concern_count,
 			COUNT(*) FILTER (WHERE COALESCE(a.is_clean_revert, false) = true) AS clean_revert_count,
 			COUNT(*) FILTER (WHERE COALESCE(a.is_clean_merge, false) = true) AS clean_merge_count,
-			COUNT(*) FILTER (WHERE COALESCE(a.pr_count, 0) > 1) AS multiple_pr_count
+			COUNT(*) FILTER (WHERE COALESCE(a.pr_count, 0) > 1) AS multiple_pr_count,
+			COUNT(*) FILTER (WHERE a.is_compliant = false
+			                   AND COALESCE(a.is_exempt_author, false) = false
+			                   AND a.is_empty_commit = false
+			                   AND COALESCE(a.is_clean_revert, false) = false) AS action_queue_count,
+			COUNT(*) FILTER (WHERE COALESCE(a.is_exempt_author, false) = true
+			                    OR a.is_empty_commit = true
+			                    OR COALESCE(a.is_clean_revert, false) = true
+			                    OR COALESCE(a.is_clean_merge, false) = true) AS waived_count,
+			COUNT(*) FILTER (WHERE a.has_pr = false
+			                   AND a.is_empty_commit = false
+			                   AND COALESCE(a.is_exempt_author, false) = false) AS r3_no_pr_count,
+			COUNT(*) FILTER (WHERE a.has_pr = true
+			                   AND a.has_final_approval = false
+			                   AND COALESCE(a.is_self_approved, false) = false) AS r4_no_final_count,
+			COUNT(*) FILTER (WHERE a.owner_approval_check IN ('failure', 'missing')) AS r6_owner_fail_count
 		FROM audit_results a
 		JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
 		WHERE 1=1
@@ -249,7 +286,8 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 		var s SummaryRow
 		if err := rows.Scan(&s.Org, &s.Repo, &s.TotalCommits,
 			&s.CompliantCount, &s.NonCompliantCount, &s.BotCount, &s.ExemptCount, &s.EmptyCount,
-			&s.SelfApprovedCount, &s.StaleApprovalCount, &s.PostMergeConcernCount, &s.CleanRevertCount, &s.CleanMergeCount, &s.MultiplePRCount); err != nil {
+			&s.SelfApprovedCount, &s.StaleApprovalCount, &s.PostMergeConcernCount, &s.CleanRevertCount, &s.CleanMergeCount, &s.MultiplePRCount,
+			&s.ActionQueueCount, &s.WaivedCount, &s.R3NoPRCount, &s.R4NoFinalCount, &s.R6OwnerFailCount); err != nil {
 			return nil, fmt.Errorf("scan summary: %w", err)
 		}
 		if s.TotalCommits > 0 {
@@ -577,6 +615,58 @@ func parseOtherPRs(s string) []OtherPR {
 		result = append(result, OtherPR{Number: n, Href: href})
 	}
 	return result
+}
+
+// GetByAuthor returns per-author aggregates for the "By Author" sheet. Rows
+// are sorted by non-compliant count desc, ties broken by total commits desc.
+func (r *Reporter) GetByAuthor(ctx context.Context, opts ReportOpts) ([]ByAuthorRow, error) {
+	query := `
+		SELECT
+			COALESCE(c.author_login, '') AS author,
+			COUNT(*) AS commits,
+			COUNT(*) FILTER (WHERE a.is_compliant = false) AS non_compliant,
+			COUNT(*) FILTER (WHERE COALESCE(a.is_self_approved, false) = true) AS self_approved,
+			COUNT(*) FILTER (WHERE COALESCE(a.has_stale_approval, false) = true) AS stale_approval,
+			COUNT(*) FILTER (WHERE COALESCE(a.has_post_merge_concern, false) = true) AS post_merge_concern
+		FROM audit_results a
+		JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
+		WHERE 1=1
+	` + defaultBranchExists + `
+	`
+
+	args := []any{r.branchRegex}
+	query, args = appendRepoFilter(query, args, opts)
+	if !opts.Since.IsZero() {
+		query += " AND c.committed_at >= ?"
+		args = append(args, opts.Since)
+	}
+	if !opts.Until.IsZero() {
+		query += " AND c.committed_at < ?"
+		args = append(args, opts.Until)
+	}
+
+	query += ` GROUP BY COALESCE(c.author_login, '')
+	           ORDER BY non_compliant DESC, commits DESC, author`
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query by author: %w", err)
+	}
+	defer rows.Close()
+
+	var result []ByAuthorRow
+	for rows.Next() {
+		var b ByAuthorRow
+		if err := rows.Scan(&b.Author, &b.Commits, &b.NonCompliant,
+			&b.SelfApproved, &b.StaleApproval, &b.PostMergeConcern); err != nil {
+			return nil, fmt.Errorf("scan by author: %w", err)
+		}
+		if b.Commits > 0 {
+			b.CompliancePct = math.Round(float64(b.Commits-b.NonCompliant)/float64(b.Commits)*1000.0) / 10.0
+		}
+		result = append(result, b)
+	}
+	return result, rows.Err()
 }
 
 // truncate shortens a string to maxLen runes, adding "..." if truncated.

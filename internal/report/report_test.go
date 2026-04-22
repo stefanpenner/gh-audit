@@ -556,21 +556,24 @@ func TestGenerateXLSXHasExpectedSheets(t *testing.T) {
 	defer xf.Close()
 
 	sheets := xf.GetSheetList()
-	expected := []string{"Summary", "All Commits", "Non-Compliant", "Exemptions", "Self-Approved", "Stale Approvals", "Post-Merge Concerns", "Clean Reverts", "Clean Merges", "Multiple PRs"}
+	expected := []string{SheetREADME, SheetActionQueue, SheetSummary, SheetByRule, SheetByAuthor, SheetDecisionMatrix, SheetWaiversLog, SheetMultiplePRs}
 	require.Len(t, sheets, len(expected))
 	for i, name := range expected {
 		assert.Equal(t, name, sheets[i], "sheet %d", i)
 	}
 }
 
-func TestSelfApprovedSheetContainsOnlySelfApproved(t *testing.T) {
+// Self-approved commits are a compliance failure; they surface as rows in the
+// Action Queue with rule R5 SelfApproval.
+func TestSelfApprovedAppearsInActionQueue(t *testing.T) {
 	db := setupTestDB(t)
 	now := time.Now().Truncate(time.Second)
 
 	insertCommit(t, db, "org1", "repo1", "selfaaa11", "dev1", now, 10, 5)
 	insertCommit(t, db, "org1", "repo1", "normalbbb", "dev2", now, 10, 5)
 
-	insertAuditResultFull(t, db, "org1", "repo1", "selfaaa11", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: true, isSelfApproved: true, prNumber: 1, approvers: []string{"dev1"}, reasons: []string{"self-approved"}})
+	// Self-approved = non-compliant (only approver is the author).
+	insertAuditResultFull(t, db, "org1", "repo1", "selfaaa11", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: false, isSelfApproved: true, prNumber: 1, approvers: []string{"dev1"}, reasons: []string{"self-approved"}})
 	insertAuditResultFull(t, db, "org1", "repo1", "normalbbb", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: true, prNumber: 2, approvers: []string{"reviewer1"}, reasons: []string{"compliant"}})
 
 	r := New(db)
@@ -583,12 +586,16 @@ func TestSelfApprovedSheetContainsOnlySelfApproved(t *testing.T) {
 	require.NoError(t, err, "opening xlsx")
 	defer xf.Close()
 
-	rows, err := xf.GetRows("Self-Approved")
-	require.NoError(t, err, "getting Self-Approved rows")
-	require.Len(t, rows, 2) // 1 header + 1 data row
+	rows, err := xf.GetRows(SheetActionQueue)
+	require.NoError(t, err, "getting Action Queue rows")
+	require.Len(t, rows, 2, "1 header + 1 self-approved row")
 
-	formula, _ := xf.GetCellFormula("Self-Approved", "C2")
+	// SHA column is D (4th).
+	formula, _ := xf.GetCellFormula(SheetActionQueue, "D2")
 	assert.Contains(t, formula, "selfaaa1", "expected self-approved SHA in formula, got: %s", formula)
+	// Failing Rule column is H (8th).
+	rule, _ := xf.GetCellValue(SheetActionQueue, "H2")
+	assert.Contains(t, rule, "R5", "expected R5 SelfApproval rule, got: %s", rule)
 }
 
 func TestSummarySelfApprovedCount(t *testing.T) {
@@ -625,14 +632,15 @@ func TestHyperlinksOnNonStreamingSheets(t *testing.T) {
 	require.NoError(t, err, "opening xlsx")
 	defer xf.Close()
 
-	// Non-Compliant sheet should have a HYPERLINK formula on SHA cell (C2)
-	formula, err := xf.GetCellFormula("Non-Compliant", "C2")
-	require.NoError(t, err, "getting formula C2")
+	// Action Queue SHA column is D (4th); non-compliant no-PR commit should
+	// land there with a HYPERLINK formula.
+	formula, err := xf.GetCellFormula(SheetActionQueue, "D2")
+	require.NoError(t, err, "getting formula D2")
 	assert.Contains(t, formula, "abc12345", "expected SHA in HYPERLINK formula")
 	assert.Contains(t, formula, "https://github.com/org1/repo1/commit/abc12345678", "expected commit URL in HYPERLINK formula")
 }
 
-func TestEmptyNonCompliantSheetStillCreated(t *testing.T) {
+func TestEmptyActionQueueSheetStillCreated(t *testing.T) {
 	db := setupTestDB(t)
 	now := time.Now().Truncate(time.Second)
 
@@ -642,7 +650,7 @@ func TestEmptyNonCompliantSheetStillCreated(t *testing.T) {
 
 	r := New(db)
 
-	tmpFile := t.TempDir() + "/test-empty-nc.xlsx"
+	tmpFile := t.TempDir() + "/test-empty-aq.xlsx"
 	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
 	require.NoError(t, err, "GenerateXLSX")
 
@@ -651,12 +659,11 @@ func TestEmptyNonCompliantSheetStillCreated(t *testing.T) {
 	defer xf.Close()
 
 	sheets := xf.GetSheetList()
-	assert.Contains(t, sheets, "Non-Compliant", "Non-Compliant sheet should exist even with zero non-compliant rows")
+	assert.Contains(t, sheets, SheetActionQueue, "Action Queue sheet should exist even when nothing needs action")
 
-	// Should have header row only
-	rows, err := xf.GetRows("Non-Compliant")
-	require.NoError(t, err, "getting Non-Compliant rows")
-	assert.Len(t, rows, 1, "expected header only in empty Non-Compliant sheet")
+	rows, err := xf.GetRows(SheetActionQueue)
+	require.NoError(t, err, "getting Action Queue rows")
+	assert.Len(t, rows, 1, "expected header only in empty Action Queue sheet")
 }
 
 func TestDetailRowMergedByLogin(t *testing.T) {
@@ -779,15 +786,17 @@ func TestGetMultiplePRDetails(t *testing.T) {
 	assert.Equal(t, 1, auditedCount, "exactly one row should be the audited PR")
 }
 
-func TestStaleApprovalsSheetContent(t *testing.T) {
+// Stale approvals surface in the Decision Matrix with R4b Stale = fail,
+// filterable alongside every other commit in one sheet.
+func TestStaleApprovalSurfacesInDecisionMatrix(t *testing.T) {
 	db := setupTestDB(t)
 	now := time.Now().Truncate(time.Second)
 
 	insertCommit(t, db, "org1", "repo1", "staleaaa11", "dev1", now, 10, 5)
-	insertCommit(t, db, "org1", "repo1", "normalbbb2", "dev2", now, 10, 5)
+	insertCommit(t, db, "org1", "repo1", "normalbbb2", "dev2", now.Add(-time.Hour), 10, 5)
 	insertCommitBranch(t, db, "org1", "repo1", "staleaaa11", "main")
 
-	insertAuditResultFull(t, db, "org1", "repo1", "staleaaa11", auditResultOpts{hasPR: true, hasApproval: false, hasStaleApproval: true, prNumber: 1, approvers: []string{"old-reviewer"}, reasons: []string{"approval is stale — not on final commit"}})
+	insertAuditResultFull(t, db, "org1", "repo1", "staleaaa11", auditResultOpts{hasPR: true, hasApproval: false, hasStaleApproval: true, prNumber: 1, approvers: []string{"old-reviewer"}, reasons: []string{"approval is stale"}})
 	insertAuditResultFull(t, db, "org1", "repo1", "normalbbb2", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: true, prNumber: 2, approvers: []string{"reviewer1"}, reasons: []string{"compliant"}})
 
 	r := New(db)
@@ -800,12 +809,26 @@ func TestStaleApprovalsSheetContent(t *testing.T) {
 	require.NoError(t, err, "opening xlsx")
 	defer xf.Close()
 
-	rows, err := xf.GetRows("Stale Approvals")
-	require.NoError(t, err, "getting Stale Approvals rows")
-	require.Len(t, rows, 2, "expected 1 header + 1 data row")
+	rows, err := xf.GetRows(SheetDecisionMatrix)
+	require.NoError(t, err, "getting Decision Matrix rows")
+	require.Len(t, rows, 3, "expected 1 header + 2 commit rows")
 
-	formula, _ := xf.GetCellFormula("Stale Approvals", "C2")
-	assert.Contains(t, formula, "staleaaa", "expected stale SHA in formula, got: %s", formula)
+	// Rule R4b Stale is column N (14th: 9 identity + 5th rule column).
+	// Find the stale row by SHA in column B (2nd).
+	staleRow := -1
+	for i, r := range rows {
+		if i == 0 {
+			continue
+		}
+		if formula, _ := xf.GetCellFormula(SheetDecisionMatrix, fmt.Sprintf("B%d", i+1)); strings.Contains(formula, "staleaaa") {
+			staleRow = i + 1
+			break
+		}
+		_ = r
+	}
+	require.Greater(t, staleRow, 0, "expected to find stale SHA in Decision Matrix")
+	cell, _ := xf.GetCellValue(SheetDecisionMatrix, fmt.Sprintf("N%d", staleRow))
+	assert.Equal(t, "fail", cell, "R4b Stale should read fail")
 }
 
 func TestDetailRowHasStaleApprovalAndPRCount(t *testing.T) {
