@@ -130,47 +130,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 			}
 		}
 
-		// Per-reviewer last-state tracking: for each reviewer on the final commit,
-		// keep the review whose state reflects their standing at merge time.
-		// Only DISMISSED or CHANGES_REQUESTED supersede an earlier APPROVED from
-		// the same reviewer (SOX requirement — a withdrawn approval must not
-		// count). A later COMMENTED review does NOT revoke an earlier APPROVED,
-		// matching GitHub's UI behaviour where commenting after approving
-		// leaves the approval intact. Reviews after MergedAt are excluded so
-		// compliance reflects the point-in-time state at merge; post-merge
-		// activity is tracked separately via HasPostMergeConcern.
-		latestByReviewer := make(map[string]model.Review)
-		hasPostMergeConcern := false
-		for _, review := range enrichment.Reviews {
-			if review.PRNumber != pr.Number || review.CommitID != pr.HeadSHA {
-				continue
-			}
-			if review.ReviewerLogin == "" {
-				continue
-			}
-			if !pr.MergedAt.IsZero() && review.SubmittedAt.After(pr.MergedAt) {
-				if review.State == "CHANGES_REQUESTED" || review.State == "DISMISSED" {
-					hasPostMergeConcern = true
-				}
-				continue
-			}
-			existing, exists := latestByReviewer[review.ReviewerLogin]
-			if !exists {
-				latestByReviewer[review.ReviewerLogin] = review
-				continue
-			}
-			if !review.SubmittedAt.After(existing.SubmittedAt) {
-				continue
-			}
-			// Newer review from same reviewer: only overwrite if it's a
-			// state-changing review (APPROVED, CHANGES_REQUESTED, DISMISSED).
-			// Plain COMMENTED reviews carry no state and must not clobber an
-			// earlier APPROVED.
-			if review.State == "COMMENTED" && existing.State == "APPROVED" {
-				continue
-			}
-			latestByReviewer[review.ReviewerLogin] = review
-		}
+		latestByReviewer, hasPostMergeConcern := latestReviewStatesOnFinal(enrichment.Reviews, *pr)
 
 		hasApprovalOnFinal := false
 		hasSelfApproval := false
@@ -285,29 +245,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		result.PRNumber = bestPR.Number
 		result.PRHref = bestPR.Href
 		result.ApproverLogins = bestApprovers
-		// Use per-reviewer last-state tracking for fallback too, with the same
-		// merged-at cutoff used in the per-PR loop.
-		fallbackLatest := make(map[string]model.Review)
-		for _, review := range enrichment.Reviews {
-			if review.PRNumber != bestPR.Number || review.CommitID != bestPR.HeadSHA || review.ReviewerLogin == "" {
-				continue
-			}
-			if !bestPR.MergedAt.IsZero() && review.SubmittedAt.After(bestPR.MergedAt) {
-				continue
-			}
-			existing, exists := fallbackLatest[review.ReviewerLogin]
-			if !exists {
-				fallbackLatest[review.ReviewerLogin] = review
-				continue
-			}
-			if !review.SubmittedAt.After(existing.SubmittedAt) {
-				continue
-			}
-			if review.State == "COMMENTED" && existing.State == "APPROVED" {
-				continue
-			}
-			fallbackLatest[review.ReviewerLogin] = review
-		}
+		fallbackLatest, _ := latestReviewStatesOnFinal(enrichment.Reviews, *bestPR)
 		for _, review := range fallbackLatest {
 			if review.State == "APPROVED" && !isSelfApproval(review, commit, *bestPR, bestPRCommitAuthors) {
 				result.HasFinalApproval = true
@@ -379,6 +317,42 @@ func applyEmptyCommitFallback(result *model.AuditResult, commit *model.Commit, f
 	result.Reasons = []string{"empty commit"}
 	result.MergeStrategy = classifyMergeStrategy(*commit, false)
 	return true
+}
+
+// latestReviewStatesOnFinal folds a PR's reviews into per-reviewer latest
+// state on pr.HeadSHA, honouring the merge-time cutoff. Reviews submitted
+// after pr.MergedAt are excluded from the map; a post-merge DISMISSED or
+// CHANGES_REQUESTED instead sets the second return value for caller to
+// surface as HasPostMergeConcern. A later COMMENTED review never clobbers
+// an earlier APPROVED from the same reviewer (matches GitHub's UI, where
+// commenting after approving leaves the approval intact).
+func latestReviewStatesOnFinal(reviews []model.Review, pr model.PullRequest) (map[string]model.Review, bool) {
+	latest := make(map[string]model.Review)
+	postMergeConcern := false
+	for _, review := range reviews {
+		if review.PRNumber != pr.Number || review.CommitID != pr.HeadSHA || review.ReviewerLogin == "" {
+			continue
+		}
+		if !pr.MergedAt.IsZero() && review.SubmittedAt.After(pr.MergedAt) {
+			if review.State == "CHANGES_REQUESTED" || review.State == "DISMISSED" {
+				postMergeConcern = true
+			}
+			continue
+		}
+		existing, exists := latest[review.ReviewerLogin]
+		if !exists {
+			latest[review.ReviewerLogin] = review
+			continue
+		}
+		if !review.SubmittedAt.After(existing.SubmittedAt) {
+			continue
+		}
+		if review.State == "COMMENTED" && existing.State == "APPROVED" {
+			continue
+		}
+		latest[review.ReviewerLogin] = review
+	}
+	return latest, postMergeConcern
 }
 
 // evaluateRequiredChecks determines the owner approval status for a set of
