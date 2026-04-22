@@ -482,39 +482,52 @@ func (ce *CachingEnricher) classifyRevertAndMerge(
 	}
 
 	// --- Revert classification ---
-	kind, revertedSHA := ParseRevert(result.Commit.Message)
+	kind, _ := ParseRevert(result.Commit.Message)
 	switch kind {
 	case NotRevert, RevertOfRevert:
 		result.RevertVerification = "none"
 	case AutoRevert:
+		// AutoRevert's two SHAs come straight from the message; no
+		// branch-name fallback needed.
+		_, sha := ParseRevert(result.Commit.Message)
 		result.IsCleanRevert = true
 		result.RevertVerification = "message-only"
-		result.RevertedSHA = revertedSHA
+		result.RevertedSHA = sha
 	case ManualRevert:
-		result.RevertedSHA = revertedSHA
-		switch {
-		case revertedSHA == "":
-			// Message matched the prefix but no `This reverts commit <sha>`
-			// trailer was found — can't verify, mark as message-only.
+		// Prefer the `This reverts commit <sha>` trailer (what `git revert`
+		// emits). Fall back to GitHub's `revert-<N>-<base-branch>` head-
+		// branch convention for commits produced by the "Revert" button,
+		// which doesn't emit the trailer.
+		revertedSHA, err := ResolveRevertedSHA(result.Commit.Message, result.PRs, func(n int) (*model.PullRequest, error) {
+			return ce.getPR(ctx, org, repo, n)
+		})
+		if err != nil {
+			// Transient lookup failure — treat as unverifiable rather
+			// than letting the error bubble out and fail enrichment.
 			result.RevertVerification = "message-only"
-		default:
-			revertFiles, err := fetchOwn()
-			if err != nil {
-				result.RevertVerification = "message-only"
-				break
-			}
-			ce.Stats.RevertVerification.Add(1)
-			revertedFiles, err := ce.client.GetCommitFiles(ctx, org, repo, revertedSHA)
-			if err != nil {
-				result.RevertVerification = "message-only"
-				break
-			}
-			if IsCleanRevertDiff(revertFiles, revertedFiles) {
-				result.IsCleanRevert = true
-				result.RevertVerification = "diff-verified"
-			} else {
-				result.RevertVerification = "diff-mismatch"
-			}
+			break
+		}
+		result.RevertedSHA = revertedSHA
+		if revertedSHA == "" {
+			result.RevertVerification = "message-only"
+			break
+		}
+		revertFiles, err := fetchOwn()
+		if err != nil {
+			result.RevertVerification = "message-only"
+			break
+		}
+		ce.Stats.RevertVerification.Add(1)
+		revertedFiles, err := ce.client.GetCommitFiles(ctx, org, repo, revertedSHA)
+		if err != nil {
+			result.RevertVerification = "message-only"
+			break
+		}
+		if IsCleanRevertDiff(revertFiles, revertedFiles) {
+			result.IsCleanRevert = true
+			result.RevertVerification = "diff-verified"
+		} else {
+			result.RevertVerification = "diff-mismatch"
 		}
 	}
 

@@ -17,3 +17,30 @@ jobs:
           go-version-file: go.mod
 
       - run: go test ./...
+
+  fixtures:
+    name: Validate against stefanpenner/gh-audit-test-fixtures
+    runs-on: ubuntu-latest
+    # Advisory at first — red here won't block the PR. Flip to blocking
+    # once the check has been stable for a few weeks.
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install DuckDB CLI
+        run: |
+          curl -fsSL https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
+          unzip -o /tmp/duckdb.zip -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/duckdb"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Validate fixtures
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/test-fixtures.sh

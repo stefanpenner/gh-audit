@@ -3,6 +3,7 @@ package github
 import (
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/stefanpenner/gh-audit/internal/model"
@@ -30,6 +31,10 @@ const (
 var (
 	autoRevertRe            = regexp.MustCompile(`^Automatic revert of ([0-9a-f]{40})\.\.([0-9a-f]{40})`)
 	manualRevertBodySHAre   = regexp.MustCompile(`This reverts commit ([0-9a-f]{40})`)
+	// revertBranchRe matches the branch-name convention GitHub's "Revert"
+	// button uses: `revert-<N>-<base-branch>`, where N is the number of the
+	// PR being reverted (NOT the number of the revert PR itself).
+	revertBranchRe = regexp.MustCompile(`^revert-(\d+)-`)
 )
 
 // ParseRevert inspects the commit message and returns the revert kind along
@@ -65,6 +70,67 @@ func ParseRevert(message string) (RevertKind, string) {
 		return ManualRevert, ""
 	}
 	return NotRevert, ""
+}
+
+// ParseRevertBranchName returns the number of the pull request being reverted
+// when `branch` follows GitHub's `revert-<N>-<base-branch>` convention, the
+// one github.com's "Revert" button emits. Returns (0, false) for any other
+// branch name, including branches that happen to start with `revert-` but
+// don't carry a numeric PR reference.
+//
+// Note the number returned is the REVERTED PR's number, not the revert PR's.
+// Callers use it to look up the reverted PR's merge_commit_sha, which is the
+// SHA `ParseRevert`'s trailer would have produced if GH's button emitted one.
+func ParseRevertBranchName(branch string) (int, bool) {
+	m := revertBranchRe.FindStringSubmatch(branch)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// ResolveRevertedSHA returns the SHA of the commit being reverted by a
+// ManualRevert, preferring the `This reverts commit <sha>` trailer from
+// the commit message (what `git revert` emits) and falling back to looking
+// up the reverted PR's merge_commit_sha via the `revert-<N>-<base-branch>`
+// convention that GitHub's "Revert" button uses.
+//
+// associatedPRs is the set of PRs discovered via `GET /commits/{sha}/pulls`
+// for the revert commit — typically a single PR, but the fallback iterates
+// defensively in case a commit is linked to more than one.
+//
+// lookupPR resolves a reverted PR number to its full record (in particular,
+// MergeCommitSHA). When nil or when the target PR has no merge SHA the
+// fallback yields "". Returning an error from lookupPR surfaces to the
+// caller so transient API failures can be distinguished from "no match".
+//
+// Returns ("", nil) when neither source yields a SHA — let the caller
+// classify as `message-only`.
+func ResolveRevertedSHA(message string, associatedPRs []model.PullRequest, lookupPR func(number int) (*model.PullRequest, error)) (string, error) {
+	if m := manualRevertBodySHAre.FindStringSubmatch(message); m != nil {
+		return m[1], nil
+	}
+	if lookupPR == nil {
+		return "", nil
+	}
+	for _, pr := range associatedPRs {
+		n, ok := ParseRevertBranchName(pr.HeadBranch)
+		if !ok {
+			continue
+		}
+		target, err := lookupPR(n)
+		if err != nil {
+			return "", err
+		}
+		if target != nil && target.MergeCommitSHA != "" {
+			return target.MergeCommitSHA, nil
+		}
+	}
+	return "", nil
 }
 
 // IsCleanRevertDiff returns true iff the per-file patches in revertFiles are

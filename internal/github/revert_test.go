@@ -57,6 +57,131 @@ func TestParseRevert(t *testing.T) {
 	}
 }
 
+func TestParseRevertBranchName(t *testing.T) {
+	// GH's "Revert" button names revert branches `revert-<N>-<base-branch>`
+	// where N is the number of the PR being reverted. ParseRevertBranchName
+	// extracts N so a no-trailer revert commit can still be diff-verified
+	// by looking up PR N's merge_commit_sha.
+	tests := []struct {
+		name   string
+		branch string
+		want   int
+		wantOK bool
+	}{
+		{"flat GH revert branch", "revert-29-scenario/4.5-gh-revert-clean-base", 29, true},
+		{"revert of a revert (nested)", "revert-33-revert-29-scenario/4.5-clean", 33, true},
+		{"plain feature branch", "feature/add-x", 0, false},
+		{"starts with revert but no number", "revert-foo", 0, false},
+		{"hyphen-bare prefix", "revert-", 0, false},
+		{"empty branch", "", 0, false},
+		{"leading whitespace defeats anchoring", "  revert-29-foo", 0, false},
+		{"multi-digit number", "revert-18413-linkedin-multiproduct/frontend-api", 18413, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := ParseRevertBranchName(tt.branch)
+			assert.Equal(t, tt.wantOK, ok)
+			if tt.wantOK {
+				assert.Equal(t, tt.want, got)
+			}
+		})
+	}
+}
+
+func TestResolveRevertedSHA(t *testing.T) {
+	// ResolveRevertedSHA tries the `This reverts commit <sha>` trailer
+	// first (what `git revert` emits) and falls back to looking up the
+	// reverted PR's merge_commit_sha via the `revert-<N>-` branch-name
+	// convention that GitHub's "Revert" button uses. Both sources produce
+	// the same semantic SHA — the one a caller can feed into
+	// IsCleanRevertDiff for verification.
+
+	const trailerSHA = "abcdef1234567890abcdef1234567890abcdef12"
+	const baseMergeSHA = "fedcba9876543210fedcba9876543210fedcba98"
+
+	t.Run("trailer SHA wins when present", func(t *testing.T) {
+		msg := `Revert "feat: foo"` + "\n\nThis reverts commit " + trailerSHA + "."
+		prs := []model.PullRequest{{Number: 33, HeadBranch: "revert-29-foo"}}
+		lookup := func(int) (*model.PullRequest, error) {
+			t.Fatal("lookup should not be consulted when trailer is present")
+			return nil, nil
+		}
+		got, err := ResolveRevertedSHA(msg, prs, lookup)
+		assert.NoError(t, err)
+		assert.Equal(t, trailerSHA, got)
+	})
+
+	t.Run("branch-name fallback when trailer absent", func(t *testing.T) {
+		msg := `Revert "Scenario 4.5: base (for GH revert button, clean)" (#33)`
+		prs := []model.PullRequest{{Number: 33, HeadBranch: "revert-29-scenario/4.5-clean"}}
+		lookup := func(n int) (*model.PullRequest, error) {
+			assert.Equal(t, 29, n, "lookup should target the reverted PR number from the branch")
+			return &model.PullRequest{Number: 29, MergeCommitSHA: baseMergeSHA}, nil
+		}
+		got, err := ResolveRevertedSHA(msg, prs, lookup)
+		assert.NoError(t, err)
+		assert.Equal(t, baseMergeSHA, got)
+	})
+
+	t.Run("no trailer and no revert-shaped branch → empty", func(t *testing.T) {
+		msg := `Revert "feat: foo"`
+		prs := []model.PullRequest{{Number: 10, HeadBranch: "feature/foo"}}
+		got, err := ResolveRevertedSHA(msg, prs, func(int) (*model.PullRequest, error) {
+			t.Fatal("lookup should not be called when no branch matches")
+			return nil, nil
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, "", got)
+	})
+
+	t.Run("branch matches but target PR has no merge SHA → empty", func(t *testing.T) {
+		msg := `Revert "feat: foo"`
+		prs := []model.PullRequest{{Number: 33, HeadBranch: "revert-29-foo"}}
+		lookup := func(int) (*model.PullRequest, error) {
+			return &model.PullRequest{Number: 29, MergeCommitSHA: ""}, nil
+		}
+		got, err := ResolveRevertedSHA(msg, prs, lookup)
+		assert.NoError(t, err)
+		assert.Equal(t, "", got)
+	})
+
+	t.Run("nil lookup skips the branch-name path", func(t *testing.T) {
+		msg := `Revert "feat: foo"`
+		prs := []model.PullRequest{{Number: 33, HeadBranch: "revert-29-foo"}}
+		got, err := ResolveRevertedSHA(msg, prs, nil)
+		assert.NoError(t, err)
+		assert.Equal(t, "", got)
+	})
+
+	t.Run("lookup error surfaces to caller", func(t *testing.T) {
+		msg := `Revert "feat: foo"`
+		prs := []model.PullRequest{{Number: 33, HeadBranch: "revert-29-foo"}}
+		lookup := func(int) (*model.PullRequest, error) {
+			return nil, assert.AnError
+		}
+		_, err := ResolveRevertedSHA(msg, prs, lookup)
+		assert.Error(t, err)
+	})
+
+	t.Run("first matching branch wins across multiple PRs", func(t *testing.T) {
+		msg := `Revert "feat: foo"`
+		prs := []model.PullRequest{
+			{Number: 100, HeadBranch: "unrelated"},
+			{Number: 33, HeadBranch: "revert-29-foo"},
+			{Number: 34, HeadBranch: "revert-30-bar"}, // should not be consulted
+		}
+		calls := 0
+		lookup := func(n int) (*model.PullRequest, error) {
+			calls++
+			return &model.PullRequest{Number: n, MergeCommitSHA: baseMergeSHA}, nil
+		}
+		got, err := ResolveRevertedSHA(msg, prs, lookup)
+		assert.NoError(t, err)
+		assert.Equal(t, baseMergeSHA, got)
+		assert.Equal(t, 1, calls, "should stop at first successful resolution")
+	})
+}
+
 func TestIsCleanRevertDiff(t *testing.T) {
 	// Single-file clean revert: R adds what A removed and removes what A added.
 	aPatch := "--- a/foo.go\n+++ b/foo.go\n@@ -1,3 +1,4 @@\n line1\n-old line\n+new line\n line2\n"
