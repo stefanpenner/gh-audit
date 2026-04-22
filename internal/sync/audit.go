@@ -21,76 +21,35 @@ type RequiredCheck struct {
 // stats at whatever the caller passed in (typically zero).
 type StatsFetcher func(org, repo, sha string) (additions, deletions int, err error)
 
-// EvaluateCommit determines compliance for a single commit given its enrichment data.
+// EvaluateCommit determines compliance for a single commit by running the
+// audit rule list documented in Architecture.md §1–§8. The function body
+// deliberately reads as that rule list top-to-bottom; each rule delegates to
+// a small helper whose name points back to the Architecture section.
 //
-// The empty-commit fallback (additions == 0 && deletions == 0 → compliant) is
-// evaluated LAST, only after the PR-approval and exempt-author paths have
-// failed. The eager behaviour prior to this change — fetching
-// additions/deletions up-front for every commit — accounted for ~16% of all
-// GitHub REST traffic on a full sweep; most commits pass the approval path
-// and never need stats. fetchStats lets the fallback lazily resolve them only
-// when the audit would otherwise flag the commit non-compliant.
-//
-// Revert waivers (see the clean-revert block below) are standalone: each
-// revert is judged on its own signals (diff verification, or GitHub-server
-// provenance) without looking at the reverted commit's verdict. That keeps
-// the audit single-pass and order-independent. See TODO.md for the stricter
-// "reverted commit must also be compliant" variant.
-//
-// fetchStats may be nil (tests, offline evaluations); the empty-commit
-// fallback is skipped in that case and compliance uses the strict
-// PR-approval path only.
+// Performance notes:
+//   - The empty-commit fallback (§2) is evaluated LAST on commit-with-PRs
+//     paths and only after rules 4–6 fail. Eager prefetching of
+//     additions/deletions previously accounted for ~16% of REST traffic on
+//     full sweeps; fetchStats lets the fallback resolve stats lazily on
+//     already-suspect commits only. A nil fetchStats is tolerated — the
+//     fallback then uses the caller-supplied stats as-is.
+//   - Rule 8 (clean-revert waiver) is standalone: it judges the revert on
+//     its own signals and does not inspect the reverted commit's verdict.
+//     See TODO.md for the stricter cross-commit variant.
 func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []string, requiredChecks []RequiredCheck, fetchStats StatsFetcher) model.AuditResult {
-	result := model.AuditResult{
-		Org:        commit.Org,
-		Repo:       commit.Repo,
-		SHA:        commit.SHA,
-		CommitHref: commit.Href,
+	// Informational fields shared by every return path (revert/merge
+	// signals, annotations, IsBot). Populated once, before any rule runs.
+	result := initAuditResult(commit, enrichment)
+
+	// Rule 1 — Exempt author.
+	if applyExemptAuthorRule(&result, commit, enrichment, exemptAuthors) {
+		return result
 	}
 
-	// Clean-revert and clean-merge signals are informational and orthogonal
-	// to compliance. Copy them early so every return path surfaces them.
-	result.IsCleanRevert = enrichment.IsCleanRevert
-	result.RevertVerification = enrichment.RevertVerification
-	result.RevertedSHA = enrichment.RevertedSHA
-	result.IsCleanMerge = enrichment.IsCleanMerge
-	result.MergeVerification = enrichment.MergeVerification
-
-	// Informational annotations (automation markers, etc.). Computed here
-	// so they're attached to every early-return path. These do not affect
-	// IsCompliant — they're metadata for reviewers.
-	result.Annotations = ComputeAnnotations(commit, enrichment)
-
-	// Detect bot authors (informational — login ending in [bot])
-	if strings.HasSuffix(strings.ToLower(commit.AuthorLogin), "[bot]") {
-		result.IsBot = true
-	}
-
-	// Check exempt author list (compliance — skips review requirements)
-	for _, exempt := range exemptAuthors {
-		if strings.EqualFold(commit.AuthorLogin, exempt) {
-			result.IsExemptAuthor = true
-
-			// For squash merges, check if PR has non-exempt contributors.
-			// If so, the exempt shortcut must not apply — fall through to
-			// normal review checks so the human code gets audited.
-			if hasNonExemptPRContributors(enrichment, exemptAuthors) {
-				break
-			}
-
-			result.IsCompliant = true
-			result.Reasons = []string{"exempt: configured author"}
-			result.MergeStrategy = classifyMergeStrategy(commit, false)
-			return result
-		}
-	}
-
-	// Check for associated PRs
+	// Rule 3 — Has associated PR.
 	if len(enrichment.PRs) == 0 {
 		result.HasPR = false
-		// Empty-commit fallback: a commit with no PR is only non-compliant
-		// if it actually touched files. Resolve stats lazily here so
-		// approved-path commits (the majority) never trigger a REST call.
+		// Rule 2 — Empty commit (no-PR path).
 		if applyEmptyCommitFallback(&result, &commit, fetchStats) {
 			return result
 		}
@@ -99,163 +58,227 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		result.MergeStrategy = classifyMergeStrategy(commit, false)
 		return result
 	}
-
 	result.HasPR = true
 	result.PRCount = len(enrichment.PRs)
 
-	// Evaluate each PR for compliance
-	var bestPR *model.PullRequest
-	var bestReasons []string
-	var bestApprovers []string
-	var bestSelfApproved bool
-	var bestStaleApproval bool
-	var bestPostMergeConcern bool
-	var bestPRCommitAuthors []string
-
+	// Rules 4, 5, 6 — per-PR evaluation (approval on final commit, self-
+	// approval exclusion, required status checks). Rule 7 short-circuits
+	// the loop as soon as any PR satisfies both rule 4 and rule 6.
+	var best prVerdict
 	for i := range enrichment.PRs {
-		pr := &enrichment.PRs[i]
-		prReasons := []string{}
-		prApprovers := []string{}
-
-		// Collect distinct PR commit authors for expanded self-approval checks
-		var prCommitAuthors []string
-		seen := make(map[string]bool)
-		for _, c := range enrichment.PRBranchCommits[pr.Number] {
-			if c.AuthorLogin != "" {
-				lower := strings.ToLower(c.AuthorLogin)
-				if !seen[lower] {
-					seen[lower] = true
-					prCommitAuthors = append(prCommitAuthors, c.AuthorLogin)
-				}
-			}
+		v := evaluatePR(commit, enrichment, &enrichment.PRs[i], requiredChecks)
+		if v.approvalOnFinal && v.ownerApprovalOK {
+			return finalizeCompliantPR(result, commit, enrichment, v)
 		}
-
-		latestByReviewer, hasPostMergeConcern := latestReviewStatesOnFinal(enrichment.Reviews, *pr)
-
-		hasApprovalOnFinal := false
-		hasSelfApproval := false
-		for _, review := range latestByReviewer {
-			if review.State == "APPROVED" {
-				if isSelfApproval(review, commit, *pr, prCommitAuthors) {
-					hasSelfApproval = true
-				} else {
-					hasApprovalOnFinal = true
-					prApprovers = append(prApprovers, review.ReviewerLogin)
-				}
-			}
-		}
-
-		// Detect stale approvals: approvals on an earlier SHA of this PR
-		hasStaleApproval := false
-		if !hasApprovalOnFinal {
-			for _, review := range enrichment.Reviews {
-				if review.PRNumber != pr.Number || review.CommitID == pr.HeadSHA {
-					continue
-				}
-				if review.State == "APPROVED" && !isSelfApproval(review, commit, *pr, prCommitAuthors) {
-					hasStaleApproval = true
-					break
-				}
-			}
-		}
-
-		if !hasApprovalOnFinal {
-			if hasSelfApproval {
-				prReasons = append(prReasons, fmt.Sprintf("self-approved (reviewer is code author) (PR #%d)", pr.Number))
-			} else if hasStaleApproval {
-				prReasons = append(prReasons, fmt.Sprintf("approval is stale — not on final commit (PR #%d)", pr.Number))
-			} else {
-				prReasons = append(prReasons, fmt.Sprintf("no approval on final commit (PR #%d)", pr.Number))
-			}
-		}
-
-		ownerApprovalStatus := evaluateRequiredChecks(enrichment.CheckRuns, pr.HeadSHA, requiredChecks)
-		ownerApprovalOK := ownerApprovalStatus == "" || ownerApprovalStatus == "success"
-
-		if !ownerApprovalOK {
-			prReasons = append(prReasons, fmt.Sprintf("Owner Approval check missing/failed (PR #%d)", pr.Number))
-		}
-
-		// If this PR satisfies all checks, commit is compliant
-		if hasApprovalOnFinal && ownerApprovalOK {
-			result.IsCompliant = true
-			result.HasFinalApproval = true
-			result.HasPostMergeConcern = hasPostMergeConcern
-			result.ApproverLogins = prApprovers
-			result.OwnerApprovalCheck = ownerApprovalStatus
-			result.PRNumber = pr.Number
-			result.PRHref = pr.Href
-			result.Reasons = []string{"compliant"}
-			result.MergeStrategy = classifyMergeStrategy(commit, true)
-			result.PRCommitAuthorLogins = distinctPRBranchAuthors(enrichment.PRBranchCommits)
-			return result
-		}
-
-		// Track best PR (fewest reasons = closest to compliant; highest PR number breaks ties)
-		if bestPR == nil || len(prReasons) < len(bestReasons) || (len(prReasons) == len(bestReasons) && pr.Number > bestPR.Number) {
-			bestPR = pr
-			bestReasons = prReasons
-			bestApprovers = prApprovers
-			bestSelfApproved = hasSelfApproval && !hasApprovalOnFinal
-			bestStaleApproval = hasStaleApproval
-			bestPostMergeConcern = hasPostMergeConcern
-			bestPRCommitAuthors = prCommitAuthors
+		if betterVerdict(v, best) {
+			best = v
 		}
 	}
 
-	// No PR satisfied all checks. Empty-commit fallback: if the commit
-	// didn't actually touch any files (e.g. an empty merge/rebase artefact),
-	// it's trivially compliant regardless of PR review state. Resolve stats
-	// lazily; the approved-PR branch above never reaches this point, so we
-	// only pay the GetCommitDetail cost on already-suspect commits.
+	// Rule 2 — Empty commit (post-PR-loop path). A PR that never modified
+	// bytes is trivially compliant regardless of review state.
 	if applyEmptyCommitFallback(&result, &commit, fetchStats) {
 		return result
 	}
-	// Revert waiver — clean revert only. Evaluated standalone (no
-	// cross-commit lookup). See TODO.md for the stricter "reverted commit
-	// must also be compliant" variant.
-	//
-	// IsCleanRevert == true means one of:
-	//   - AutoRevert (bot-generated, trusted by construction), OR
-	//   - ManualRevert whose diff was verified as the exact inverse of the
-	//     reverted commit (revert_verification == "diff-verified").
-	// A clean revert puts bytes back that were already on master, so it
-	// needs no fresh review. Every other revert shape (conflict-resolved,
-	// message-only, revert-of-revert, hand-crafted without verification)
-	// falls through to the normal PR-approval rules — the bytes landing on
-	// master aren't proven equivalent to previously-reviewed bytes, so a
-	// human should eyeball the change.
-	if revertCompliant, reason := evaluateRevertCompliance(commit, enrichment); revertCompliant {
-		result.IsCompliant = true
-		result.HasFinalApproval = false
-		if bestPR != nil {
-			result.PRNumber = bestPR.Number
-			result.PRHref = bestPR.Href
-		}
-		result.Reasons = []string{reason}
-		result.MergeStrategy = classifyMergeStrategy(commit, bestPR != nil)
-		result.PRCommitAuthorLogins = distinctPRBranchAuthors(enrichment.PRBranchCommits)
-		return result
+
+	// Rule 8 — Clean-revert waiver (standalone).
+	if ok, reason := evaluateRevertCompliance(commit, enrichment); ok {
+		return finalizeRevertWaiver(result, commit, enrichment, best, reason)
 	}
+
+	// Rule 7 — Non-compliant verdict, reporting the best PR's reasons.
+	return finalizeNonCompliant(result, commit, enrichment, best)
+}
+
+// initAuditResult populates the fields shared by every return path: Org/
+// Repo/SHA, the informational revert and merge signals, reviewer-facing
+// annotations, and the IsBot flag. None of these affect IsCompliant.
+func initAuditResult(commit model.Commit, enrichment model.EnrichmentResult) model.AuditResult {
+	result := model.AuditResult{
+		Org:                commit.Org,
+		Repo:               commit.Repo,
+		SHA:                commit.SHA,
+		CommitHref:         commit.Href,
+		IsCleanRevert:      enrichment.IsCleanRevert,
+		RevertVerification: enrichment.RevertVerification,
+		RevertedSHA:        enrichment.RevertedSHA,
+		IsCleanMerge:       enrichment.IsCleanMerge,
+		MergeVerification:  enrichment.MergeVerification,
+		Annotations:        ComputeAnnotations(commit, enrichment),
+	}
+	if strings.HasSuffix(strings.ToLower(commit.AuthorLogin), "[bot]") {
+		result.IsBot = true
+	}
+	return result
+}
+
+// applyExemptAuthorRule implements Architecture.md §1. Returns true iff the
+// commit is waived as exempt (caller should return result as-is). When the
+// commit author matches but the PR contains non-exempt contributors (squash
+// merge with human work), the exemption is NOT granted — IsExemptAuthor is
+// still marked so reviewers can see the match — and the function returns
+// false so downstream rules audit the human code.
+func applyExemptAuthorRule(result *model.AuditResult, commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []string) bool {
+	for _, exempt := range exemptAuthors {
+		if !strings.EqualFold(commit.AuthorLogin, exempt) {
+			continue
+		}
+		result.IsExemptAuthor = true
+		if hasNonExemptPRContributors(enrichment, exemptAuthors) {
+			return false
+		}
+		result.IsCompliant = true
+		result.Reasons = []string{"exempt: configured author"}
+		result.MergeStrategy = classifyMergeStrategy(commit, false)
+		return true
+	}
+	return false
+}
+
+// A prVerdict captures the rules 4–6 outcome for a single PR. It's both the
+// early-return payload (when approvalOnFinal && ownerApprovalOK) and the
+// "closest to compliant" candidate tracked across multiple PRs.
+type prVerdict struct {
+	pr               *model.PullRequest
+	reasons          []string
+	approvers        []string
+	commitAuthors    []string // distinct PR-branch commit authors (for self-approval check)
+	approvalOnFinal  bool     // rule 4: non-self APPROVED on pr.HeadSHA
+	selfApproved     bool     // rule 5: any APPROVED whose reviewer is a code author
+	staleApproval    bool     // rule 4: non-self APPROVED on older SHA
+	postMergeConcern bool     // §4 cutoff: post-merge CHANGES_REQUESTED/DISMISSED
+	ownerApproval    string   // rule 6: "", "success", "failure", "missing"
+	ownerApprovalOK  bool     // rule 6: ownerApproval is "" or "success"
+}
+
+// evaluatePR applies Architecture.md §4 (approval on final commit), §5
+// (self-approval exclusion), and §6 (required status checks) to a single PR
+// and returns the resulting verdict. The function is side-effect free.
+func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *model.PullRequest, requiredChecks []RequiredCheck) prVerdict {
+	v := prVerdict{pr: pr}
+	v.commitAuthors = distinctPRCommitAuthors(enrichment.PRBranchCommits[pr.Number])
+
+	// Rule 4 — per-reviewer latest state on pr.HeadSHA with merge-time cutoff.
+	latestByReviewer, postMergeConcern := latestReviewStatesOnFinal(enrichment.Reviews, *pr)
+	v.postMergeConcern = postMergeConcern
+
+	// Rules 4+5 — classify each APPROVED review as self or independent.
+	for _, review := range latestByReviewer {
+		if review.State != "APPROVED" {
+			continue
+		}
+		if isSelfApproval(review, commit, *pr, v.commitAuthors) {
+			v.selfApproved = true
+			continue
+		}
+		v.approvalOnFinal = true
+		v.approvers = append(v.approvers, review.ReviewerLogin)
+	}
+
+	// Rule 4 — stale-approval detection (only meaningful when no fresh approval).
+	if !v.approvalOnFinal {
+		for _, review := range enrichment.Reviews {
+			if review.PRNumber != pr.Number || review.CommitID == pr.HeadSHA {
+				continue
+			}
+			if review.State == "APPROVED" && !isSelfApproval(review, commit, *pr, v.commitAuthors) {
+				v.staleApproval = true
+				break
+			}
+		}
+	}
+
+	// Reason string when rule 4 fails — distinguishes self-approval, stale,
+	// and never-reviewed so reports point reviewers at the right concern.
+	if !v.approvalOnFinal {
+		switch {
+		case v.selfApproved:
+			v.reasons = append(v.reasons, fmt.Sprintf("self-approved (reviewer is code author) (PR #%d)", pr.Number))
+		case v.staleApproval:
+			v.reasons = append(v.reasons, fmt.Sprintf("approval is stale — not on final commit (PR #%d)", pr.Number))
+		default:
+			v.reasons = append(v.reasons, fmt.Sprintf("no approval on final commit (PR #%d)", pr.Number))
+		}
+	}
+
+	// Rule 6 — required status checks.
+	v.ownerApproval = evaluateRequiredChecks(enrichment.CheckRuns, pr.HeadSHA, requiredChecks)
+	v.ownerApprovalOK = v.ownerApproval == "" || v.ownerApproval == "success"
+	if !v.ownerApprovalOK {
+		v.reasons = append(v.reasons, fmt.Sprintf("Owner Approval check missing/failed (PR #%d)", pr.Number))
+	}
+
+	return v
+}
+
+// betterVerdict reports whether candidate should replace best in the
+// "closest to compliant" tournament (Architecture.md §7). Fewer reasons
+// wins; ties break by higher PR number for deterministic reporting.
+func betterVerdict(candidate, best prVerdict) bool {
+	if best.pr == nil {
+		return true
+	}
+	if len(candidate.reasons) != len(best.reasons) {
+		return len(candidate.reasons) < len(best.reasons)
+	}
+	return candidate.pr.Number > best.pr.Number
+}
+
+// finalizeCompliantPR sets the compliant verdict from a PR that passed both
+// rule 4 (non-self approval on final commit) and rule 6 (required checks).
+func finalizeCompliantPR(result model.AuditResult, commit model.Commit, enrichment model.EnrichmentResult, v prVerdict) model.AuditResult {
+	result.IsCompliant = true
+	result.HasFinalApproval = true
+	result.HasPostMergeConcern = v.postMergeConcern
+	result.ApproverLogins = v.approvers
+	result.OwnerApprovalCheck = v.ownerApproval
+	result.PRNumber = v.pr.Number
+	result.PRHref = v.pr.Href
+	result.Reasons = []string{"compliant"}
+	result.MergeStrategy = classifyMergeStrategy(commit, true)
+	result.PRCommitAuthorLogins = distinctPRBranchAuthors(enrichment.PRBranchCommits)
+	return result
+}
+
+// finalizeRevertWaiver sets the compliant verdict from Architecture.md §8.
+// The best PR (if any) is surfaced for reporting without claiming final
+// approval — the waiver rests on revert provenance, not on review state.
+func finalizeRevertWaiver(result model.AuditResult, commit model.Commit, enrichment model.EnrichmentResult, best prVerdict, reason string) model.AuditResult {
+	result.IsCompliant = true
+	result.HasFinalApproval = false
+	if best.pr != nil {
+		result.PRNumber = best.pr.Number
+		result.PRHref = best.pr.Href
+	}
+	result.Reasons = []string{reason}
+	result.MergeStrategy = classifyMergeStrategy(commit, best.pr != nil)
+	result.PRCommitAuthorLogins = distinctPRBranchAuthors(enrichment.PRBranchCommits)
+	return result
+}
+
+// finalizeNonCompliant sets the negative verdict using the best PR's
+// signals (Architecture.md §7). HasFinalApproval is recomputed from the
+// fallback review-state map so reports can still list an independent
+// approval even when the commit fails for other reasons (e.g. owner check).
+func finalizeNonCompliant(result model.AuditResult, commit model.Commit, enrichment model.EnrichmentResult, best prVerdict) model.AuditResult {
 	result.IsCompliant = false
-	result.IsSelfApproved = bestSelfApproved
-	result.HasStaleApproval = bestStaleApproval
-	result.HasPostMergeConcern = bestPostMergeConcern
-	if bestPR != nil {
-		result.PRNumber = bestPR.Number
-		result.PRHref = bestPR.Href
-		result.ApproverLogins = bestApprovers
-		fallbackLatest, _ := latestReviewStatesOnFinal(enrichment.Reviews, *bestPR)
+	result.IsSelfApproved = best.selfApproved && !best.approvalOnFinal
+	result.HasStaleApproval = best.staleApproval
+	result.HasPostMergeConcern = best.postMergeConcern
+	if best.pr != nil {
+		result.PRNumber = best.pr.Number
+		result.PRHref = best.pr.Href
+		result.ApproverLogins = best.approvers
+		result.OwnerApprovalCheck = best.ownerApproval
+		fallbackLatest, _ := latestReviewStatesOnFinal(enrichment.Reviews, *best.pr)
 		for _, review := range fallbackLatest {
-			if review.State == "APPROVED" && !isSelfApproval(review, commit, *bestPR, bestPRCommitAuthors) {
+			if review.State == "APPROVED" && !isSelfApproval(review, commit, *best.pr, best.commitAuthors) {
 				result.HasFinalApproval = true
 				break
 			}
 		}
-		ownerApprovalStatus := evaluateRequiredChecks(enrichment.CheckRuns, bestPR.HeadSHA, requiredChecks)
-		result.OwnerApprovalCheck = ownerApprovalStatus
 	}
-	result.Reasons = bestReasons
+	result.Reasons = best.reasons
 	result.MergeStrategy = classifyMergeStrategy(commit, true)
 	result.PRCommitAuthorLogins = distinctPRBranchAuthors(enrichment.PRBranchCommits)
 	return result
@@ -460,7 +483,27 @@ func hasNonExemptPRContributors(enrichment model.EnrichmentResult, exemptAuthors
 	return false
 }
 
-// distinctPRBranchAuthors returns unique author logins from all PR branch commits.
+// distinctPRCommitAuthors returns unique author logins from a single PR's
+// branch commits (for self-approval checks scoped to that PR).
+func distinctPRCommitAuthors(commits []model.Commit) []string {
+	var out []string
+	seen := make(map[string]bool)
+	for _, c := range commits {
+		if c.AuthorLogin == "" {
+			continue
+		}
+		lower := strings.ToLower(c.AuthorLogin)
+		if seen[lower] {
+			continue
+		}
+		seen[lower] = true
+		out = append(out, c.AuthorLogin)
+	}
+	return out
+}
+
+// distinctPRBranchAuthors returns unique author logins across every PR's
+// branch commits on a commit (for the PRCommitAuthorLogins report column).
 func distinctPRBranchAuthors(prBranchCommits map[int][]model.Commit) []string {
 	seen := make(map[string]bool)
 	var result []string
