@@ -8,6 +8,31 @@ import (
 	"github.com/stefanpenner/gh-audit/internal/model"
 )
 
+// Audit evaluation kernel — Architecture.md §1–§8.
+//
+// Rules dispatch as follows:
+//
+//	§1 Exempt author            → applyExemptAuthorRule
+//	§2 Empty commit             → applyEmptyCommitFallback (lazy; runs on both no-PR and post-loop paths)
+//	§3 Has associated PR        → inlined in EvaluateCommit
+//	§4 Approval on final commit → evaluatePR + latestReviewStatesOnFinal
+//	§5 Self-approval exclusion  → evaluatePR + isSelfApproval
+//	§6 Required status checks   → evaluatePR + evaluateRequiredChecks
+//	§7 Verdict across PRs       → EvaluateCommit loop + betterVerdict + finalize*
+//	§8 Clean-revert waiver      → evaluateRevertCompliance
+//
+// File layout (functions grouped by role, not rule number):
+//
+//	Orchestration             — EvaluateCommit, initAuditResult
+//	Rule-dispatch helpers     — applyExemptAuthorRule, applyEmptyCommitFallback,
+//	                            evaluateRevertCompliance
+//	Per-PR verdict machinery  — prVerdict, evaluatePR, betterVerdict, and the
+//	                            three finalizers (Compliant / RevertWaiver / NonCompliant)
+//	Leaf predicates           — latestReviewStatesOnFinal, evaluateRequiredChecks,
+//	                            isSelfApproval
+//	Pure utilities            — truncateSHA, hasNonExemptPRContributors, distinct*,
+//	                            classifyMergeStrategy
+
 // RequiredCheck describes a status check that must pass for compliance.
 type RequiredCheck struct {
 	Name       string
@@ -21,35 +46,39 @@ type RequiredCheck struct {
 // stats at whatever the caller passed in (typically zero).
 type StatsFetcher func(org, repo, sha string) (additions, deletions int, err error)
 
+// ----- Orchestration -----
+
 // EvaluateCommit determines compliance for a single commit by running the
 // audit rule list documented in Architecture.md §1–§8. The function body
-// deliberately reads as that rule list top-to-bottom; each rule delegates to
-// a small helper whose name points back to the Architecture section.
+// reads as that rule list top-to-bottom; each rule delegates to a small
+// helper whose name points back to the Architecture section.
+//
+// Rule numbers are evaluated in decision-tree order, not numeric order:
+//   - §2 (empty commit) is lazy and fires on both no-PR and post-loop paths.
+//   - §7 (verdict) owns the PR loop AND the non-compliant fallback return.
 //
 // Performance notes:
-//   - The empty-commit fallback (§2) is evaluated LAST on commit-with-PRs
-//     paths and only after rules 4–6 fail. Eager prefetching of
-//     additions/deletions previously accounted for ~16% of REST traffic on
-//     full sweeps; fetchStats lets the fallback resolve stats lazily on
-//     already-suspect commits only. A nil fetchStats is tolerated — the
-//     fallback then uses the caller-supplied stats as-is.
-//   - Rule 8 (clean-revert waiver) is standalone: it judges the revert on
-//     its own signals and does not inspect the reverted commit's verdict.
-//     See TODO.md for the stricter cross-commit variant.
+//   - Eager prefetching of additions/deletions previously accounted for ~16%
+//     of REST traffic on full sweeps; fetchStats lets the §2 fallback resolve
+//     stats lazily on already-suspect commits only. A nil fetchStats is
+//     tolerated — the fallback then uses the caller-supplied stats as-is.
+//   - §8 (clean-revert waiver) is standalone: it judges the revert on its own
+//     signals and does not inspect the reverted commit's verdict. See
+//     TODO.md for the stricter cross-commit variant.
 func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []string, requiredChecks []RequiredCheck, fetchStats StatsFetcher) model.AuditResult {
 	// Informational fields shared by every return path (revert/merge
 	// signals, annotations, IsBot). Populated once, before any rule runs.
 	result := initAuditResult(commit, enrichment)
 
-	// Rule 1 — Exempt author.
+	// §1 — Exempt author.
 	if applyExemptAuthorRule(&result, commit, enrichment, exemptAuthors) {
 		return result
 	}
 
-	// Rule 3 — Has associated PR.
+	// §3 — Has associated PR.
 	if len(enrichment.PRs) == 0 {
 		result.HasPR = false
-		// Rule 2 — Empty commit (no-PR path).
+		// §2 — Empty commit (no-PR path).
 		if applyEmptyCommitFallback(&result, &commit, fetchStats) {
 			return result
 		}
@@ -61,9 +90,11 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	result.HasPR = true
 	result.PRCount = len(enrichment.PRs)
 
-	// Rules 4, 5, 6 — per-PR evaluation (approval on final commit, self-
-	// approval exclusion, required status checks). Rule 7 short-circuits
-	// the loop as soon as any PR satisfies both rule 4 and rule 6.
+	// §7 — verdict across associated PRs. evaluatePR folds §§4+5 into
+	// approvalOnFinal (non-self APPROVED on pr.HeadSHA) and §6 into
+	// ownerApprovalOK. The first PR that clears both wins: the commit is
+	// compliant. Otherwise track the closest-to-compliant verdict so
+	// finalizeNonCompliant can report its reasons.
 	var best prVerdict
 	for i := range enrichment.PRs {
 		v := evaluatePR(commit, enrichment, &enrichment.PRs[i], requiredChecks)
@@ -75,18 +106,18 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		}
 	}
 
-	// Rule 2 — Empty commit (post-PR-loop path). A PR that never modified
-	// bytes is trivially compliant regardless of review state.
+	// §2 — Empty commit (post-loop path). A PR that never modified bytes
+	// is trivially compliant regardless of review state.
 	if applyEmptyCommitFallback(&result, &commit, fetchStats) {
 		return result
 	}
 
-	// Rule 8 — Clean-revert waiver (standalone).
+	// §8 — Clean-revert waiver (standalone).
 	if ok, reason := evaluateRevertCompliance(commit, enrichment); ok {
 		return finalizeRevertWaiver(result, commit, enrichment, best, reason)
 	}
 
-	// Rule 7 — Non-compliant verdict, reporting the best PR's reasons.
+	// §7 — Non-compliant verdict, reporting the best PR's reasons.
 	return finalizeNonCompliant(result, commit, enrichment, best)
 }
 
@@ -112,6 +143,8 @@ func initAuditResult(commit model.Commit, enrichment model.EnrichmentResult) mod
 	return result
 }
 
+// ----- Rule-dispatch helpers -----
+
 // applyExemptAuthorRule implements Architecture.md §1. Returns true iff the
 // commit is waived as exempt (caller should return result as-is). When the
 // commit author matches but the PR contains non-exempt contributors (squash
@@ -135,34 +168,108 @@ func applyExemptAuthorRule(result *model.AuditResult, commit model.Commit, enric
 	return false
 }
 
-// A prVerdict captures the rules 4–6 outcome for a single PR. It's both the
-// early-return payload (when approvalOnFinal && ownerApprovalOK) and the
-// "closest to compliant" candidate tracked across multiple PRs.
+// applyEmptyCommitFallback implements Architecture.md §2. It flips `result`
+// to the "empty commit" compliant state when the commit's net diff is zero
+// lines, and returns true iff the fallback fired (caller should return
+// `result` unchanged).
+//
+// Stats are resolved lazily: if the commit already carries non-zero
+// additions/deletions the check short-circuits without IO; otherwise
+// fetchStats is called (DB-first, API-fallback). A nil fetchStats or a
+// fetch error leaves the caller's existing zero stats in place, which means
+// the commit IS marked empty — matching the legacy "stats default to zero →
+// treated as empty" semantics so this refactor is a strict subset.
+func applyEmptyCommitFallback(result *model.AuditResult, commit *model.Commit, fetchStats StatsFetcher) bool {
+	if commit.Additions != 0 || commit.Deletions != 0 {
+		return false
+	}
+	if fetchStats != nil {
+		if adds, dels, err := fetchStats(commit.Org, commit.Repo, commit.SHA); err == nil {
+			commit.Additions, commit.Deletions = adds, dels
+		}
+	}
+	if commit.Additions != 0 || commit.Deletions != 0 {
+		return false
+	}
+	result.IsEmptyCommit = true
+	result.IsCompliant = true
+	result.Reasons = []string{"empty commit"}
+	result.MergeStrategy = classifyMergeStrategy(*commit, false)
+	return true
+}
+
+// evaluateRevertCompliance implements Architecture.md §8. It returns
+// (true, reason) iff the commit is a clean revert — either an AutoRevert
+// (trusted by construction) or a ManualRevert whose diff was verified as
+// the exact inverse of the reverted commit. Returns (false, "") otherwise.
+//
+// Conflict-resolved GH-UI reverts intentionally do NOT waive here — the
+// diff is no longer a pure inverse, so reviewers should eyeball the
+// conflict resolution. Revert-of-revert is likewise not treated as clean
+// (content is coming *back* onto master, not off it). See TODO.md for
+// deferred variants (re-apply diff verification, cross-commit chain).
+func evaluateRevertCompliance(commit model.Commit, enrichment model.EnrichmentResult) (bool, string) {
+	if !enrichment.IsCleanRevert {
+		return false, ""
+	}
+	if enrichment.RevertedSHA != "" {
+		return true, fmt.Sprintf("clean revert of %s", truncateSHA(enrichment.RevertedSHA))
+	}
+	return true, "clean revert"
+}
+
+// ----- Per-PR verdict machinery -----
+
+// A prVerdict captures how one PR scores against Architecture.md §§4–6.
+//
+// The APPROVED reviews on pr.HeadSHA partition into two independent flags:
+//   - approvalOnFinal — at least one non-self APPROVED on head SHA (§4 pass)
+//   - selfApproved   — at least one self APPROVED on head SHA (§5 taint)
+//
+// Both, one, or neither may be true; they are disjoint signals and each
+// emits its own reason string when §4 fails.
+//
+// staleApproval separately records a non-self APPROVED on an older SHA —
+// a §4 presentational hint meaning "reviewed, then code changed." It is
+// only computed when approvalOnFinal is false.
+//
+// ownerApproval / ownerApprovalOK carry the §6 result ("", "success",
+// "failure", "missing") and its passing predicate.
+//
+// The struct is reused as (a) the early-return payload for a compliant PR
+// and (b) the closest-to-compliant candidate tracked across PRs when no
+// PR is compliant (see betterVerdict).
 type prVerdict struct {
 	pr               *model.PullRequest
 	reasons          []string
 	approvers        []string
 	commitAuthors    []string // distinct PR-branch commit authors (for self-approval check)
-	approvalOnFinal  bool     // rule 4: non-self APPROVED on pr.HeadSHA
-	selfApproved     bool     // rule 5: any APPROVED whose reviewer is a code author
-	staleApproval    bool     // rule 4: non-self APPROVED on older SHA
+	approvalOnFinal  bool     // §4: non-self APPROVED on pr.HeadSHA
+	selfApproved     bool     // §5: any APPROVED whose reviewer is a code author
+	staleApproval    bool     // §4: non-self APPROVED on older SHA
 	postMergeConcern bool     // §4 cutoff: post-merge CHANGES_REQUESTED/DISMISSED
-	ownerApproval    string   // rule 6: "", "success", "failure", "missing"
-	ownerApprovalOK  bool     // rule 6: ownerApproval is "" or "success"
+	ownerApproval    string   // §6: "", "success", "failure", "missing"
+	ownerApprovalOK  bool     // §6: ownerApproval is "" or "success"
 }
 
-// evaluatePR applies Architecture.md §4 (approval on final commit), §5
-// (self-approval exclusion), and §6 (required status checks) to a single PR
-// and returns the resulting verdict. The function is side-effect free.
+// evaluatePR scores a single PR against Architecture.md §§4–6 and returns
+// a prVerdict. Side-effect free.
+//
+// The function runs as four phases:
+//
+//	Phase 1: classify APPROVED reviews on pr.HeadSHA as self vs. independent.
+//	Phase 2: if no independent approval on head, look for one on an older
+//	         SHA (stale-approval signal).
+//	Phase 3: emit §4 / §5 reasons. selfApproved and staleApproval are
+//	         independent flaws and can both appear for the same PR.
+//	Phase 4: evaluate §6 required status checks and append any failure.
 func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *model.PullRequest, requiredChecks []RequiredCheck) prVerdict {
 	v := prVerdict{pr: pr}
 	v.commitAuthors = distinctPRCommitAuthors(enrichment.PRBranchCommits[pr.Number])
 
-	// Rule 4 — per-reviewer latest state on pr.HeadSHA with merge-time cutoff.
+	// Phase 1 — per-reviewer latest state on pr.HeadSHA with merge-time cutoff.
 	latestByReviewer, postMergeConcern := latestReviewStatesOnFinal(enrichment.Reviews, *pr)
 	v.postMergeConcern = postMergeConcern
-
-	// Rules 4+5 — classify each APPROVED review as self or independent.
 	for _, review := range latestByReviewer {
 		if review.State != "APPROVED" {
 			continue
@@ -175,7 +282,7 @@ func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *mode
 		v.approvers = append(v.approvers, review.ReviewerLogin)
 	}
 
-	// Rule 4 — stale-approval detection (only meaningful when no fresh approval).
+	// Phase 2 — stale-approval detection (only meaningful when no fresh approval).
 	if !v.approvalOnFinal {
 		for _, review := range enrichment.Reviews {
 			if review.PRNumber != pr.Number || review.CommitID == pr.HeadSHA {
@@ -188,20 +295,22 @@ func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *mode
 		}
 	}
 
-	// Reason string when rule 4 fails — distinguishes self-approval, stale,
-	// and never-reviewed so reports point reviewers at the right concern.
+	// Phase 3 — reasons for §4 / §5 failures. selfApproved and staleApproval
+	// are independent; both may emit. "No approval on final commit" is only
+	// the reason when neither flag fired — a genuine never-reviewed PR.
 	if !v.approvalOnFinal {
-		switch {
-		case v.selfApproved:
+		if v.selfApproved {
 			v.reasons = append(v.reasons, fmt.Sprintf("self-approved (reviewer is code author) (PR #%d)", pr.Number))
-		case v.staleApproval:
+		}
+		if v.staleApproval {
 			v.reasons = append(v.reasons, fmt.Sprintf("approval is stale — not on final commit (PR #%d)", pr.Number))
-		default:
+		}
+		if !v.selfApproved && !v.staleApproval {
 			v.reasons = append(v.reasons, fmt.Sprintf("no approval on final commit (PR #%d)", pr.Number))
 		}
 	}
 
-	// Rule 6 — required status checks.
+	// Phase 4 — §6 required status checks.
 	v.ownerApproval = evaluateRequiredChecks(enrichment.CheckRuns, pr.HeadSHA, requiredChecks)
 	v.ownerApprovalOK = v.ownerApproval == "" || v.ownerApproval == "success"
 	if !v.ownerApprovalOK {
@@ -224,8 +333,8 @@ func betterVerdict(candidate, best prVerdict) bool {
 	return candidate.pr.Number > best.pr.Number
 }
 
-// finalizeCompliantPR sets the compliant verdict from a PR that passed both
-// rule 4 (non-self approval on final commit) and rule 6 (required checks).
+// finalizeCompliantPR sets the compliant verdict from a PR that passed
+// both §4 (non-self approval on final commit) and §6 (required checks).
 func finalizeCompliantPR(result model.AuditResult, commit model.Commit, enrichment model.EnrichmentResult, v prVerdict) model.AuditResult {
 	result.IsCompliant = true
 	result.HasFinalApproval = true
@@ -260,6 +369,12 @@ func finalizeRevertWaiver(result model.AuditResult, commit model.Commit, enrichm
 // signals (Architecture.md §7). HasFinalApproval is recomputed from the
 // fallback review-state map so reports can still list an independent
 // approval even when the commit fails for other reasons (e.g. owner check).
+//
+// IsSelfApproved is set only when a self-approval exists AND no independent
+// approval covered it (`!best.approvalOnFinal`). If both kinds of APPROVED
+// appear on the head SHA the commit would have early-returned compliant
+// via finalizeCompliantPR — unless §6 failed, in which case §4 is satisfied
+// and the self-approval is purely informational, not the cause of failure.
 func finalizeNonCompliant(result model.AuditResult, commit model.Commit, enrichment model.EnrichmentResult, best prVerdict) model.AuditResult {
 	result.IsCompliant = false
 	result.IsSelfApproved = best.selfApproved && !best.approvalOnFinal
@@ -284,63 +399,7 @@ func finalizeNonCompliant(result model.AuditResult, commit model.Commit, enrichm
 	return result
 }
 
-// evaluateRevertCompliance returns (true, reason) iff the commit is a clean
-// revert — either an AutoRevert (trusted by construction) or a ManualRevert
-// whose diff was verified as the exact inverse of the reverted commit.
-// Returns (false, "") otherwise.
-//
-// Conflict-resolved GH-UI reverts intentionally do NOT waive here — the
-// diff is no longer a pure inverse, so reviewers should eyeball the
-// conflict resolution. Revert-of-revert is likewise not treated as clean
-// (content is coming *back* onto master, not off it). See TODO.md for
-// deferred variants (re-apply diff verification, cross-commit chain).
-func evaluateRevertCompliance(commit model.Commit, enrichment model.EnrichmentResult) (bool, string) {
-	if !enrichment.IsCleanRevert {
-		return false, ""
-	}
-	if enrichment.RevertedSHA != "" {
-		return true, fmt.Sprintf("clean revert of %s", truncateSHA(enrichment.RevertedSHA))
-	}
-	return true, "clean revert"
-}
-
-// truncateSHA returns the first 12 chars of a git SHA, or the full string
-// if it's shorter. Used in reasons strings to keep them readable.
-func truncateSHA(sha string) string {
-	if len(sha) <= 12 {
-		return sha
-	}
-	return sha[:12]
-}
-
-// applyEmptyCommitFallback flips `result` to the "empty commit" compliant
-// state when the commit's net diff is zero lines. Returns true iff the
-// fallback fired (caller should return `result` unchanged).
-//
-// Stats are resolved lazily: if the commit already carries non-zero
-// additions/deletions the check short-circuits without IO; otherwise
-// fetchStats is called (DB-first, API-fallback). A nil fetchStats or a
-// fetch error leaves the caller's existing zero stats in place, which means
-// the commit IS marked empty — matching the legacy "stats default to zero →
-// treated as empty" semantics so this refactor is a strict subset.
-func applyEmptyCommitFallback(result *model.AuditResult, commit *model.Commit, fetchStats StatsFetcher) bool {
-	if commit.Additions != 0 || commit.Deletions != 0 {
-		return false
-	}
-	if fetchStats != nil {
-		if adds, dels, err := fetchStats(commit.Org, commit.Repo, commit.SHA); err == nil {
-			commit.Additions, commit.Deletions = adds, dels
-		}
-	}
-	if commit.Additions != 0 || commit.Deletions != 0 {
-		return false
-	}
-	result.IsEmptyCommit = true
-	result.IsCompliant = true
-	result.Reasons = []string{"empty commit"}
-	result.MergeStrategy = classifyMergeStrategy(*commit, false)
-	return true
-}
+// ----- Leaf predicates -----
 
 // latestReviewStatesOnFinal folds a PR's reviews into per-reviewer latest
 // state on pr.HeadSHA, honouring the merge-time cutoff. Reviews submitted
@@ -378,9 +437,10 @@ func latestReviewStatesOnFinal(reviews []model.Review, pr model.PullRequest) (ma
 	return latest, postMergeConcern
 }
 
-// evaluateRequiredChecks determines the owner approval status for a set of
-// required checks against the check runs for a given commit SHA.
-// Returns "success" if all pass, "failure" if any found but failed, "missing" if not found.
+// evaluateRequiredChecks determines the owner approval status for a set
+// of required checks against the check runs for a given commit SHA.
+// Returns "success" if all pass, "failure" if any found but failed,
+// "missing" if not found.
 func evaluateRequiredChecks(checkRuns []model.CheckRun, headSHA string, requiredChecks []RequiredCheck) string {
 	if len(requiredChecks) == 0 {
 		return ""
@@ -412,9 +472,22 @@ func evaluateRequiredChecks(checkRuns []model.CheckRun, headSHA string, required
 	return "missing"
 }
 
-// isSelfApproval checks whether a review's author is the same person who
-// contributed code to the commit or PR. GitHub's merge bot logins
-// ("web-flow", "github") are excluded from the committer check.
+// isSelfApproval checks whether a review's reviewer is also a code
+// contributor and therefore cannot count as an independent approval.
+//
+// Five identities are tested against review.ReviewerLogin:
+//
+//   - PR author                 — always.
+//   - Commit author             — skipped on CleanMerge.
+//   - Commit committer          — skipped on CleanMerge; web-flow / github
+//     are ignored always.
+//   - Co-authored-by trailers   — every login listed on the commit.
+//   - PR-branch commit authors  — every author on the PR's commits,
+//     for squash-merge coverage.
+//
+// See Architecture.md §5 for why CleanMerge exempts the author/committer
+// check: GitHub's merge button refuses to produce a CleanMerge under
+// conflicts, so no committer-authored bytes can ride along.
 func isSelfApproval(review model.Review, commit model.Commit, pr model.PullRequest, prCommitAuthors []string) bool {
 	reviewer := strings.ToLower(review.ReviewerLogin)
 
@@ -426,14 +499,6 @@ func isSelfApproval(review model.Review, commit model.Commit, pr model.PullReque
 		return true
 	}
 
-	// For CleanMerge commits (2 parents, auto-generated message) the commit
-	// author/committer is just who clicked merge — GitHub's merge button
-	// refuses to produce such a commit when there are conflicts, so no code
-	// was authored here. Skip the author/committer check.
-	//
-	// DirtyMerge (2 parents, non-auto message) and OctopusMerge (3+ parents)
-	// may carry committer-authored conflict-resolution or edits, so we still
-	// check them.
 	mergeKind := github.ClassifyMerge(commit.ParentCount, commit.Message, commit.CommitterLogin, commit.IsVerified)
 	if mergeKind != github.CleanMerge {
 		if strings.EqualFold(commit.AuthorLogin, reviewer) {
@@ -452,7 +517,6 @@ func isSelfApproval(review model.Review, commit model.Commit, pr model.PullReque
 		}
 	}
 
-	// For squash merges: check against all PR branch commit authors
 	for _, author := range prCommitAuthors {
 		if strings.EqualFold(author, reviewer) {
 			return true
@@ -462,9 +526,20 @@ func isSelfApproval(review model.Review, commit model.Commit, pr model.PullReque
 	return false
 }
 
-// hasNonExemptPRContributors returns true if any PR branch commit author is not
-// in the exempt list. Used to prevent exempt-author early return when a squash
-// merge contains human contributions.
+// ----- Pure utilities -----
+
+// truncateSHA returns the first 12 chars of a git SHA, or the full string
+// if it's shorter. Used in reason strings to keep them readable.
+func truncateSHA(sha string) string {
+	if len(sha) <= 12 {
+		return sha
+	}
+	return sha[:12]
+}
+
+// hasNonExemptPRContributors returns true if any PR branch commit author is
+// not in the exempt list. Used to prevent exempt-author early return when a
+// squash merge contains human contributions.
 func hasNonExemptPRContributors(enrichment model.EnrichmentResult, exemptAuthors []string) bool {
 	if len(enrichment.PRBranchCommits) == 0 {
 		return false
@@ -518,6 +593,9 @@ func distinctPRBranchAuthors(prBranchCommits map[int][]model.Commit) []string {
 	return result
 }
 
+// classifyMergeStrategy labels a commit as "initial", "merge", "squash",
+// or "direct-push" based on parent count and whether it has an associated
+// PR. Informational only — does not affect compliance.
 func classifyMergeStrategy(c model.Commit, hasPR bool) string {
 	switch {
 	case c.ParentCount == 0:

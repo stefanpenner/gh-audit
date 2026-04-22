@@ -454,6 +454,32 @@ func TestEvaluateCommit_Rule4_StaleApproval(t *testing.T) {
 			wantHasPR:      true,
 			wantReasons:    []string{"no approval on final commit (PR #42)"},
 		},
+		{
+			// Both flaws present: an independent reviewer approved on an
+			// older SHA (→ staleApproval), then the PR/commit author
+			// self-approved on the final SHA (→ selfApproved,
+			// !approvalOnFinal). Both reasons must be emitted so reports
+			// align with HasStaleApproval and IsSelfApproved flags.
+			name:   "self-approval on final SHA plus independent stale approval on old SHA",
+			commit: f.commit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{f.pr},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "old-sha", SubmittedAt: f.now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "developer", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
+				},
+				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
+			},
+			requiredChecks:    f.requiredChecks,
+			wantCompliant:     false,
+			wantHasPR:         true,
+			wantSelfApproved:  true,
+			wantStaleApproval: true,
+			wantReasons: []string{
+				"self-approved (reviewer is code author) (PR #42)",
+				"approval is stale — not on final commit (PR #42)",
+			},
+		},
 	}
 	runEvalCases(t, cases)
 }
