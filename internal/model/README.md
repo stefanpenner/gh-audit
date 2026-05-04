@@ -44,7 +44,6 @@ classDiagram
         Additions int
         Deletions int
         Branch string
-        IsDefaultBranch bool
         Href string
     }
 

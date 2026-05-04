@@ -58,7 +58,7 @@ func LoginFromNoreplyEmail(email string) string {
 // A Commit is a git commit synced from GitHub.
 //
 // Modeled as a pure git object — knows parents, author, and committer.
-// Branch and IsDefaultBranch record the ref context at sync time.
+// Branch records the ref context at sync time (transient; not persisted).
 //
 //	CoAuthor ←── Commit ──→ CheckRun
 //	                ├──→ PullRequest (via merge commit or head SHA)
@@ -79,7 +79,6 @@ type Commit struct {
 	Additions      int
 	Deletions      int
 	Branch         string
-	IsDefaultBranch bool
 	Href           string
 }
 

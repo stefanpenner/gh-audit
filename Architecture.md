@@ -412,7 +412,7 @@ Two small classifiers feed the audit tree and the XLSX report.
 | `ManualRevert` | `Revert "..."` with `This reverts commit <sha>.` | **Only if** `IsCleanRevertDiff` confirms the diff is the exact inverse of the reverted commit |
 | `RevertOfRevert` | Revert-of-revert (re-application) | No — treated as fresh code |
 
-`IsCleanRevertDiff` compares file patches as multisets of added/removed lines; order is ignored. A `ManualRevert` with a failing diff check becomes `revert_verification = "diff-mismatch"` (or `"message-only"` when no trailer SHA was found) and does **not** qualify for rule 8's R1 clean-revert waiver. It may still qualify for R2 if the committer is `web-flow` and the signature is verified.
+`IsCleanRevertDiff` compares file patches as multisets of added/removed lines; order is ignored. A `ManualRevert` with a failing diff check becomes `revert_verification = "diff-mismatch"` (or `"message-only"` when no trailer SHA was found) and does **not** qualify for rule 8's clean-revert waiver — it falls through to the normal PR-approval rules.
 
 ### `ClassifyMerge` (`internal/github/merge.go`)
 

@@ -693,9 +693,9 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 			// enrichment (e.g. from a future GraphQL path). When absent,
 			// EvaluateCommit resolves them lazily via p.statsFetcher only
 			// if the audit would otherwise flag the commit non-compliant.
-			if e, ok := enrichmentMap[c.SHA]; ok {
-				c.Additions = e.Commit.Additions
-				c.Deletions = e.Commit.Deletions
+			if enrichment.Commit.Additions > 0 || enrichment.Commit.Deletions > 0 {
+				c.Additions = enrichment.Commit.Additions
+				c.Deletions = enrichment.Commit.Deletions
 			}
 			result := EvaluateCommit(c, enrichment, p.config.ExemptAuthors, p.config.RequiredChecks, p.statsFetcher)
 			result.AuditedAt = time.Now()
