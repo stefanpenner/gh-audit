@@ -80,6 +80,7 @@ func newSyncCmd() *cobra.Command {
 					CheckRuns:          enricher.Stats.CheckRuns.Load(),
 					PRCommits:          enricher.Stats.PRCommits.Load(),
 					RevertVerification: enricher.Stats.RevertVerification.Load(),
+					PRRecovered:        enricher.Stats.PRRecovered.Load(),
 					CacheHits:          enricher.Stats.CacheHits.Load(),
 					DBHits:             enricher.Stats.DBHits.Load(),
 				}
@@ -170,6 +171,7 @@ func newSyncCmd() *cobra.Command {
 				"reviews", s.Reviews.Load(),
 				"check_runs", s.CheckRuns.Load(),
 				"pr_commits", s.PRCommits.Load(),
+				"pr_recovered", s.PRRecovered.Load(),
 			)
 			return nil
 		},

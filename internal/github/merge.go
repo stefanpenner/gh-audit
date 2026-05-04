@@ -1,6 +1,10 @@
 package github
 
-import "strings"
+import (
+	"regexp"
+	"strconv"
+	"strings"
+)
 
 // MergeKind classifies a commit's relationship to merge operations based on
 // its parent count and commit message.
@@ -68,6 +72,39 @@ func ClassifyMerge(parentCount int, message, committerLogin string, isVerified b
 		return CleanMerge
 	}
 	return DirtyMerge
+}
+
+// prReferenceRE matches the trailing "(#N)" token that GitHub's
+// squash-merge button appends to commit titles. Anchored to end-of-line
+// so we pick the *last* token on the first line — guards against
+// revert-of-squash titles like `Revert "Foo (#100)" (#101)` where the
+// outer (#101) is the right answer.
+var prReferenceRE = regexp.MustCompile(`\(#(\d+)\)\s*$`)
+
+// ParsePRReference extracts the trailing PR number from a squash-merge
+// commit message's first line. Returns (number, true) on a match;
+// (0, false) for any message that does not end with `(#N)`.
+//
+// This is a *hint*, not a canonical lookup: a commit author can write
+// any number into their message. It must always be paired with a
+// canonical verification step (typically:
+// `pulls/N.merge_commit_sha == sha`) before the link is trusted.
+//
+// Mirrors ParseRevert's role for revert messages.
+func ParsePRReference(message string) (int, bool) {
+	firstLine := message
+	if i := strings.IndexByte(message, '\n'); i >= 0 {
+		firstLine = message[:i]
+	}
+	m := prReferenceRE.FindStringSubmatch(firstLine)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 // mergeKindVerification returns the string persisted to

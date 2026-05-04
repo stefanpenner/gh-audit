@@ -110,6 +110,11 @@ type APIStatsSnapshot struct {
 	RevertVerification int64
 	CacheHits          int64
 	DBHits             int64
+	// PRRecovered counts commit→PR links repaired through the parse +
+	// canonical-verify fallback when GitHub's commit→PR reverse index
+	// returned empty. Excluded from Total() — the recovery rides on an
+	// already-counted PRDetail call rather than issuing a new endpoint.
+	PRRecovered int64
 }
 
 // Total is the sum of API-call fields (excludes cache/DB hits).
@@ -286,6 +291,7 @@ func (p *Pipeline) runTelemetry(ctx context.Context, done <-chan struct{}) {
 					"check_runs", api.CheckRuns,
 					"pr_commits", api.PRCommits,
 					"revert_verify", api.RevertVerification,
+					"pr_recovered", api.PRRecovered,
 					"cache_hits", api.CacheHits,
 					"db_hits", api.DBHits,
 					"delta_total", api.Total()-lastAPI.Total(),
@@ -368,6 +374,7 @@ type telemetryRecord struct {
 	CheckRuns          *int64 `json:"check_runs,omitempty"`
 	PRCommits          *int64 `json:"pr_commits,omitempty"`
 	RevertVerification *int64 `json:"revert_verify,omitempty"`
+	PRRecovered        *int64 `json:"pr_recovered,omitempty"`
 	CacheHits          *int64 `json:"cache_hits,omitempty"`
 	DBHits             *int64 `json:"db_hits,omitempty"`
 }
@@ -414,6 +421,7 @@ func buildTelemetryRecord(now time.Time, elapsedSec, windowSec float64, final bo
 		r.CheckRuns = &a.CheckRuns
 		r.PRCommits = &a.PRCommits
 		r.RevertVerification = &a.RevertVerification
+		r.PRRecovered = &a.PRRecovered
 		r.CacheHits = &a.CacheHits
 		r.DBHits = &a.DBHits
 	}

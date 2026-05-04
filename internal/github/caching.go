@@ -31,6 +31,14 @@ type APIStats struct {
 	RevertVerification atomic.Int64 // GetCommitFiles calls made for clean-revert diff check
 	CacheHits          atomic.Int64
 	DBHits             atomic.Int64
+	// PRRecovered counts commit→PR links discovered through the
+	// parse-then-canonical-verify fallback when GitHub's commit→PR
+	// reverse index returned empty. Each increment represents one
+	// would-be "no associated pull request" that was correctly
+	// linked back to its merged PR via PullRequest.merge_commit_sha.
+	// Not added to Total() — recovery rides on top of the existing
+	// PRDetail call, no extra endpoint cost.
+	PRRecovered atomic.Int64
 }
 
 // Total returns the total number of API requests made.
@@ -182,10 +190,57 @@ func (ce *CachingEnricher) getPRsForCommit(ctx context.Context, org, repo, sha s
 		return nil, err
 	}
 
+	// Recovery fallback: GitHub's /commits/{sha}/pulls endpoint is a
+	// best-effort reverse index, not a canonical relationship. It
+	// sporadically returns empty for commits whose merged PR clearly
+	// exists (verified empirically via PullRequest.merge_commit_sha).
+	// When the API hands back zero PRs, parse the trailing `(#N)` from
+	// the squash-merge commit message and *verify canonically*: fetch
+	// PR #N and accept the link only if its merge_commit_sha matches
+	// this SHA. The parse step is forgeable; the verify step is not —
+	// only GitHub sets merge_commit_sha on a real merge event.
+	if len(prs) == 0 {
+		if recovered, ok := ce.recoverPRFromMergeMessage(ctx, org, repo, sha); ok {
+			prs = []model.PullRequest{*recovered}
+			ce.Stats.PRRecovered.Add(1)
+		}
+	}
+
 	ce.mu.Lock()
 	ce.commitPRCache[cacheKey] = prs
 	ce.mu.Unlock()
 	return prs, nil
+}
+
+// recoverPRFromMergeMessage attempts to repair a missing commit→PR link
+// when GitHub's reverse index returned empty. Implements rule §3's
+// canonical-verify mitigation:
+//
+//  1. Resolve the commit message (DB-cached via getCommit).
+//  2. Parse the trailing `(#N)` token from the first line.
+//  3. Fetch PR #N via getPR (merged-PR-frozen via DB cache).
+//  4. Accept the link iff pr.Merged && pr.MergeCommitSHA == sha.
+//
+// Any failure or mismatch returns (nil, false) so rule §3 fires
+// unchanged. We never silently accept an unverified link — the parse
+// step is a hint, the verify step is the trust boundary.
+func (ce *CachingEnricher) recoverPRFromMergeMessage(ctx context.Context, org, repo, sha string) (*model.PullRequest, bool) {
+	commit, err := ce.getCommit(ctx, org, repo, sha)
+	if err != nil || commit == nil {
+		return nil, false
+	}
+	number, ok := ParsePRReference(commit.Message)
+	if !ok {
+		return nil, false
+	}
+	pr, err := ce.getPR(ctx, org, repo, number)
+	if err != nil || pr == nil {
+		return nil, false
+	}
+	if !pr.Merged || pr.MergeCommitSHA != sha {
+		return nil, false
+	}
+	return pr, true
 }
 
 func (ce *CachingEnricher) getPR(ctx context.Context, org, repo string, number int) (*model.PullRequest, error) {
@@ -228,22 +283,23 @@ func (ce *CachingEnricher) getPR(ctx context.Context, org, repo string, number i
 	return pr, nil
 }
 
-// isPRMerged returns true when the PR is known to be merged from the
-// in-memory cache or DB. The merged state is the freeze trigger: reviews,
-// check runs, and PR-branch commits attached to a merged PR are
-// immutable, so a DB-empty result is the truth — no API fall-through.
+// isPRMerged reports whether the PR was *previously synced* and is in
+// a merged state — the only situation where a zero-row reviews / check
+// runs / PR-branch-commits result from the DB is authoritative.
 //
-// The check is best-effort: a DB error or a missing row falls through to
-// the API (returns false), preserving the pre-freeze behaviour for any
-// PR we haven't yet seen.
+// Critically, this MUST NOT consult the in-memory prCache. That cache
+// is also populated by a fresh API fetch in getPR; trusting it here
+// would let the freeze fire on a PR whose sub-data (reviews, etc.) has
+// not yet been persisted, silently dropping every API call we needed.
+// On a never-before-seen month that surfaced as ~55% of merged PRs
+// being marked "no approval on final commit" because the reviews fetch
+// was skipped.
+//
+// Going straight to the DB makes "row exists with merged=true" the
+// proxy for "previously synced and finalised", which is what the
+// freeze actually depends on. DuckDB PK lookups are sub-millisecond.
+// A DB error or missing row falls through to the API path.
 func (ce *CachingEnricher) isPRMerged(ctx context.Context, org, repo string, prNumber int) bool {
-	key := fmt.Sprintf("%s/%s/%d", org, repo, prNumber)
-	ce.mu.Lock()
-	pr, ok := ce.prCache[key]
-	ce.mu.Unlock()
-	if ok && pr != nil {
-		return pr.Merged
-	}
 	if ce.dbCache == nil {
 		return false
 	}

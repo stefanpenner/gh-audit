@@ -47,14 +47,43 @@ If the commit has no merged PR (direct push), it is **non-compliant** with reaso
 
 ```
 GET /repos/{o}/{r}/commits/{sha}/pulls
-      → []PullRequest (merged only)           ← SOT: GitHub REST API
+      → []PullRequest (merged only)           ← SOT: GitHub REST API (best-effort index)
       │
       ▼
 EvaluateCommit (audit.go)
       → len(PRs) == 0?
-          yes → IsCompliant=false, HasPR=false, reason="no associated pull request"
+          yes → recover via parse + canonical verify (see below)
+                → still 0? IsCompliant=false, HasPR=false, reason="no associated pull request"
           no  → PRCount=len(PRs), continue to rule 4
 ```
+
+#### Commit→PR index gap
+
+GitHub exposes the commit→PR relationship through two distinct surfaces:
+
+| Direction | Source | Trustworthiness |
+|---|---|---|
+| Commit → PR | `GET /commits/{sha}/pulls` (and GraphQL `Commit.associatedPullRequests`, REST/GraphQL search by SHA) | **Best-effort reverse index.** Asynchronous, computed by GitHub from refs and ref-events. Has empirically observed gaps from indexer races on burst merges, schema migrations, and squash/rebase commit-SHA chases. No SLA. |
+| PR → commit | `PullRequest.merge_commit_sha` | **Canonical.** Set by GitHub atomically at merge time. Immutable. Never the gap. |
+
+Empirically (last full sweep across 242 repos × 30 days), ~0.12% of commits surfaced as "no associated pull request" despite the PR clearly existing — `/commits/{sha}/pulls` returned `[]` while `/pulls/{N}.merge_commit_sha` matched the audited SHA. None of GitHub's alternative discovery APIs (GraphQL search, REST search) recovered the link either.
+
+##### Mitigation: parse + canonical verify
+
+When `/commits/{sha}/pulls` returns empty, gh-audit's caching layer (`recoverPRFromMergeMessage` in `internal/github/caching.go`) attempts a recovery:
+
+1. **Parse** the trailing `(#N)` token from the squash-merge commit's first line via `ParsePRReference` (`internal/github/merge.go`). Strict regex `\(#(\d+)\)\s*$` against the first line, so revert-of-squash titles like `Revert "Foo (#100)" (#101)` resolve to `101`, not `100`.
+2. **Fetch** PR #N via `getPR` (DB-frozen for previously-synced merged PRs; one extra `GET /pulls/N` if cold).
+3. **Verify canonically**: accept the link **only if** `pr.merged && pr.merge_commit_sha == sha`.
+
+The split is deliberate. The parse step is a forgeable hint — a commit author can write any `(#N)` they want into the message. The verify step is unforgeable: only GitHub sets `merge_commit_sha`, and only on a real merge event for the actual PR. A commit message claiming `(#1234)` cannot make `pulls/1234.merge_commit_sha` equal that commit's SHA.
+
+Failure modes that still fire §3:
+- Commit message has no `(#N)` (cross-fork PRs without an annotation, manual merges from local).
+- Parsed PR exists but isn't merged or its `merge_commit_sha` doesn't match the audited SHA — verification rejects the hint.
+- Fetch error — fail-closed; never silently accept an unverified link.
+
+Telemetry exposes recovery counts as `pr_recovered` in the per-endpoint breakdown so we can track how often the index gap fires in production.
 
 ### 4. Approval on final commit
 

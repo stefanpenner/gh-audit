@@ -101,3 +101,86 @@ func TestClassifyMerge(t *testing.T) {
 		})
 	}
 }
+
+func TestParsePRReference(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		want    int
+		ok      bool
+	}{
+		{
+			name:    "bare squash-merge title",
+			message: "Add accountId param to findByStrategies for account-level eligibility filtering (#12729)",
+			want:    12729,
+			ok:      true,
+		},
+		{
+			name:    "squash title with multi-line body — only first line consulted",
+			message: "feat: bump dep (#42)\n\n* refactor\n* tests\n\nCo-authored-by: bot <bot@example>",
+			want:    42,
+			ok:      true,
+		},
+		{
+			name:    "revert-of-squash — picks the outer (#101), not the inner (#100)",
+			message: `Revert "Foo (#100)" (#101)`,
+			want:    101,
+			ok:      true,
+		},
+		{
+			name:    "trailing whitespace tolerated",
+			message: "Subject (#7)   ",
+			want:    7,
+			ok:      true,
+		},
+		{
+			name:    "no PR reference — plain commit",
+			message: "feat: bump dependency",
+			want:    0,
+			ok:      false,
+		},
+		{
+			name:    "PR ref not at end of line (typical revert without outer ref) is rejected",
+			message: `Revert "Foo (#100)"`,
+			want:    0,
+			ok:      false,
+		},
+		{
+			name:    "non-numeric inside parens",
+			message: "Subject (#abc)",
+			want:    0,
+			ok:      false,
+		},
+		{
+			name:    "zero is rejected — GitHub never assigns PR #0",
+			message: "Subject (#0)",
+			want:    0,
+			ok:      false,
+		},
+		{
+			name:    "negative or signed numbers rejected (regex doesn't match)",
+			message: "Subject (#-1)",
+			want:    0,
+			ok:      false,
+		},
+		{
+			name:    "empty message",
+			message: "",
+			want:    0,
+			ok:      false,
+		},
+		{
+			name:    "merge-button-style (Merge pull request #N from …) — not the squash form, not matched",
+			message: "Merge pull request #123 from org/branch\n\nbody",
+			want:    0,
+			ok:      false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := ParsePRReference(tt.message)
+			assert.Equal(t, tt.ok, ok)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
