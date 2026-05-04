@@ -195,11 +195,25 @@ func (m *mockStore) UpdateCommitStats(_ context.Context, org, repo, sha string, 
 	return nil
 }
 
-func (m *mockStore) GetUnauditedCommits(_ context.Context, org, repo string) ([]model.Commit, error) {
+func (m *mockStore) GetUnauditedCommits(_ context.Context, org, repo string, since, until time.Time) ([]model.Commit, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := org + "/" + repo
-	return m.unaudited[key], nil
+	all := m.unaudited[key]
+	if since.IsZero() && until.IsZero() {
+		return all, nil
+	}
+	out := make([]model.Commit, 0, len(all))
+	for _, c := range all {
+		if !since.IsZero() && c.CommittedAt.Before(since) {
+			continue
+		}
+		if !until.IsZero() && !c.CommittedAt.Before(until) {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out, nil
 }
 
 // --- Tests ---
@@ -336,6 +350,104 @@ func TestPipelineUsesInitialLookbackDays(t *testing.T) {
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())
 	err := p.Run(context.Background())
 	require.NoError(t, err)
+}
+
+// TestPipelineAuditBoundedByWindow guards against the regression where
+// `--since/--until` only scoped the fetch phase. The audit phase used to
+// pull every unaudited commit in the DB regardless of date, silently
+// re-enriching the long-tail backlog from prior partial runs and inflating
+// API usage far beyond what the flags advertised. The fix passes the same
+// cfg.Since/cfg.Until into Store.GetUnauditedCommits.
+func TestPipelineAuditBoundedByWindow(t *testing.T) {
+	since := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
+	until := time.Date(2025, 7, 1, 0, 0, 0, 0, time.UTC)
+	inWindow := since.Add(15 * 24 * time.Hour) // 2025-06-16
+	beforeWindow := since.Add(-30 * 24 * time.Hour)
+	afterWindow := until.Add(30 * 24 * time.Hour)
+
+	source := &mockSource{
+		repos: map[string][]model.RepoInfo{
+			"myorg": {{Org: "myorg", Name: "repo1", DefaultBranch: "main"}},
+		},
+		commits: map[string][]model.Commit{
+			"myorg/repo1/main": {
+				{Org: "myorg", Repo: "repo1", SHA: "in-window", CommittedAt: inWindow, Additions: 1, AuthorLogin: "dev"},
+			},
+		},
+	}
+	store := newMockStore()
+	// Seed pre-existing unaudited backlog from "prior runs": one commit
+	// before the window, one after. Neither should be audited by this run.
+	store.unaudited["myorg/repo1"] = []model.Commit{
+		{Org: "myorg", Repo: "repo1", SHA: "stale-old", CommittedAt: beforeWindow, AuthorLogin: "dev"},
+		{Org: "myorg", Repo: "repo1", SHA: "stale-future", CommittedAt: afterWindow, AuthorLogin: "dev"},
+	}
+	enricher := &mockEnricher{}
+
+	cfg := &SyncConfig{
+		Orgs:        []OrgConfig{{Name: "myorg"}},
+		Concurrency: 1,
+		Since:       since,
+		Until:       until,
+	}
+
+	p := NewPipeline(source, enricher, store, cfg, slog.Default())
+	require.NoError(t, p.Run(context.Background()))
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	auditedSHAs := make([]string, 0, len(store.auditResults))
+	for _, r := range store.auditResults {
+		auditedSHAs = append(auditedSHAs, r.SHA)
+	}
+	assert.ElementsMatch(t, []string{"in-window"}, auditedSHAs,
+		"only commits whose committed_at is within [Since, Until) should be audited; "+
+			"backlog commits outside the window must not leak into this run")
+}
+
+// TestPipelineUnboundedAuditMopsUpBacklog covers the complementary case:
+// when neither --since nor --until is set (cursor-driven cron run), the
+// pipeline must still mop up the historical unaudited backlog so daily runs
+// don't permanently strand commits that prior partial syncs left behind.
+func TestPipelineUnboundedAuditMopsUpBacklog(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-90 * 24 * time.Hour)
+
+	source := &mockSource{
+		repos: map[string][]model.RepoInfo{
+			"myorg": {{Org: "myorg", Name: "repo1", DefaultBranch: "main"}},
+		},
+		commits: map[string][]model.Commit{
+			"myorg/repo1/main": {
+				{Org: "myorg", Repo: "repo1", SHA: "today", CommittedAt: now, Additions: 1, AuthorLogin: "dev"},
+			},
+		},
+	}
+	store := newMockStore()
+	store.unaudited["myorg/repo1"] = []model.Commit{
+		{Org: "myorg", Repo: "repo1", SHA: "old-backlog", CommittedAt: old, AuthorLogin: "dev"},
+	}
+	enricher := &mockEnricher{}
+
+	cfg := &SyncConfig{
+		Orgs:        []OrgConfig{{Name: "myorg"}},
+		Concurrency: 1,
+		// No Since/Until: cursor-driven, must remain unbounded.
+	}
+
+	p := NewPipeline(source, enricher, store, cfg, slog.Default())
+	require.NoError(t, p.Run(context.Background()))
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	auditedSHAs := make([]string, 0, len(store.auditResults))
+	for _, r := range store.auditResults {
+		auditedSHAs = append(auditedSHAs, r.SHA)
+	}
+	assert.ElementsMatch(t, []string{"today", "old-backlog"}, auditedSHAs,
+		"unbounded runs must audit both today's commits and the historical backlog")
 }
 
 func TestPipelineEnrichesInBatches(t *testing.T) {

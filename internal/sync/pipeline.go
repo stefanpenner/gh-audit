@@ -42,7 +42,10 @@ type Store interface {
 	UpsertCommitPRs(ctx context.Context, org, repo, sha string, prNumbers []int) error
 	UpsertAuditResults(ctx context.Context, results []model.AuditResult) error
 	UpdateCommitStats(ctx context.Context, org, repo, sha string, additions, deletions int) error
-	GetUnauditedCommits(ctx context.Context, org, repo string) ([]model.Commit, error)
+	// GetUnauditedCommits returns commits in org/repo with no audit_results row.
+	// Zero-valued since/until disables that side of the bound; both zero =
+	// unbounded (mops up the full historical backlog).
+	GetUnauditedCommits(ctx context.Context, org, repo string, since, until time.Time) ([]model.Commit, error)
 }
 
 // SyncConfig controls the sync pipeline behaviour.
@@ -600,8 +603,16 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 		return fmt.Errorf("upserting commit branches: %w", err)
 	}
 
-	// Reads are safe concurrent with the writer — DuckDB MVCC
-	unaudited, err := p.store.GetUnauditedCommits(ctx, repo.Org, repo.Name)
+	// Reads are safe concurrent with the writer — DuckDB MVCC.
+	//
+	// Bound the audit window to the same explicit flags the user passed for
+	// fetching. Without this bound, the audit phase enriches every commit
+	// the DB has ever seen for this repo with audited=false (including the
+	// long tail from prior partial syncs), which silently inflates API
+	// usage far beyond what `--since/--until` advertise. Zero values fall
+	// through unbounded so cursor-driven daily runs still mop up any
+	// freshly-discovered backlog.
+	unaudited, err := p.store.GetUnauditedCommits(ctx, repo.Org, repo.Name, p.config.Since, p.config.Until)
 	if err != nil {
 		return fmt.Errorf("getting unaudited commits: %w", err)
 	}

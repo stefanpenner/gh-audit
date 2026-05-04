@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/stefanpenner/gh-audit/internal/model"
 )
@@ -50,15 +51,29 @@ func (d *DB) UpsertCommitBranches(ctx context.Context, org, repo string, shas []
 	return d.bulkUpsert(ctx, "commit_branches", commitBranchColumns, []string{"org", "repo", "sha", "branch"}, rows)
 }
 
-// GetUnauditedCommits returns commits in org/repo that have no corresponding audit_results row.
-func (d *DB) GetUnauditedCommits(ctx context.Context, org, repo string) ([]model.Commit, error) {
-	rows, err := d.DB.QueryContext(ctx, `
+// GetUnauditedCommits returns commits in org/repo that have no corresponding
+// audit_results row. since/until bound the result by committed_at; either may
+// be zero to disable that side of the bound. Both zero = unbounded (mops up
+// the full historical backlog, matching the original behaviour).
+func (d *DB) GetUnauditedCommits(ctx context.Context, org, repo string, since, until time.Time) ([]model.Commit, error) {
+	q := `
 		SELECT c.org, c.repo, c.sha, c.author_login, c.author_email, c.committer_login,
 		       c.committed_at, c.message, c.parent_count, c.additions, c.deletions, c.href
 		FROM commits c
 		LEFT JOIN audit_results a ON c.org = a.org AND c.repo = a.repo AND c.sha = a.sha
-		WHERE c.org = ? AND c.repo = ? AND a.sha IS NULL
-		ORDER BY c.committed_at`, org, repo)
+		WHERE c.org = ? AND c.repo = ? AND a.sha IS NULL`
+	args := []any{org, repo}
+	if !since.IsZero() {
+		q += " AND c.committed_at >= ?"
+		args = append(args, since)
+	}
+	if !until.IsZero() {
+		q += " AND c.committed_at < ?"
+		args = append(args, until)
+	}
+	q += " ORDER BY c.committed_at"
+
+	rows, err := d.DB.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query unaudited commits: %w", err)
 	}

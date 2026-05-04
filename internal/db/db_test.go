@@ -47,9 +47,42 @@ func TestUpsertCommitsAndGetUnaudited(t *testing.T) {
 
 	require.NoError(t, db.UpsertCommits(ctx, commits))
 
-	got, err := db.GetUnauditedCommits(ctx, "org1", "repo1")
+	got, err := db.GetUnauditedCommits(ctx, "org1", "repo1", time.Time{}, time.Time{})
 	require.NoError(t, err)
 	require.Len(t, got, 2)
+
+	// Window bounds: since trims off the earlier commit; until is exclusive.
+	bounded, err := db.GetUnauditedCommits(ctx, "org1", "repo1",
+		time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC),
+		time.Date(2025, 1, 3, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Len(t, bounded, 1)
+	assert.Equal(t, "bbb", bounded[0].SHA)
+
+	// Only-since: keeps everything from `bbb` forward.
+	sinceOnly, err := db.GetUnauditedCommits(ctx, "org1", "repo1",
+		time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC),
+		time.Time{})
+	require.NoError(t, err)
+	require.Len(t, sinceOnly, 1)
+	assert.Equal(t, "bbb", sinceOnly[0].SHA)
+
+	// Only-until: keeps everything strictly before `bbb`.
+	untilOnly, err := db.GetUnauditedCommits(ctx, "org1", "repo1",
+		time.Time{},
+		time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Len(t, untilOnly, 1)
+	assert.Equal(t, "aaa", untilOnly[0].SHA)
+
+	// Until is half-open: a bound exactly equal to a commit's timestamp
+	// excludes that commit. Documents the semantics callers rely on.
+	exclusive, err := db.GetUnauditedCommits(ctx, "org1", "repo1",
+		time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Len(t, exclusive, 1)
+	assert.Equal(t, "aaa", exclusive[0].SHA)
 }
 
 func TestUpsertCommitsIdempotent(t *testing.T) {
@@ -90,7 +123,7 @@ func TestBatchInsertOver500(t *testing.T) {
 
 	require.NoError(t, db.UpsertCommits(ctx, commits))
 
-	got, err := db.GetUnauditedCommits(ctx, "org1", "repo1")
+	got, err := db.GetUnauditedCommits(ctx, "org1", "repo1", time.Time{}, time.Time{})
 	require.NoError(t, err)
 	require.Len(t, got, 501)
 }
@@ -222,7 +255,7 @@ func TestUpsertAuditResultsAndGetAuditResults(t *testing.T) {
 	assert.Len(t, got[0].ApproverLogins, 2)
 
 	// Verify the commit is now audited
-	unaudited, err := db.GetUnauditedCommits(ctx, "org1", "repo1")
+	unaudited, err := db.GetUnauditedCommits(ctx, "org1", "repo1", time.Time{}, time.Time{})
 	require.NoError(t, err)
 	assert.Empty(t, unaudited)
 }
@@ -475,7 +508,7 @@ func TestUpsertAndLoadCoAuthors(t *testing.T) {
 	assert.Empty(t, withoutCo.CoAuthors)
 
 	// GetUnauditedCommits should also load co-authors
-	unaudited, err := db.GetUnauditedCommits(ctx, "org1", "repo1")
+	unaudited, err := db.GetUnauditedCommits(ctx, "org1", "repo1", time.Time{}, time.Time{})
 	require.NoError(t, err)
 	require.Len(t, unaudited, 2)
 
