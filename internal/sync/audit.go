@@ -97,7 +97,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	// finalizeNonCompliant can report its reasons.
 	var best prVerdict
 	for i := range enrichment.PRs {
-		v := evaluatePR(commit, enrichment, &enrichment.PRs[i], requiredChecks)
+		v := evaluatePR(commit, enrichment, &enrichment.PRs[i], requiredChecks, fetchStats)
 		if v.approvalOnFinal && v.ownerApprovalOK {
 			return finalizeCompliantPR(result, commit, enrichment, v)
 		}
@@ -263,9 +263,9 @@ type prVerdict struct {
 //	Phase 3: emit §4 / §5 reasons. selfApproved and staleApproval are
 //	         independent flaws and can both appear for the same PR.
 //	Phase 4: evaluate §6 required status checks and append any failure.
-func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *model.PullRequest, requiredChecks []RequiredCheck) prVerdict {
+func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *model.PullRequest, requiredChecks []RequiredCheck, fetchStats StatsFetcher) prVerdict {
 	v := prVerdict{pr: pr}
-	v.commitAuthors = distinctPRCommitAuthors(enrichment.PRBranchCommits[pr.Number])
+	v.commitAuthors = distinctPRCommitAuthors(commit.Org, commit.Repo, enrichment.PRBranchCommits[pr.Number], fetchStats)
 
 	// Phase 1 — per-reviewer latest state on pr.HeadSHA with merge-time cutoff.
 	latestByReviewer, postMergeConcern := latestReviewStatesOnFinal(enrichment.Reviews, *pr)
@@ -560,21 +560,66 @@ func hasNonExemptPRContributors(enrichment model.EnrichmentResult, exemptAuthors
 
 // distinctPRCommitAuthors returns unique author logins from a single PR's
 // branch commits (for self-approval checks scoped to that PR).
-func distinctPRCommitAuthors(commits []model.Commit) []string {
-	var out []string
-	seen := make(map[string]bool)
+//
+// Authors whose every contribution to this PR branch is an empty commit
+// (zero additions and zero deletions) are dropped. The reviewer pushing an
+// "Empty commit to rerun check" or similar admin commit is the prototypical
+// false positive: GitHub's /pulls/N/commits endpoint omits diff stats, so
+// every commit looks zero-stat at this point. fetchStats lazily resolves
+// the truth via GetCommitDetail (DB-cached), and is only invoked for an
+// author whose listed contributions all *appear* empty — the common case
+// where the author has any commit with non-zero stats short-circuits before
+// any API call. fetchStats may be nil; without it the conservative
+// pre-filter behaviour (treat the author as a contributor) is preserved.
+func distinctPRCommitAuthors(org, repo string, commits []model.Commit, fetchStats StatsFetcher) []string {
+	byAuthor := make(map[string][]model.Commit)
+	var order []string
 	for _, c := range commits {
 		if c.AuthorLogin == "" {
 			continue
 		}
 		lower := strings.ToLower(c.AuthorLogin)
-		if seen[lower] {
-			continue
+		if _, ok := byAuthor[lower]; !ok {
+			order = append(order, c.AuthorLogin)
 		}
-		seen[lower] = true
-		out = append(out, c.AuthorLogin)
+		byAuthor[lower] = append(byAuthor[lower], c)
+	}
+
+	var out []string
+	for _, login := range order {
+		if hasNonEmptyContribution(org, repo, byAuthor[strings.ToLower(login)], fetchStats) {
+			out = append(out, login)
+		}
 	}
 	return out
+}
+
+// hasNonEmptyContribution reports whether any of an author's PR-branch
+// commits modified at least one line. If every commit's local stats look
+// empty (typical: PR-branch commits returned by /pulls/N/commits never
+// carry stats), fetchStats is consulted per commit to disambiguate
+// truly-empty admin commits from un-fetched ones. A nil fetcher or any
+// fetch error fails open (returns true) so we never silently drop an
+// author who actually contributed.
+func hasNonEmptyContribution(org, repo string, commits []model.Commit, fetchStats StatsFetcher) bool {
+	for _, c := range commits {
+		if c.Additions > 0 || c.Deletions > 0 {
+			return true
+		}
+	}
+	if fetchStats == nil {
+		return true
+	}
+	for _, c := range commits {
+		a, d, err := fetchStats(org, repo, c.SHA)
+		if err != nil {
+			return true
+		}
+		if a > 0 || d > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // distinctPRBranchAuthors returns unique author logins across every PR's

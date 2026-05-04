@@ -93,8 +93,11 @@ A review is self-approval if the reviewer matches any of:
 - Commit author (skipped for `CleanMerge` commits — see below)
 - Committer (skipped for `CleanMerge`)
 - Any co-author (from `Co-authored-by:` trailers)
+- Any **PR-branch commit author with a non-empty contribution** (catches squash-merge cases where the reviewer pushed real code that landed in the squash). Authors whose every PR-branch commit is zero-diff (the prototypical "Empty commit to rerun check") are dropped from this set; see "Empty-commit exclusion" below.
 
 **CleanMerge exclusion**: A `CleanMerge` (2 parents + `Merge pull request #…` message + `web-flow` committer + verified GitHub signature — see [ClassifyMerge](#classifymerge-internalgithubmergego)) cannot contain committer-authored code. GitHub's merge button refuses to produce one when there are conflicts, and the verified `web-flow` signature can't be forged locally. For these commits the author/committer is just "who clicked merge," so skipping the author/committer check avoids false positives. `DirtyMerge` (any 2-parent merge missing one of those signals) and `OctopusMerge` (3+ parents) may contain conflict-resolution or edits authored by the committer, so the check still runs.
+
+**Empty-commit exclusion** (PR-branch authors only): a reviewer who pushed only zero-diff commits onto the PR branch — typically `Empty commit to rerun check` to re-trigger CI — has not contributed code and must not invalidate their own review. The check verifies emptiness against the commit's actual `additions`/`deletions`. The `/pulls/{n}/commits` listing endpoint omits diff stats, so when an author's listed contributions all *appear* zero locally, `GetCommitDetail` is fetched lazily (DB-cached) to disambiguate a truly empty commit from un-fetched stats. Any non-zero stat short-circuits before any API call. A fetch error fails open (treats as contributor) so we never silently downgrade a real contributor.
 
 If the only approvals are self-approvals, the commit is **non-compliant**.
 
@@ -102,12 +105,14 @@ If the only approvals are self-approvals, the commit is **non-compliant**.
 review.reviewer_login               ← SOT: GitHub REST API (reviews)
       │
       ▼
-isSelfApproval (audit.go) checks against four identities:
+isSelfApproval (audit.go) checks against five identities:
       │
-      ├── pr.author_login            ← SOT: GET /commits/{sha}/pulls
-      ├── commit.author_login        ← SOT: GET /commits/{sha} (skip if CleanMerge)
-      ├── commit.committer_login     ← SOT: GET /commits/{sha} (skip "web-flow", "github"; skip if CleanMerge)
-      └── commit.co_authors[].login  ← SOT: co_authors table (persisted from "Co-authored-by:" trailers)
+      ├── pr.author_login                ← SOT: GET /commits/{sha}/pulls
+      ├── commit.author_login            ← SOT: GET /commits/{sha} (skip if CleanMerge)
+      ├── commit.committer_login         ← SOT: GET /commits/{sha} (skip "web-flow", "github"; skip if CleanMerge)
+      ├── commit.co_authors[].login      ← SOT: co_authors table (persisted from "Co-authored-by:" trailers)
+      └── pr_branch_commits[].author     ← SOT: GET /pulls/{n}/commits (filtered: drop authors whose every contribution is empty;
+                                              GetCommitDetail fetched lazily when local stats are zero)
       │
       ▼
 All approvals are self?

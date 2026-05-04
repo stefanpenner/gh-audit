@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -1457,6 +1458,142 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 		result := EvaluateCommit(octopus, enrichment, nil, nil, nil)
 		assert.True(t, result.IsSelfApproved, "OctopusMerge is not auto-trusted")
 		assert.False(t, result.IsCompliant)
+	})
+}
+
+// TestSelfApproval_EmptyAdminCommitByReviewer guards against a real-world
+// false positive: a reviewer pushes an "Empty commit to rerun check"
+// (or any zero-diff admin commit) onto the PR branch and then approves.
+// Treating that as self-approval voids legitimate reviews. The fix lazy-
+// fetches diff stats — only when an author's PR-branch contributions all
+// look zero-stat — to disambiguate truly-empty admin commits from the
+// listing-endpoint's missing-stats default.
+//
+// Modeled after https://github.com/linkedin-multiproduct/ad-targeting-spark/pull/1134
+// where the reviewer's only PR-branch commit was "Empty commit to rerun check".
+func TestSelfApproval_EmptyAdminCommitByReviewer(t *testing.T) {
+	now := time.Now()
+
+	commit := model.Commit{
+		Org: "myorg", Repo: "myrepo", SHA: "merge1",
+		AuthorLogin: "dev-a", CommittedAt: now,
+		Message:     "feat: real change",
+		ParentCount: 1, Additions: 50, Deletions: 5,
+		Href: "https://github.com/myorg/myrepo/commit/merge1",
+	}
+	pr := model.PullRequest{
+		Org: "myorg", Repo: "myrepo", Number: 10, HeadSHA: "head1",
+		AuthorLogin: "dev-a", Merged: true,
+		Href: "https://github.com/myorg/myrepo/pull/10",
+	}
+	approvalFromReviewer := model.Review{
+		Org: "myorg", Repo: "myrepo", PRNumber: 10, ReviewID: 1,
+		ReviewerLogin: "reviewer-r", State: "APPROVED",
+		CommitID: "head1", SubmittedAt: now,
+	}
+	checks := []model.CheckRun{
+		{Org: "myorg", Repo: "myrepo", CommitSHA: "head1", CheckRunID: 100, CheckName: "Owner Approval", Status: "completed", Conclusion: "success"},
+	}
+	required := []RequiredCheck{{Name: "Owner Approval", Conclusion: "success"}}
+
+	t.Run("reviewer's only PR-branch commit is empty (fetchStats confirms 0,0) — compliant", func(t *testing.T) {
+		var calls int
+		fetchStats := func(_, _, sha string) (int, int, error) {
+			calls++
+			if sha == "empty1" {
+				return 0, 0, nil
+			}
+			return 100, 0, nil
+		}
+		enrichment := model.EnrichmentResult{
+			Commit: commit, PRs: []model.PullRequest{pr},
+			Reviews: []model.Review{approvalFromReviewer}, CheckRuns: checks,
+			PRBranchCommits: map[int][]model.Commit{
+				10: {
+					{Org: "myorg", Repo: "myrepo", SHA: "real1", AuthorLogin: "dev-a", Additions: 50, Deletions: 5},
+					{Org: "myorg", Repo: "myrepo", SHA: "empty1", AuthorLogin: "reviewer-r"}, // Empty commit to rerun check
+				},
+			},
+		}
+		result := EvaluateCommit(commit, enrichment, nil, required, fetchStats)
+		assert.False(t, result.IsSelfApproved, "reviewer's only contribution is empty admin commit")
+		assert.True(t, result.IsCompliant)
+		assert.Equal(t, 1, calls, "fetchStats invoked exactly once for the suspect commit")
+	})
+
+	t.Run("reviewer authored both empty and real commits — self-approved", func(t *testing.T) {
+		// Short-circuits on the locally non-zero commit; never calls fetchStats.
+		called := false
+		fetchStats := func(_, _, _ string) (int, int, error) {
+			called = true
+			return 0, 0, nil
+		}
+		enrichment := model.EnrichmentResult{
+			Commit: commit, PRs: []model.PullRequest{pr},
+			Reviews: []model.Review{approvalFromReviewer}, CheckRuns: checks,
+			PRBranchCommits: map[int][]model.Commit{
+				10: {
+					{Org: "myorg", Repo: "myrepo", SHA: "empty1", AuthorLogin: "reviewer-r"},
+					{Org: "myorg", Repo: "myrepo", SHA: "real-by-reviewer", AuthorLogin: "reviewer-r", Additions: 30, Deletions: 1},
+				},
+			},
+		}
+		result := EvaluateCommit(commit, enrichment, nil, required, fetchStats)
+		assert.True(t, result.IsSelfApproved, "reviewer also pushed a non-empty commit")
+		assert.False(t, result.IsCompliant)
+		assert.False(t, called, "non-zero local stats short-circuit before any API call")
+	})
+
+	t.Run("reviewer's lone commit looks empty locally but fetchStats reveals real diff — self-approved", func(t *testing.T) {
+		fetchStats := func(_, _, sha string) (int, int, error) {
+			if sha == "stats-hidden" {
+				return 42, 7, nil // /pulls/N/commits omitted stats; reality is non-empty
+			}
+			return 0, 0, nil
+		}
+		enrichment := model.EnrichmentResult{
+			Commit: commit, PRs: []model.PullRequest{pr},
+			Reviews: []model.Review{approvalFromReviewer}, CheckRuns: checks,
+			PRBranchCommits: map[int][]model.Commit{
+				10: {
+					{Org: "myorg", Repo: "myrepo", SHA: "stats-hidden", AuthorLogin: "reviewer-r"},
+				},
+			},
+		}
+		result := EvaluateCommit(commit, enrichment, nil, required, fetchStats)
+		assert.True(t, result.IsSelfApproved, "fetchStats unmasked a real diff hidden by missing-stats default")
+		assert.False(t, result.IsCompliant)
+	})
+
+	t.Run("fetchStats returns error — fail-safe to self-approval", func(t *testing.T) {
+		fetchStats := func(_, _, _ string) (int, int, error) {
+			return 0, 0, errors.New("transient API failure")
+		}
+		enrichment := model.EnrichmentResult{
+			Commit: commit, PRs: []model.PullRequest{pr},
+			Reviews: []model.Review{approvalFromReviewer}, CheckRuns: checks,
+			PRBranchCommits: map[int][]model.Commit{
+				10: {
+					{Org: "myorg", Repo: "myrepo", SHA: "unknown", AuthorLogin: "reviewer-r"},
+				},
+			},
+		}
+		result := EvaluateCommit(commit, enrichment, nil, required, fetchStats)
+		assert.True(t, result.IsSelfApproved, "API errors must not silently downgrade to compliant")
+	})
+
+	t.Run("nil fetchStats with zero-stat reviewer commit — preserves legacy conservative behaviour", func(t *testing.T) {
+		enrichment := model.EnrichmentResult{
+			Commit: commit, PRs: []model.PullRequest{pr},
+			Reviews: []model.Review{approvalFromReviewer}, CheckRuns: checks,
+			PRBranchCommits: map[int][]model.Commit{
+				10: {
+					{Org: "myorg", Repo: "myrepo", SHA: "empty1", AuthorLogin: "reviewer-r"},
+				},
+			},
+		}
+		result := EvaluateCommit(commit, enrichment, nil, required, nil)
+		assert.True(t, result.IsSelfApproved, "without a fetcher we cannot distinguish empty from un-fetched")
 	})
 }
 

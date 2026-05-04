@@ -138,6 +138,9 @@ A review is considered self-approval if the reviewer matches any of:
 - Commit author
 - Committer (excluding GitHub merge bots: "web-flow", "github")
 - Co-authors (from `Co-authored-by` trailers)
+- Any PR-branch commit author with a non-empty contribution (covers squash-merges where the reviewer's code landed in the squash)
+
+A reviewer whose only PR-branch contribution is a zero-diff "rerun CI" commit is **not** treated as a code author — diff stats are lazy-fetched (DB-cached) to distinguish truly empty admin commits from `/pulls/{n}/commits`'s missing-stats default. Fetch errors fail open (treat as contributor).
 
 If the only approvals are self-approvals, the commit is non-compliant.
 
