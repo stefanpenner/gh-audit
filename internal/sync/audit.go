@@ -639,16 +639,22 @@ func distinctPRBranchAuthors(prBranchCommits map[int][]model.Commit) []string {
 }
 
 // classifyMergeStrategy labels a commit as "initial", "merge", "squash",
-// or "direct-push" based on parent count and whether it has an associated
-// PR. Informational only — does not affect compliance.
+// "rebase", or "direct-push". Informational only — does not affect compliance.
+//
+// Squash vs rebase: GitHub's squash merge always sets committer=web-flow with
+// a verified signature. Rebase (fast-forward) preserves the original committer.
+// Non-fast-forward rebases also get web-flow and are indistinguishable from
+// squash at the commit level — we accept that ambiguity.
 func classifyMergeStrategy(c model.Commit, hasPR bool) string {
 	switch {
 	case c.ParentCount == 0:
 		return "initial"
 	case c.ParentCount > 1:
 		return "merge"
-	case hasPR:
+	case hasPR && strings.EqualFold(c.CommitterLogin, "web-flow"):
 		return "squash"
+	case hasPR:
+		return "rebase"
 	default:
 		return "direct-push"
 	}

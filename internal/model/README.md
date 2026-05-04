@@ -34,10 +34,12 @@ classDiagram
         Repo string
         SHA string
         AuthorLogin string
+        AuthorEmail string
         CommitterLogin string
         CoAuthors []CoAuthor
         CommittedAt time.Time
         Message string
+        IsVerified bool
         ParentCount int
         Additions int
         Deletions int
@@ -99,16 +101,20 @@ classDiagram
         IsExemptAuthor bool
         IsEmptyCommit bool
         IsSelfApproved bool
+        HasFinalApproval bool
         HasStaleApproval bool
+        HasPostMergeConcern bool
         HasPR bool
         PRNumber int
         PRCount int
-        HasFinalApproval bool
+        IsCleanRevert bool
+        RevertVerification string
+        IsCleanMerge bool
+        MergeVerification string
+        MergeStrategy string
         ApproverLogins []string
-        OwnerApprovalCheck string
         Reasons []string
-        CommitHref string
-        PRHref string
+        Annotations []string
     }
 
     RepoInfo "1" --o "*" Commit : contains

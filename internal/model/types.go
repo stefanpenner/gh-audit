@@ -65,29 +65,22 @@ func LoginFromNoreplyEmail(email string) string {
 //	                ├──→ AuditResult
 //	                └──→ EnrichmentResult
 type Commit struct {
-	Org               string
-	Repo              string
-	SHA               string
-	TreeSHA           string
-	ParentSHAs        []string
-	AuthorLogin       string
-	AuthorEmail       string
-	AuthorName        string
-	CommitterLogin    string
-	CommitterEmail    string
-	CommitterName     string
-	CoAuthors         []CoAuthor
-	CommittedAt       time.Time
-	Message           string
-	IsVerified        bool
-	SignatureType     string // gpg, ssh, smime, unsigned
-	ParentCount       int
-	Additions         int
-	Deletions         int
-	Branch            string
-	IsDefaultBranch   bool
-	IsGitHubGenerated bool // merge commits, reverts, squashes created by GitHub
-	Href              string
+	Org            string
+	Repo           string
+	SHA            string
+	AuthorLogin    string
+	AuthorEmail    string
+	CommitterLogin string
+	CoAuthors      []CoAuthor
+	CommittedAt    time.Time
+	Message        string
+	IsVerified     bool
+	ParentCount    int
+	Additions      int
+	Deletions      int
+	Branch         string
+	IsDefaultBranch bool
+	Href           string
 }
 
 // A FileDiff is a per-file change in a commit's diff, used for clean-revert
@@ -224,7 +217,7 @@ type AuditResult struct {
 	OwnerApprovalCheck string // success, failure, missing
 	IsCompliant        bool
 	Reasons            []string
-	MergeStrategy         string // merge, squash, direct-push, initial
+	MergeStrategy         string // initial, merge, squash, rebase, direct-push
 	PRCommitAuthorLogins  []string
 	CommitHref            string
 	PRHref             string

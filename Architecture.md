@@ -425,7 +425,23 @@ Two small classifiers feed the audit tree and the XLSX report.
 
 The `CleanMerge` signal is deliberately strict. Message-only matching is forgeable — anyone can craft a `Merge pull request #…` commit locally. Requiring the `web-flow` committer with a GitHub-verified signature is what makes it trustworthy: only GitHub holds the web-flow signing key, so the signal can't be produced outside GitHub's merge button.
 
+`is_verified` is read from the GitHub REST API's `commit.verification.verified` field (available on both `GET /commits/{sha}` and `GET /repos/{o}/{r}/commits`). It's persisted in the `commits` table so the enrichment DB-read path preserves it.
+
 These flags drive the **Clean Reverts** and **Clean Merges** XLSX sheets, the rule-8 fallback, and the self-approval CleanMerge exclusion (rule 5). They are **informational for compliance** except when `IsCleanRevert` is true and the reverted commit is itself compliant.
+
+### `classifyMergeStrategy` (`internal/sync/audit.go`)
+
+Informational label recorded on every `audit_results` row. Does not affect compliance.
+
+| Strategy | Detection | Typical source |
+|---|---|---|
+| `initial` | `parent_count == 0` | Repository root commit |
+| `merge` | `parent_count > 1` | GitHub's "Create a merge commit" button |
+| `squash` | 1 parent, has PR, `committer_login == web-flow` | GitHub's "Squash and merge" button |
+| `rebase` | 1 parent, has PR, `committer_login != web-flow` | GitHub's "Rebase and merge" (fast-forward) |
+| `direct-push` | 1 parent, no PR | `git push` without a pull request |
+
+**Ambiguity:** Non-fast-forward rebase merges get `committer=web-flow` (GitHub replays the commits), making them indistinguishable from squash merges at the commit level. Feature-branch commits visible on main via a 2-parent merge commit also appear as `rebase` since their original committer is preserved.
 
 ## Annotations
 
