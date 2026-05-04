@@ -44,6 +44,11 @@ func (s *APIStats) Total() int64 {
 // Implemented by *db.DB. Merged PR data is immutable, so DB results are
 // always valid and eliminate the need for HTTP-level ETag caching.
 type EnrichmentCache interface {
+	// GetPullRequest returns the DB-stored row for org/repo#number or
+	// (nil, nil) if absent. Drives the merged-PR freeze: a row with
+	// Merged=true is immutable in every field gh-audit cares about, so
+	// the API call is skipped entirely on subsequent runs.
+	GetPullRequest(ctx context.Context, org, repo string, number int) (*model.PullRequest, error)
 	GetPRsForCommit(ctx context.Context, org, repo, sha string) ([]model.PullRequest, error)
 	GetReviewsForPR(ctx context.Context, org, repo string, prNumber int) ([]model.Review, error)
 	GetCheckRunsForCommit(ctx context.Context, org, repo, sha string) ([]model.CheckRun, error)
@@ -194,6 +199,22 @@ func (ce *CachingEnricher) getPR(ctx context.Context, org, repo string, number i
 	}
 	ce.mu.Unlock()
 
+	// DB fallback: a previously-synced merged PR is frozen — every field
+	// gh-audit consumes (head_sha, author, merged_by, merged_at) is
+	// immutable post-merge, so the API call is wasted budget. Open or
+	// not-yet-synced PRs fall through to the live fetch.
+	if ce.dbCache != nil {
+		pr, err := ce.dbCache.GetPullRequest(ctx, org, repo, number)
+		if err == nil && pr != nil && pr.Merged {
+			ce.mu.Lock()
+			ce.prCache[key] = pr
+			ce.indexPR(pr)
+			ce.mu.Unlock()
+			ce.Stats.DBHits.Add(1)
+			return pr, nil
+		}
+	}
+
 	ce.Stats.PRDetail.Add(1)
 	pr, err := ce.client.GetPullRequest(ctx, org, repo, number)
 	if err != nil {
@@ -207,6 +228,32 @@ func (ce *CachingEnricher) getPR(ctx context.Context, org, repo string, number i
 	return pr, nil
 }
 
+// isPRMerged returns true when the PR is known to be merged from the
+// in-memory cache or DB. The merged state is the freeze trigger: reviews,
+// check runs, and PR-branch commits attached to a merged PR are
+// immutable, so a DB-empty result is the truth — no API fall-through.
+//
+// The check is best-effort: a DB error or a missing row falls through to
+// the API (returns false), preserving the pre-freeze behaviour for any
+// PR we haven't yet seen.
+func (ce *CachingEnricher) isPRMerged(ctx context.Context, org, repo string, prNumber int) bool {
+	key := fmt.Sprintf("%s/%s/%d", org, repo, prNumber)
+	ce.mu.Lock()
+	pr, ok := ce.prCache[key]
+	ce.mu.Unlock()
+	if ok && pr != nil {
+		return pr.Merged
+	}
+	if ce.dbCache == nil {
+		return false
+	}
+	pr, err := ce.dbCache.GetPullRequest(ctx, org, repo, prNumber)
+	if err != nil || pr == nil {
+		return false
+	}
+	return pr.Merged
+}
+
 func (ce *CachingEnricher) getReviews(ctx context.Context, org, repo string, prNumber int) ([]model.Review, error) {
 	key := fmt.Sprintf("%s/%s/%d", org, repo, prNumber)
 
@@ -218,10 +265,13 @@ func (ce *CachingEnricher) getReviews(ctx context.Context, org, repo string, prN
 	}
 	ce.mu.Unlock()
 
-	// DB fallback
+	// DB fallback. When the PR is merged (frozen), a zero-row result is
+	// authoritative — reviews on a merged PR don't change — so we cache
+	// the empty slice and skip the API. Open PRs still hit the API on
+	// DB-empty so newly-added reviews are discovered.
 	if ce.dbCache != nil {
 		reviews, err := ce.dbCache.GetReviewsForPR(ctx, org, repo, prNumber)
-		if err == nil && len(reviews) > 0 {
+		if err == nil && (len(reviews) > 0 || ce.isPRMerged(ctx, org, repo, prNumber)) {
 			ce.mu.Lock()
 			ce.reviewCache[key] = reviews
 			ce.mu.Unlock()
@@ -242,7 +292,12 @@ func (ce *CachingEnricher) getReviews(ctx context.Context, org, repo string, prN
 	return reviews, nil
 }
 
-func (ce *CachingEnricher) getCheckRuns(ctx context.Context, org, repo, ref string) ([]model.CheckRun, error) {
+// getCheckRuns fetches the check runs for a head SHA. The prNumber
+// argument is only used for the merged-PR freeze decision: when the PR
+// is merged, head SHA is final and any check runs that were going to run
+// have already run (the GH check API does not retroactively add new runs
+// to a merged PR's head SHA), so a DB-empty result is the truth.
+func (ce *CachingEnricher) getCheckRuns(ctx context.Context, org, repo, ref string, prNumber int) ([]model.CheckRun, error) {
 	key := fmt.Sprintf("%s/%s/%s", org, repo, ref)
 
 	ce.mu.Lock()
@@ -253,10 +308,10 @@ func (ce *CachingEnricher) getCheckRuns(ctx context.Context, org, repo, ref stri
 	}
 	ce.mu.Unlock()
 
-	// DB fallback
+	// DB fallback. Merged-PR freeze trusts a zero-row result.
 	if ce.dbCache != nil {
 		runs, err := ce.dbCache.GetCheckRunsForCommit(ctx, org, repo, ref)
-		if err == nil && len(runs) > 0 {
+		if err == nil && (len(runs) > 0 || ce.isPRMerged(ctx, org, repo, prNumber)) {
 			ce.mu.Lock()
 			ce.checkRunCache[key] = runs
 			ce.mu.Unlock()
@@ -288,10 +343,12 @@ func (ce *CachingEnricher) getPRCommits(ctx context.Context, org, repo string, p
 	}
 	ce.mu.Unlock()
 
-	// DB fallback
+	// DB fallback. Merged-PR freeze trusts a zero-row result; in
+	// practice every real PR has at least one branch commit, so this
+	// branch only matters for empty PRs that somehow got merged.
 	if ce.dbCache != nil {
 		commits, err := ce.dbCache.GetCommitsForPR(ctx, org, repo, prNumber)
-		if err == nil && len(commits) > 0 {
+		if err == nil && (len(commits) > 0 || ce.isPRMerged(ctx, org, repo, prNumber)) {
 			ce.mu.Lock()
 			ce.prCommitCache[key] = commits
 			ce.mu.Unlock()
@@ -397,7 +454,7 @@ func (ce *CachingEnricher) enrichOneCommit(ctx context.Context, org, repo, sha s
 				headSHA = fullPR.HeadSHA
 			}
 			if headSHA != "" {
-				runs, err := ce.getCheckRuns(ectx, org, repo, headSHA)
+				runs, err := ce.getCheckRuns(ectx, org, repo, headSHA, pr.Number)
 				if err != nil {
 					return fmt.Errorf("PR #%d check runs: %w", pr.Number, err)
 				}

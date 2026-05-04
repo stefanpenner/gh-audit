@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 
 	"github.com/stefanpenner/gh-audit/internal/model"
@@ -91,6 +93,29 @@ func (d *DB) UpsertCommitPRs(ctx context.Context, org, repo, sha string, prNumbe
 	}
 
 	return d.bulkUpsert(ctx, "commit_prs", commitPRColumns, []string{"org", "repo", "sha", "pr_number"}, rows)
+}
+
+// GetPullRequest retrieves a single pull request by primary key. Returns
+// (nil, nil) when no row exists; the caller decides whether to fall back
+// to the API. The columns mirror UpsertPullRequests so a DB-cached PR is
+// indistinguishable from one freshly fetched from GitHub.
+func (d *DB) GetPullRequest(ctx context.Context, org, repo string, number int) (*model.PullRequest, error) {
+	row := d.DB.QueryRowContext(ctx, `
+		SELECT org, repo, number, title, merged, head_sha,
+		       COALESCE(head_branch, ''), merge_commit_sha, author_login,
+		       COALESCE(merged_by_login, ''), merged_at, href
+		FROM pull_requests
+		WHERE org = ? AND repo = ? AND number = ?`, org, repo, number)
+	var pr model.PullRequest
+	if err := row.Scan(&pr.Org, &pr.Repo, &pr.Number, &pr.Title, &pr.Merged,
+		&pr.HeadSHA, &pr.HeadBranch, &pr.MergeCommitSHA, &pr.AuthorLogin,
+		&pr.MergedByLogin, &pr.MergedAt, &pr.Href); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("query pull request %s/%s#%d: %w", org, repo, number, err)
+	}
+	return &pr, nil
 }
 
 // GetPRsForCommit retrieves pull requests associated with a commit via commit_prs.
