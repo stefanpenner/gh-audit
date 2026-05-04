@@ -18,6 +18,7 @@ set -euo pipefail
 
 FIXTURES_REPO="${FIXTURES_REPO:-stefanpenner/gh-audit-test-fixtures}"
 SCENARIOS_URL="${SCENARIOS_URL:-https://raw.githubusercontent.com/${FIXTURES_REPO}/main/scenarios.json}"
+REPO_URL="https://github.com/${FIXTURES_REPO}"
 
 if [[ -z "${GITHUB_TOKEN:-}" ]]; then
     echo "error: GITHUB_TOKEN is required" >&2
@@ -64,49 +65,116 @@ echo "==> Fetching scenarios.json"
 curl -fsSL "$SCENARIOS_URL" > "$TMPDIR/scenarios.json"
 
 echo "==> Validating assertions"
+echo "    $REPO_URL"
+echo
+
 fails=0
 total=0
+current_series=""
 
-# Each row: scenario-id<TAB>sha<TAB>expected_is_compliant<TAB>expected_is_clean_revert<TAB>expected_revert_verification
-while IFS=$'\t' read -r id sha want_compliant want_clean want_rv; do
-    [[ -z "${sha:-}" ]] && continue
+# Emit one JSON object per assertion with all fields from scenarios.json.
+# Fields not present in the assertion are emitted as null (skipped during comparison).
+while IFS= read -r assertion; do
+    id=$(jq -r '.id' <<<"$assertion")
+    title=$(jq -r '.title' <<<"$assertion")
+    sha=$(jq -r '.sha' <<<"$assertion")
+    comment=$(jq -r '.comment // empty' <<<"$assertion")
+
+    [[ -z "$sha" || "$sha" == "null" ]] && continue
     total=$((total + 1))
 
+    # Print series header when it changes
+    series="${id%%.*}"
+    if [[ "$series" != "$current_series" ]]; then
+        current_series="$series"
+        series_title=$(jq -r --arg s "$series" '
+            .series[$s].title // empty
+        ' "$TMPDIR/scenarios.json")
+        if [[ -n "$series_title" ]]; then
+            printf '\n  ── %s.x: %s ──\n\n' "$series" "$series_title"
+        else
+            printf '\n  ── %s.x ──\n\n' "$series"
+        fi
+    fi
+
+    # Query all assertable fields from audit_results
     row=$(duckdb -noheader -csv "$TMPDIR/audit.db" <<SQL
-SELECT is_compliant, is_clean_revert, COALESCE(revert_verification, '')
+SELECT is_compliant,
+       is_clean_revert,
+       COALESCE(revert_verification, ''),
+       COALESCE(has_final_approval, false),
+       COALESCE(is_self_approved, false),
+       COALESCE(has_stale_approval, false),
+       COALESCE(has_post_merge_concern, false),
+       COALESCE(pr_count, 0),
+       COALESCE(merge_strategy, ''),
+       COALESCE(is_clean_merge, false)
 FROM audit_results
 WHERE sha = '$sha';
 SQL
 )
     if [[ -z "$row" ]]; then
-        echo "FAIL $id  sha=${sha:0:12}  not found in audit_results"
+        printf '  FAIL  %s — %s\n' "$id" "$title"
+        printf '        %s/commit/%s\n' "$REPO_URL" "$sha"
+        printf '        commit not found in audit_results\n'
         fails=$((fails + 1))
         continue
     fi
 
-    got_compliant=$(cut -d, -f1 <<<"$row")
-    got_clean=$(cut -d, -f2 <<<"$row")
-    got_rv=$(cut -d, -f3 <<<"$row")
+    IFS=',' read -r got_compliant got_clean got_rv got_final got_self \
+                    got_stale got_concern got_prcount got_strategy got_cleanmerge <<<"$row"
 
-    if [[ "$got_compliant" == "$want_compliant" && "$got_clean" == "$want_clean" && "$got_rv" == "$want_rv" ]]; then
-        printf 'OK   %s  sha=%s  compliant=%s clean=%s rv=%s\n' "$id" "${sha:0:12}" "$got_compliant" "$got_clean" "$got_rv"
+    # Compare each field the assertion specifies (null = skip)
+    mismatches=()
+    check_field() {
+        local field="$1" want="$2" got="$3"
+        [[ "$want" == "null" ]] && return
+        # Normalize booleans
+        case "$want" in true) want="true" ;; false) want="false" ;; esac
+        if [[ "$got" != "$want" ]]; then
+            mismatches+=("$field: want=$want got=$got")
+        fi
+    }
+
+    check_field "is_compliant"          "$(jq -r '.is_compliant // "null"' <<<"$assertion")"          "$got_compliant"
+    check_field "is_clean_revert"       "$(jq -r '.is_clean_revert // "null"' <<<"$assertion")"       "$got_clean"
+    check_field "revert_verification"   "$(jq -r '.revert_verification // "null"' <<<"$assertion")"   "$got_rv"
+    check_field "has_final_approval"    "$(jq -r '.has_final_approval // "null"' <<<"$assertion")"     "$got_final"
+    check_field "is_self_approved"      "$(jq -r '.is_self_approved // "null"' <<<"$assertion")"       "$got_self"
+    check_field "has_stale_approval"    "$(jq -r '.has_stale_approval // "null"' <<<"$assertion")"     "$got_stale"
+    check_field "has_post_merge_concern" "$(jq -r '.has_post_merge_concern // "null"' <<<"$assertion")" "$got_concern"
+    check_field "pr_count"              "$(jq -r '.pr_count // "null"' <<<"$assertion")"               "$got_prcount"
+    check_field "merge_strategy"        "$(jq -r '.merge_strategy // "null"' <<<"$assertion")"         "$got_strategy"
+    check_field "is_clean_merge"        "$(jq -r '.is_clean_merge // "null"' <<<"$assertion")"         "$got_cleanmerge"
+
+    if [[ ${#mismatches[@]} -eq 0 ]]; then
+        printf '  OK    %s — %s\n' "$id" "$title"
+        printf '        %s/commit/%s\n' "$REPO_URL" "${sha:0:12}"
+        [[ -n "$comment" ]] && printf '        %s\n' "$comment"
     else
-        printf 'FAIL %s  sha=%s\n' "$id" "${sha:0:12}"
-        printf '     expected: compliant=%s clean=%s rv=%s\n' "$want_compliant" "$want_clean" "$want_rv"
-        printf '     got:      compliant=%s clean=%s rv=%s\n' "$got_compliant" "$got_clean" "$got_rv"
+        printf '  FAIL  %s — %s\n' "$id" "$title"
+        printf '        %s/commit/%s\n' "$REPO_URL" "$sha"
+        [[ -n "$comment" ]] && printf '        %s\n' "$comment"
+        for m in "${mismatches[@]}"; do
+            printf '        ✗ %s\n' "$m"
+        done
         fails=$((fails + 1))
     fi
-done < <(jq -r '
+done < <(jq -c '
     .scenarios
-    | to_entries[]
+    | to_entries
+    | sort_by(.key | split(".") | map(tonumber? // 0))
+    | .[]
     | .key as $id
+    | .value.title as $title
     | (.value.assertions // [])[]
-    | [$id, .sha, .is_compliant, .is_clean_revert, .revert_verification] | @tsv
+    | . + {id: $id, title: $title}
 ' "$TMPDIR/scenarios.json")
 
 echo
+echo "────────────────────────────────────"
 if [[ "$fails" -gt 0 ]]; then
-    echo "FAILED: $fails/$total assertion(s) mismatched"
+    printf 'FAILED: %d/%d assertion(s) mismatched\n' "$fails" "$total"
     exit 1
 fi
-echo "PASSED: $total/$total assertions match"
+printf 'PASSED: %d/%d assertions match\n' "$total" "$total"

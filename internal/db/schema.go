@@ -35,6 +35,7 @@ const (
 		parent_count     INTEGER,
 		additions        INTEGER,
 		deletions        INTEGER,
+		is_verified      BOOLEAN DEFAULT false,
 		href             TEXT,
 		fetched_at       TIMESTAMP DEFAULT current_timestamp,
 		PRIMARY KEY (org, repo, sha)
@@ -166,6 +167,7 @@ var addColumnMigrations = []string{
 	`ALTER TABLE audit_results ADD COLUMN is_clean_merge BOOLEAN DEFAULT false`,
 	`ALTER TABLE audit_results ADD COLUMN merge_verification TEXT`,
 	`ALTER TABLE audit_results ADD COLUMN annotations TEXT[]`,
+	`ALTER TABLE commits ADD COLUMN is_verified BOOLEAN DEFAULT false`,
 }
 
 // allTables is the ordered list of DDL statements to run during migration.

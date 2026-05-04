@@ -149,6 +149,9 @@ func (c *Client) ListCommits(ctx context.Context, org, repo, branch string, sinc
 				if rc.GetCommit().GetCommitter() != nil {
 					commit.CommittedAt = rc.GetCommit().GetCommitter().GetDate().Time
 				}
+				if rc.GetCommit().GetVerification() != nil {
+					commit.IsVerified = rc.GetCommit().GetVerification().GetVerified()
+				}
 			}
 			commit.ParentCount = len(rc.Parents)
 			commit.Branch = branch
@@ -196,6 +199,9 @@ func (c *Client) GetCommitDetail(ctx context.Context, org, repo, sha string) (*m
 		}
 		if rc.GetCommit().GetCommitter() != nil {
 			commit.CommittedAt = rc.GetCommit().GetCommitter().GetDate().Time
+		}
+		if rc.GetCommit().GetVerification() != nil {
+			commit.IsVerified = rc.GetCommit().GetVerification().GetVerified()
 		}
 	}
 	commit.ParentCount = len(rc.Parents)

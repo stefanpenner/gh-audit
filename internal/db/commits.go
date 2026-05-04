@@ -14,7 +14,7 @@ const batchSize = 500
 
 var commitColumns = []string{
 	"org", "repo", "sha", "author_login", "author_email", "committer_login",
-	"committed_at", "message", "parent_count", "additions", "deletions", "href",
+	"committed_at", "message", "parent_count", "additions", "deletions", "is_verified", "href",
 }
 
 // UpsertCommits batch-inserts commits using the DuckDB Appender API with
@@ -28,7 +28,7 @@ func (d *DB) UpsertCommits(ctx context.Context, commits []model.Commit) error {
 	for i, c := range commits {
 		rows[i] = []driver.Value{
 			c.Org, c.Repo, c.SHA, c.AuthorLogin, c.AuthorEmail, c.CommitterLogin,
-			c.CommittedAt, c.Message, c.ParentCount, c.Additions, c.Deletions, c.Href,
+			c.CommittedAt, c.Message, c.ParentCount, c.Additions, c.Deletions, c.IsVerified, c.Href,
 		}
 	}
 
@@ -58,7 +58,7 @@ func (d *DB) UpsertCommitBranches(ctx context.Context, org, repo string, shas []
 func (d *DB) GetUnauditedCommits(ctx context.Context, org, repo string, since, until time.Time) ([]model.Commit, error) {
 	q := `
 		SELECT c.org, c.repo, c.sha, c.author_login, c.author_email, c.committer_login,
-		       c.committed_at, c.message, c.parent_count, c.additions, c.deletions, c.href
+		       c.committed_at, c.message, c.parent_count, c.additions, c.deletions, c.is_verified, c.href
 		FROM commits c
 		LEFT JOIN audit_results a ON c.org = a.org AND c.repo = a.repo AND c.sha = a.sha
 		WHERE c.org = ? AND c.repo = ? AND a.sha IS NULL`
@@ -93,7 +93,7 @@ func (d *DB) GetUnauditedCommits(ctx context.Context, org, repo string, since, u
 func (d *DB) GetAllCommits(ctx context.Context, org, repo string) ([]model.Commit, error) {
 	rows, err := d.DB.QueryContext(ctx, `
 		SELECT org, repo, sha, author_login, author_email, committer_login,
-		       committed_at, message, parent_count, additions, deletions, href
+		       committed_at, message, parent_count, additions, deletions, is_verified, href
 		FROM commits
 		WHERE org = ? AND repo = ?
 		ORDER BY committed_at`, org, repo)
@@ -138,7 +138,7 @@ func (d *DB) GetCommitsBySHA(ctx context.Context, org, repo string, shas []strin
 	}
 
 	q := fmt.Sprintf(`SELECT org, repo, sha, author_login, author_email, committer_login,
-		committed_at, message, parent_count, additions, deletions, href
+		committed_at, message, parent_count, additions, deletions, is_verified, href
 		FROM commits
 		WHERE org = ? AND repo = ? AND sha IN (%s)`, strings.Join(placeholders, ", "))
 
@@ -252,7 +252,7 @@ func scanCommits(rows interface {
 	for rows.Next() {
 		var c model.Commit
 		if err := rows.Scan(&c.Org, &c.Repo, &c.SHA, &c.AuthorLogin, &c.AuthorEmail, &c.CommitterLogin,
-			&c.CommittedAt, &c.Message, &c.ParentCount, &c.Additions, &c.Deletions, &c.Href); err != nil {
+			&c.CommittedAt, &c.Message, &c.ParentCount, &c.Additions, &c.Deletions, &c.IsVerified, &c.Href); err != nil {
 			return nil, fmt.Errorf("scan commit: %w", err)
 		}
 		result = append(result, c)
