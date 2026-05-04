@@ -101,7 +101,13 @@ type TokenStatsFn func() TokenStatsSnapshot
 // can be attributed to a specific endpoint family (e.g. reviews vs
 // check runs vs PR commits).
 type APIStatsSnapshot struct {
-	CommitDetail       int64
+	// CommitDetailEager: GetCommitDetail called from enrichment
+	// (caching.go::getCommit). Defensive fallback for missing DB rows.
+	CommitDetailEager int64
+	// CommitDetailLazy: GetCommitDetail called from the audit's
+	// statsFetcher closure (cmd/sync.go) — the §2 empty-commit
+	// fallback and §5 PR-branch-author empty-stats disambiguation.
+	CommitDetailLazy   int64
 	CommitPRs          int64
 	PRDetail           int64
 	Reviews            int64
@@ -119,7 +125,8 @@ type APIStatsSnapshot struct {
 
 // Total is the sum of API-call fields (excludes cache/DB hits).
 func (s APIStatsSnapshot) Total() int64 {
-	return s.CommitDetail + s.CommitPRs + s.PRDetail +
+	return s.CommitDetailEager + s.CommitDetailLazy +
+		s.CommitPRs + s.PRDetail +
 		s.Reviews + s.CheckRuns + s.PRCommits + s.RevertVerification
 }
 
@@ -284,7 +291,8 @@ func (p *Pipeline) runTelemetry(ctx context.Context, done <-chan struct{}) {
 				p.logger.Info("api_endpoint_breakdown",
 					"elapsed", time.Duration(elapsedSec*float64(time.Second)).Round(time.Second),
 					"total_api", api.Total(),
-					"commit_detail", api.CommitDetail,
+					"commit_detail_eager", api.CommitDetailEager,
+					"commit_detail_lazy", api.CommitDetailLazy,
 					"commit_prs", api.CommitPRs,
 					"pr_detail", api.PRDetail,
 					"reviews", api.Reviews,
@@ -295,7 +303,8 @@ func (p *Pipeline) runTelemetry(ctx context.Context, done <-chan struct{}) {
 					"cache_hits", api.CacheHits,
 					"db_hits", api.DBHits,
 					"delta_total", api.Total()-lastAPI.Total(),
-					"delta_commit_detail", api.CommitDetail-lastAPI.CommitDetail,
+					"delta_commit_detail_eager", api.CommitDetailEager-lastAPI.CommitDetailEager,
+					"delta_commit_detail_lazy", api.CommitDetailLazy-lastAPI.CommitDetailLazy,
 					"delta_commit_prs", api.CommitPRs-lastAPI.CommitPRs,
 					"delta_pr_detail", api.PRDetail-lastAPI.PRDetail,
 					"delta_reviews", api.Reviews-lastAPI.Reviews,
@@ -367,7 +376,8 @@ type telemetryRecord struct {
 
 	// API endpoint breakdown (present only if apiStats is wired)
 	TotalAPI           *int64 `json:"total_api,omitempty"`
-	CommitDetail       *int64 `json:"commit_detail,omitempty"`
+	CommitDetailEager  *int64 `json:"commit_detail_eager,omitempty"`
+	CommitDetailLazy   *int64 `json:"commit_detail_lazy,omitempty"`
 	CommitPRs          *int64 `json:"commit_prs,omitempty"`
 	PRDetail           *int64 `json:"pr_detail,omitempty"`
 	Reviews            *int64 `json:"reviews,omitempty"`
@@ -414,7 +424,8 @@ func buildTelemetryRecord(now time.Time, elapsedSec, windowSec float64, final bo
 		a := p.apiStats()
 		tot := a.Total()
 		r.TotalAPI = &tot
-		r.CommitDetail = &a.CommitDetail
+		r.CommitDetailEager = &a.CommitDetailEager
+		r.CommitDetailLazy = &a.CommitDetailLazy
 		r.CommitPRs = &a.CommitPRs
 		r.PRDetail = &a.PRDetail
 		r.Reviews = &a.Reviews

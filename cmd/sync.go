@@ -73,7 +73,8 @@ func newSyncCmd() *cobra.Command {
 			})
 			pipeline.SetAPIStatsFn(func() sync.APIStatsSnapshot {
 				return sync.APIStatsSnapshot{
-					CommitDetail:       enricher.Stats.CommitDetail.Load(),
+					CommitDetailEager:  enricher.Stats.CommitDetailEager.Load(),
+					CommitDetailLazy:   enricher.Stats.CommitDetailLazy.Load(),
 					CommitPRs:          enricher.Stats.CommitPRs.Load(),
 					PRDetail:           enricher.Stats.PRDetail.Load(),
 					Reviews:            enricher.Stats.Reviews.Load(),
@@ -102,7 +103,7 @@ func newSyncCmd() *cobra.Command {
 						}
 					}
 				}
-				enricher.Stats.CommitDetail.Add(1)
+				enricher.Stats.CommitDetailLazy.Add(1)
 				detail, err := client.GetCommitDetail(ctxForFetcher, org, repo, sha)
 				if err != nil {
 					return 0, 0, err
@@ -165,7 +166,8 @@ func newSyncCmd() *cobra.Command {
 				"total_api", s.Total(),
 				"cache_hits", s.CacheHits.Load(),
 				"db_hits", s.DBHits.Load(),
-				"commit_detail", s.CommitDetail.Load(),
+				"commit_detail_eager", s.CommitDetailEager.Load(),
+				"commit_detail_lazy", s.CommitDetailLazy.Load(),
 				"commit_prs", s.CommitPRs.Load(),
 				"pr_detail", s.PRDetail.Load(),
 				"reviews", s.Reviews.Load(),

@@ -22,7 +22,19 @@ const enrichPRFanout = 5
 
 // APIStats tracks API request counts by endpoint.
 type APIStats struct {
-	CommitDetail       atomic.Int64
+	// CommitDetailEager is GET /commits/{sha} fetched during enrichment
+	// (the getCommit defensive fallback when DB doesn't have the row
+	// pre-populated). On warm DBs this should be near zero.
+	CommitDetailEager atomic.Int64
+	// CommitDetailLazy is GET /commits/{sha} fetched during the audit
+	// phase via the statsFetcher closure — Architecture.md rule §2's
+	// empty-commit fallback and rule §5's PR-branch-author empty-stats
+	// disambiguation. Dominant on cold sweeps because PR-branch commits
+	// (from /pulls/{n}/commits) are returned without diff stats. Tracked
+	// separately so we can decide whether eager batched prefetching
+	// (which would convert these into Eager calls amortised across a
+	// repo) is worth implementing.
+	CommitDetailLazy   atomic.Int64
 	CommitPRs          atomic.Int64
 	PRDetail           atomic.Int64
 	Reviews            atomic.Int64
@@ -43,7 +55,8 @@ type APIStats struct {
 
 // Total returns the total number of API requests made.
 func (s *APIStats) Total() int64 {
-	return s.CommitDetail.Load() + s.CommitPRs.Load() + s.PRDetail.Load() +
+	return s.CommitDetailEager.Load() + s.CommitDetailLazy.Load() +
+		s.CommitPRs.Load() + s.PRDetail.Load() +
 		s.Reviews.Load() + s.CheckRuns.Load() + s.PRCommits.Load() +
 		s.RevertVerification.Load()
 }
@@ -140,7 +153,7 @@ func (ce *CachingEnricher) getCommit(ctx context.Context, org, repo, sha string)
 			return &c, nil
 		}
 	}
-	ce.Stats.CommitDetail.Add(1)
+	ce.Stats.CommitDetailEager.Add(1)
 	return ce.client.GetCommitDetail(ctx, org, repo, sha)
 }
 
