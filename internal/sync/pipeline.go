@@ -17,6 +17,14 @@ import (
 
 const enrichBatchSize = 25
 
+// auditFanoutLimit caps concurrent EvaluateCommit calls within a single
+// repo's audit pass. EvaluateCommit can issue a GetCommitDetail call on
+// the §2 empty-commit and §5 lazy-stats paths, so the loop must be
+// parallel to keep the token pool saturated on long-tail repos. 16 is
+// well below the per-token in-flight limits and leaves headroom for
+// other repos' goroutines running concurrently at p.config.Concurrency.
+const auditFanoutLimit = 16
+
 // GitHubSource abstracts GitHub API access for listing repos and commits.
 type GitHubSource interface {
 	ListOrgRepos(ctx context.Context, org string) ([]model.RepoInfo, error)
@@ -643,20 +651,41 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 		enrichmentMap[e.Commit.SHA] = e
 	}
 
-	var auditResults []model.AuditResult
-	for _, c := range unaudited {
-		enrichment := enrichmentMap[c.SHA]
-		// Carry any additions/deletions we happened to get during enrichment
-		// (e.g. from a future GraphQL path). When absent, EvaluateCommit
-		// resolves them lazily via p.statsFetcher only if the audit would
-		// otherwise flag the commit non-compliant.
-		if e, ok := enrichmentMap[c.SHA]; ok {
-			c.Additions = e.Commit.Additions
-			c.Deletions = e.Commit.Deletions
-		}
-		result := EvaluateCommit(c, enrichment, p.config.ExemptAuthors, p.config.RequiredChecks, p.statsFetcher)
-		result.AuditedAt = time.Now()
-		auditResults = append(auditResults, result)
+	// Audit-loop fan-out. Previously this loop was serial, which meant a
+	// repo with thousands of unaudited commits — and any of those tripping
+	// the §2 empty-commit fallback or the §5 lazy stats fetch — issued
+	// each GetCommitDetail request one-at-a-time. On the long-tail repos
+	// (voyager-android, frontend-api, sdui) this dropped the global API
+	// rate to ~2/s with 12 tokens idle. EvaluateCommit is pure given a
+	// fixed enrichment + thread-safe statsFetcher, so we fan out at the
+	// same per-repo concurrency the rest of the pipeline uses.
+	auditResults := make([]model.AuditResult, len(unaudited))
+	auditEG, auditCtx := errgroup.WithContext(ctx)
+	auditEG.SetLimit(auditFanoutLimit)
+	for i := range unaudited {
+		i := i
+		auditEG.Go(func() error {
+			if err := auditCtx.Err(); err != nil {
+				return err
+			}
+			c := unaudited[i]
+			enrichment := enrichmentMap[c.SHA]
+			// Carry any additions/deletions we happened to get during
+			// enrichment (e.g. from a future GraphQL path). When absent,
+			// EvaluateCommit resolves them lazily via p.statsFetcher only
+			// if the audit would otherwise flag the commit non-compliant.
+			if e, ok := enrichmentMap[c.SHA]; ok {
+				c.Additions = e.Commit.Additions
+				c.Deletions = e.Commit.Deletions
+			}
+			result := EvaluateCommit(c, enrichment, p.config.ExemptAuthors, p.config.RequiredChecks, p.statsFetcher)
+			result.AuditedAt = time.Now()
+			auditResults[i] = result
+			return nil
+		})
+	}
+	if err := auditEG.Wait(); err != nil {
+		return fmt.Errorf("auditing commits: %w", err)
 	}
 
 	if err := writer.Write(ctx, func() error {
