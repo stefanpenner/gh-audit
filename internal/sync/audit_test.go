@@ -1818,3 +1818,101 @@ func TestEvaluateRevertCompliance(t *testing.T) {
 		})
 	}
 }
+
+// TestLatestReviewStatesOnFinal_CaseSensitivity verifies that the per-reviewer
+// latest-state map treats login casing as equivalent. GitHub normalizes logins
+// but cached data or renamed accounts may introduce casing variance.
+func TestLatestReviewStatesOnFinal_CaseSensitivity(t *testing.T) {
+	pr := model.PullRequest{
+		Number:  1,
+		HeadSHA: "head",
+		MergedAt: time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC),
+	}
+	t1 := time.Date(2025, 5, 1, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2025, 5, 1, 11, 0, 0, 0, time.UTC)
+
+	t.Run("same reviewer different casing collapses to one entry", func(t *testing.T) {
+		reviews := []model.Review{
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "Alice", ReviewID: 1, State: "APPROVED", SubmittedAt: t1},
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "alice", ReviewID: 2, State: "CHANGES_REQUESTED", SubmittedAt: t2},
+		}
+		latest, _ := latestReviewStatesOnFinal(reviews, pr)
+		require.Len(t, latest, 1, "same reviewer with different casing must collapse to one map entry")
+		for _, r := range latest {
+			assert.Equal(t, "CHANGES_REQUESTED", r.State, "later CHANGES_REQUESTED must clobber earlier APPROVED")
+		}
+	})
+
+	t.Run("COMMENTED with different casing does not clobber APPROVED", func(t *testing.T) {
+		reviews := []model.Review{
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "Bob", ReviewID: 1, State: "APPROVED", SubmittedAt: t1},
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "bob", ReviewID: 2, State: "COMMENTED", SubmittedAt: t2},
+		}
+		latest, _ := latestReviewStatesOnFinal(reviews, pr)
+		require.Len(t, latest, 1)
+		for _, r := range latest {
+			assert.Equal(t, "APPROVED", r.State, "COMMENTED must not clobber APPROVED even with casing mismatch")
+		}
+	})
+}
+
+// TestLatestReviewStatesOnFinal_SameTimestampTiebreak verifies that when two
+// reviews from the same reviewer have identical SubmittedAt, the one with the
+// higher ReviewID wins (later creation). Without this, slice order determines
+// the outcome — an observable correctness hazard.
+func TestLatestReviewStatesOnFinal_SameTimestampTiebreak(t *testing.T) {
+	pr := model.PullRequest{
+		Number:  1,
+		HeadSHA: "head",
+		MergedAt: time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC),
+	}
+	sameTime := time.Date(2025, 5, 1, 10, 0, 0, 0, time.UTC)
+
+	t.Run("higher ReviewID wins when timestamps are equal", func(t *testing.T) {
+		reviews := []model.Review{
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "reviewer", ReviewID: 100, State: "APPROVED", SubmittedAt: sameTime},
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "reviewer", ReviewID: 200, State: "CHANGES_REQUESTED", SubmittedAt: sameTime},
+		}
+		latest, _ := latestReviewStatesOnFinal(reviews, pr)
+		require.Len(t, latest, 1)
+		assert.Equal(t, "CHANGES_REQUESTED", latest["reviewer"].State,
+			"higher ReviewID must win as tiebreaker when timestamps are equal")
+	})
+
+	t.Run("order independence with same timestamp", func(t *testing.T) {
+		// Reversed slice order — must produce the same result.
+		reviews := []model.Review{
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "reviewer", ReviewID: 200, State: "CHANGES_REQUESTED", SubmittedAt: sameTime},
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "reviewer", ReviewID: 100, State: "APPROVED", SubmittedAt: sameTime},
+		}
+		latest, _ := latestReviewStatesOnFinal(reviews, pr)
+		require.Len(t, latest, 1)
+		assert.Equal(t, "CHANGES_REQUESTED", latest["reviewer"].State,
+			"result must be order-independent — higher ReviewID wins regardless of slice position")
+	})
+}
+
+// TestEvaluateCommit_ReviewerCasingBug is an integration test proving that
+// reviewer login casing differences do not create a false-compliant verdict.
+func TestEvaluateCommit_ReviewerCasingBug(t *testing.T) {
+	f := newAuditBaseline()
+	cases := []evalCase{
+		{
+			name:   "APPROVED then CHANGES_REQUESTED from same reviewer (different casing) → non-compliant",
+			commit: f.commit,
+			enrichment: model.EnrichmentResult{
+				PRs: []model.PullRequest{f.pr},
+				Reviews: []model.Review{
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "Reviewer1", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer1", State: "CHANGES_REQUESTED", CommitID: "head123", SubmittedAt: f.now},
+				},
+				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
+			},
+			requiredChecks: f.requiredChecks,
+			wantCompliant:  false,
+			wantHasPR:      true,
+			wantReasons:    []string{"no approval on final commit (PR #42)"},
+		},
+	}
+	runEvalCases(t, cases)
+}

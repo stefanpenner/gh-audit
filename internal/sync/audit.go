@@ -473,18 +473,22 @@ func latestReviewStatesOnFinal(reviews []model.Review, pr model.PullRequest) (ma
 			}
 			continue
 		}
-		existing, exists := latest[review.ReviewerLogin]
+		key := strings.ToLower(review.ReviewerLogin)
+		existing, exists := latest[key]
 		if !exists {
-			latest[review.ReviewerLogin] = review
+			latest[key] = review
 			continue
 		}
-		if !review.SubmittedAt.After(existing.SubmittedAt) {
+		if review.SubmittedAt.Before(existing.SubmittedAt) {
+			continue
+		}
+		if review.SubmittedAt.Equal(existing.SubmittedAt) && review.ReviewID <= existing.ReviewID {
 			continue
 		}
 		if review.State == "COMMENTED" && existing.State == "APPROVED" {
 			continue
 		}
-		latest[review.ReviewerLogin] = review
+		latest[key] = review
 	}
 	return latest, postMergeConcern
 }
