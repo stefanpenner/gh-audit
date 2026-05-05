@@ -119,7 +119,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	// finalizeNonCompliant can report its reasons.
 	var best prVerdict
 	for i := range enrichment.PRs {
-		v := evaluatePR(commit, enrichment, &enrichment.PRs[i], requiredChecks, fetchStats)
+		v := evaluatePR(commit, enrichment, &enrichment.PRs[i], requiredChecks, fetchStats, exemptAuthors)
 		if v.approvalOnFinal && v.ownerApprovalOK {
 			return finalizeCompliantPR(result, commit, enrichment, v)
 		}
@@ -174,12 +174,12 @@ func initAuditResult(commit model.Commit, enrichment model.EnrichmentResult) mod
 // still marked so reviewers can see the match — and the function returns
 // false so downstream rules audit the human code.
 //
-// Matching is strict id-only — see isExempt for the full rationale.
-// commit.AuthorID is guaranteed populated by ingestion (client.go's
-// requireAuthor refuses commits without it), so the rule never has to
-// fall back to login or other forgeable signals.
+// Matching prefers the unforgeable numeric account id; for service accounts
+// whose emails GitHub doesn't bind to an account (commit.AuthorID == 0) the
+// rule falls back to the operator-curated `verified_emails` list. See
+// isExemptCommit for the full rationale.
 func applyExemptAuthorRule(result *model.AuditResult, commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor) bool {
-	if !isExempt(commit.AuthorID, exemptAuthors) {
+	if !isExemptCommit(commit.AuthorID, commit.AuthorEmail, exemptAuthors) {
 		return false
 	}
 	result.IsExemptAuthor = true
@@ -192,29 +192,38 @@ func applyExemptAuthorRule(result *model.AuditResult, commit model.Commit, enric
 	return true
 }
 
-// isExempt is the shared id-only matcher used by §1 and the
-// PR-branch-contributor scan. Numeric account IDs are the only signal
-// trusted for exempt-author matching:
-//
-//   - GitHub-controlled and immutable per account.
-//   - Never reused across deletions (unlike usernames, which return to
-//     the pool after a 90-day cooldown and can be claimed by anyone).
-//   - Cannot be forged client-side — the operator cannot fabricate a
-//     commit whose author.id resolves to a particular account.
-//
-// Commit ingestion (internal/github/client.go::requireAuthor) refuses
-// commits with no resolved author id and surfaces a fix-it message. By
-// the time isExempt is called, every commit in scope is guaranteed to
-// have AuthorID != 0; an entry whose ID is zero (the YAML schema allows
-// it for un-resolved bare-string legacy entries, though those are no
-// longer accepted) is silently ignored — never matches.
-func isExempt(authorID int64, exemptAuthors []model.ExemptAuthor) bool {
-	if authorID == 0 {
+// isExemptCommit decides whether a commit's authorship matches the
+// exempt list. The preferred signal is the numeric account id —
+// GitHub-controlled, immutable, never reused, and not forgeable
+// client-side. When the id is unavailable (AuthorID == 0, typical for
+// service accounts whose git-author email isn't bound to a GitHub
+// account) the function falls back to matching the commit's
+// author email against any exempt entry's curated `verified_emails`
+// list. The email path is forgeable in isolation (any local committer
+// can set their git-author email arbitrarily), so callers that want
+// to extend a carve-out beyond the audited commit itself — e.g. to a
+// squash-merged PR's branch contents — must additionally verify every
+// PR-branch commit passes this same check (see
+// hasNonExemptPRContributors). The combination "operator-vetted email
+// list + every contributor passes" recovers the same trust property
+// id-only matching provided.
+func isExemptCommit(authorID int64, authorEmail string, exemptAuthors []model.ExemptAuthor) bool {
+	if authorID != 0 {
+		for _, e := range exemptAuthors {
+			if e.ID != 0 && e.ID == authorID {
+				return true
+			}
+		}
+		return false
+	}
+	if authorEmail == "" {
 		return false
 	}
 	for _, e := range exemptAuthors {
-		if e.ID != 0 && e.ID == authorID {
-			return true
+		for _, em := range e.VerifiedEmails {
+			if strings.EqualFold(em, authorEmail) {
+				return true
+			}
 		}
 	}
 	return false
@@ -315,7 +324,7 @@ type prVerdict struct {
 //	Phase 3: emit §4 / §5 reasons. selfApproved and staleApproval are
 //	         independent flaws and can both appear for the same PR.
 //	Phase 4: evaluate §6 required status checks and append any failure.
-func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *model.PullRequest, requiredChecks []RequiredCheck, fetchStats StatsFetcher) prVerdict {
+func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *model.PullRequest, requiredChecks []RequiredCheck, fetchStats StatsFetcher, exemptAuthors []model.ExemptAuthor) prVerdict {
 	v := prVerdict{pr: pr}
 	v.prBranchCommits = filterNonEmptyContributors(commit.Org, commit.Repo, enrichment.PRBranchCommits[pr.Number], fetchStats)
 
@@ -346,10 +355,23 @@ func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *mode
 			if review.ReviewerID == 0 {
 				continue
 			}
-			if review.State == "APPROVED" && !isSelfApproval(review, commit, *pr, v.prBranchCommits) {
-				v.staleApproval = true
-				break
+			if review.State != "APPROVED" || isSelfApproval(review, commit, *pr, v.prBranchCommits) {
+				continue
 			}
+			// Carve-out: if every PR-branch commit committed strictly
+			// after this approval is authored by an exempt-list
+			// account (typically a CI bot performing automated
+			// branch-sync merges), the head moved without adding any
+			// human-authored bytes the reviewer didn't see — the
+			// approval's intent still covers the merged content.
+			// Promote the review to approvalOnFinal so §4 doesn't fire.
+			if isApprovalRefreshable(review, enrichment.PRBranchCommits[pr.Number], pr.MergeCommitSHA, exemptAuthors) {
+				v.approvalOnFinal = true
+				v.approvers = append(v.approvers, review.ReviewerLogin)
+				continue
+			}
+			v.staleApproval = true
+			break
 		}
 	}
 
@@ -608,23 +630,33 @@ func truncateSHA(sha string) string {
 
 // hasNonExemptPRContributors returns true if any PR branch commit author
 // is not in the exempt list. Used to prevent exempt-author early return
-// when a squash merge contains human contributions. Strict id-only,
-// matching applyExemptAuthorRule.
+// when a squash merge contains human contributions. Mirrors
+// applyExemptAuthorRule's matching: id when present, falling back to
+// `verified_emails` when AuthorID == 0.
 //
-// Note: PR-branch commits come from /pulls/{n}/commits which (unlike
-// /repos/{o}/{r}/commits) does not go through requireAuthor. A
-// PR-branch commit with AuthorID == 0 means GitHub couldn't bind the
-// branch commit's git author email to a verified account. We treat
-// that as "non-exempt contributor present" — fail closed — because
-// the bot exempt path is meant to short-circuit "no human code", and
-// an unverifiable contributor cannot be presumed exempt.
+// Empty commits (zero additions and zero deletions) are skipped — they
+// can't introduce any code into the squash merge, so their author's
+// exempt status is irrelevant to "did human code ship". This mirrors
+// the empty-commit exclusion in distinctPRCommitAuthors (Architecture.md
+// §5) and avoids voiding the §1 carve-out on GitHub stub commits or
+// "Empty commit to rerun check" markers.
+//
+// PR-branch commits come from /pulls/{n}/commits which (unlike
+// /repos/{o}/{r}/commits) does not go through requireAuthor — so an
+// AuthorID of 0 is normal. The verified_emails fallback lets the
+// operator vet service accounts whose emails GitHub doesn't bind to a
+// verified account; without a match (or with no email at all) we fail
+// closed, treating the contributor as non-exempt.
 func hasNonExemptPRContributors(enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor) bool {
 	if len(enrichment.PRBranchCommits) == 0 {
 		return false
 	}
 	for _, commits := range enrichment.PRBranchCommits {
 		for _, c := range commits {
-			if !isExempt(c.AuthorID, exemptAuthors) {
+			if c.Additions == 0 && c.Deletions == 0 {
+				continue
+			}
+			if !isExemptCommit(c.AuthorID, c.AuthorEmail, exemptAuthors) {
 				return true
 			}
 		}
@@ -668,6 +700,56 @@ func filterNonEmptyContributors(org, repo string, commits []model.Commit, fetchS
 		}
 	}
 	return out
+}
+
+// isApprovalRefreshable implements the §4 stale-approval carve-out
+// for post-approval commits produced exclusively by exempt-list
+// accounts (typically CI bots performing branch-sync merges, but the
+// rule is more general). Returns true iff every PR-branch commit
+// committed strictly after the approval is authored by an account in
+// the exempt list.
+//
+// The trust boundary is the exempt-author ID match. AuthorID is set
+// by GitHub from the commit's git-author email's verified account
+// binding — a local actor cannot forge it. The exempt list is the
+// curated set of accounts the operator has already vetted as not
+// requiring human review (§1); commits by those accounts after an
+// approval don't invalidate the approval's coverage.
+//
+// One non-exempt commit between approval and merge means real
+// human-authored code shipped that the reviewer never saw — the
+// original §4 stale flag is the right verdict.
+//
+// An empty post-approval set returns false — the caller only invokes
+// this on an old-SHA review, so a post-approval set should always be
+// non-empty in practice; treating "no post-approval commits" as
+// non-refreshable is the safe default.
+//
+// `mergeCommitSHA` is the PR's `merge_commit_sha`. The PR-branch list is
+// built from `commit_prs ⨝ commits`, which links the squash-merge
+// commit on master to the PR — so it ends up in the per-PR commit list
+// even though it's the merge destination, not a branch contribution.
+// We skip that SHA before applying the exempt check; otherwise a
+// human-authored squash-merge commit (the normal case for a
+// human-authored PR) would always void the carve-out.
+func isApprovalRefreshable(approval model.Review, prBranchCommits []model.Commit, mergeCommitSHA string, exemptAuthors []model.ExemptAuthor) bool {
+	if len(prBranchCommits) == 0 {
+		return false
+	}
+	postApprovalCount := 0
+	for _, c := range prBranchCommits {
+		if mergeCommitSHA != "" && c.SHA == mergeCommitSHA {
+			continue
+		}
+		if !c.CommittedAt.After(approval.SubmittedAt) {
+			continue
+		}
+		postApprovalCount++
+		if !isExemptCommit(c.AuthorID, c.AuthorEmail, exemptAuthors) {
+			return false
+		}
+	}
+	return postApprovalCount > 0
 }
 
 // distinctPRCommitAuthors returns unique author logins from a single PR's

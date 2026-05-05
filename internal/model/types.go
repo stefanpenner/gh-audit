@@ -329,4 +329,15 @@ type ExemptAuthor struct {
 	Type    string `yaml:"type,omitempty"`
 	Name    string `yaml:"name,omitempty"`
 	Comment string `yaml:"comment,omitempty"`
+	// VerifiedEmails enumerates git-author emails that the operator has
+	// vetted as belonging to this exempt account. Used as a fallback for
+	// service accounts whose emails GitHub does not bind to a verified
+	// account (so commit.AuthorID stays 0). The list is consulted only
+	// when AuthorID is unavailable; an id match always wins. Forgeable
+	// in the abstract — anyone can set a git-author email locally — so
+	// callers must additionally enforce that every contributor on the
+	// PR's branch passes the same id-or-email check before extending
+	// the carve-out to a squash merge. See isExemptCommit and
+	// hasNonExemptPRContributors.
+	VerifiedEmails []string `yaml:"verified_emails,omitempty"`
 }

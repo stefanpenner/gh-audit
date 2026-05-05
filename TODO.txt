@@ -1,0 +1,65 @@
+Fixture-repo tests outstanding
+==============================
+
+Each entry is a scenario that needs a real PR landed in the
+gh-audit-test-fixtures repo so it shows up in a live sync run, not
+just in unit-test mocks. Cross-reference the scenarios.md catalog
+under testdata/.
+
+- §4 stale-approval automated-branch-sync refresh
+  -----------------------------------------------
+  Add a fixture PR exercising the carve-out
+  (audit.go::isApprovalRefreshable):
+
+    1. PR opened by a human author with a real code commit on the branch.
+    2. A non-self reviewer submits APPROVED on that commit's SHA.
+    3. An exempt-list bot account (numeric ID listed in the operator's
+       exempt-authors config) pushes a post-approval commit (typically
+       a base-branch sync merge, but the rule is content-agnostic — any
+       commit by the exempt account qualifies).
+    4. PR is merged from the new head SHA without any further human
+       commits.
+
+  Expected audit verdict: COMPLIANT, has_stale_approval=false,
+  reason "compliant". A pre-fix sync would have flagged this PR as
+  "approval is stale — not on final commit"; the live fixture run
+  proves the rule fires on a real GitHub commit-history shape, not
+  just the synthetic timestamps unit tests use.
+
+  Negative companion fixture: same setup but the sync merge is
+  authored by the PR author (not exempt). Must remain stale.
+
+- §1 verified_emails fallback for id-less service accounts
+  ---------------------------------------------------------
+  Add a fixture PR exercising the carve-out
+  (audit.go::isExemptCommit + applyExemptAuthorRule):
+
+    1. PR opened by an exempt-list account whose git-author email is
+       NOT bound to its GitHub account, so its commits arrive with
+       author_id=0. The exempt entry has `verified_emails: [<that-email>]`.
+    2. The PR contains only commits whose author_email is on the
+       verified_emails list (i.e. all squashed work is the bot's).
+    3. PR is squash-merged via the GitHub merge button. The merge
+       commit on master has author_id=0, author_email=<the email>,
+       committer=web-flow.
+
+  Expected audit verdict: COMPLIANT, IsExemptAuthor=true,
+  reason "exempt: configured author". A pre-fix sync would have
+  flagged this commit non-compliant (§3 stale or §4 missing approval)
+  because id-only matching skipped the bot. The live fixture run
+  proves the email fallback fires on a real GitHub commit-history
+  shape, not just synthetic AuthorID=0 unit tests.
+
+  Negative companion fixtures:
+    a) Same PR but with one PR-branch commit pushed by a human
+       collaborator (different email, AuthorID > 0 or unbound). Must
+       NOT be exempt — non-exempt contributor in the squash voids the
+       carve-out.
+    b) Direct push to master with author_email matching verified_emails
+       but no PR. Must remain non-compliant under §3 (the rule is
+       per-PR; the email fallback alone doesn't waive missing-PR).
+
+  Real-world shape: a service account whose noreply / private email
+  isn't bound to its GitHub account opens hundreds of PRs that
+  squash-merge into commits with author_id=0 — these were
+  misclassified as non-compliant before the fallback shipped.

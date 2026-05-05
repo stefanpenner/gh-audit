@@ -175,6 +175,116 @@ func TestEvaluateCommit_Rule1_ExemptAuthor(t *testing.T) {
 	runEvalCases(t, cases)
 }
 
+// TestEvaluateCommit_Rule1_VerifiedEmailFallback covers the §1 carve-out
+// for service accounts whose git-author email is not bound to a GitHub
+// account (so commit.AuthorID stays 0 even though the operator has
+// vetted the account onto the exempt list).
+//
+// Real-world shape: a service account (`svc-bot`) opens PRs that get
+// squash-merged via the GitHub merge button. The resulting merge
+// commit has author_email=svc-bot@example.com but author_id=0,
+// because the email is not publicly bound to a GitHub account. Under
+// strict id-only matching the merge commit looks non-exempt despite
+// being the bot's work.
+//
+// The carve-out: when commit.AuthorID is 0, fall back to matching
+// commit.AuthorEmail against the exempt entry's `verified_emails`
+// list. The list is operator-curated (same trust class as the rest of
+// the exempt config), and is only consulted when GitHub couldn't
+// supply a forgery-resistant id. To prevent a squash from absorbing
+// non-exempt code, EVERY PR-branch commit must independently pass the
+// same test (id OR email match), or the exemption is denied.
+func TestEvaluateCommit_Rule1_VerifiedEmailFallback(t *testing.T) {
+	exempt := []model.ExemptAuthor{
+		{
+			Login:          "svc-bot-account",
+			ID:             900001,
+			Type:           "User",
+			Name:           "svc-bot",
+			VerifiedEmails: []string{"svc-bot@example.com"},
+		},
+	}
+
+	t.Run("squash-merge by exempt service account whose email isn't id-bound — exempt", func(t *testing.T) {
+		mergeCommit := model.Commit{
+			Org: "myorg", Repo: "myrepo", SHA: "merge-sha",
+			AuthorLogin: "", AuthorID: 0,
+			AuthorEmail:    "svc-bot@example.com",
+			CommitterLogin: "web-flow",
+			ParentCount:    1, Additions: 5, Deletions: 3,
+		}
+		pr := model.PullRequest{
+			Org: "myorg", Repo: "myrepo", Number: 42,
+			MergeCommitSHA: "merge-sha",
+			AuthorLogin:    "svc-bot-account",
+			Merged:         true,
+		}
+		enrichment := model.EnrichmentResult{
+			PRs: []model.PullRequest{pr},
+			PRBranchCommits: map[int][]model.Commit{
+				42: {
+					{Org: "myorg", Repo: "myrepo", SHA: "branch1", AuthorID: 0, AuthorEmail: "svc-bot@example.com", ParentCount: 1, Additions: 5, Deletions: 3},
+				},
+			},
+		}
+		result := EvaluateCommit(mergeCommit, enrichment, exempt, nil, nil)
+		assert.True(t, result.IsCompliant, "merge commit by id-less but email-verified exempt account should be compliant. reasons=%v", result.Reasons)
+		assert.True(t, result.IsExemptAuthor, "IsExemptAuthor should be set when verified_emails matches")
+		assert.Equal(t, []string{"exempt: configured author"}, result.Reasons)
+	})
+
+	t.Run("squash-merge: PR-branch contains a non-exempt commit — NOT exempt", func(t *testing.T) {
+		mergeCommit := model.Commit{
+			Org: "myorg", Repo: "myrepo", SHA: "merge-sha",
+			AuthorID: 0, AuthorEmail: "svc-bot@example.com",
+			ParentCount: 1, Additions: 50, Deletions: 5,
+		}
+		pr := model.PullRequest{
+			Org: "myorg", Repo: "myrepo", Number: 42,
+			MergeCommitSHA: "merge-sha",
+			AuthorLogin:    "svc-bot-account",
+			Merged:         true,
+		}
+		enrichment := model.EnrichmentResult{
+			PRs: []model.PullRequest{pr},
+			PRBranchCommits: map[int][]model.Commit{
+				42: {
+					{Org: "myorg", Repo: "myrepo", SHA: "branch1", AuthorID: 0, AuthorEmail: "svc-bot@example.com"},
+					// Human collaborator pushed onto the bot's PR — not on the verified_emails list.
+					{Org: "myorg", Repo: "myrepo", SHA: "branch2", AuthorID: 555111, AuthorLogin: "human-contributor", AuthorEmail: "human@example.com", Additions: 30, Deletions: 2},
+				},
+			},
+		}
+		result := EvaluateCommit(mergeCommit, enrichment, exempt, nil, nil)
+		assert.False(t, result.IsCompliant, "any non-exempt PR-branch contributor must void the carve-out")
+		assert.True(t, result.IsExemptAuthor, "the audited commit's author still matches; IsExemptAuthor stays informational")
+	})
+
+	t.Run("commit email not on verified_emails list — NOT exempt", func(t *testing.T) {
+		commit := model.Commit{
+			Org: "myorg", Repo: "myrepo", SHA: "abc",
+			AuthorID: 0, AuthorEmail: "someone-else@example.com",
+			Additions: 5, Deletions: 3,
+		}
+		result := EvaluateCommit(commit, model.EnrichmentResult{}, exempt, nil, nil)
+		assert.False(t, result.IsCompliant)
+		assert.False(t, result.IsExemptAuthor)
+	})
+
+	t.Run("commit has author_id matching exempt entry — id wins, email path not consulted", func(t *testing.T) {
+		commit := model.Commit{
+			Org: "myorg", Repo: "myrepo", SHA: "abc",
+			AuthorLogin: "svc-bot-account",
+			AuthorID:    900001,
+			AuthorEmail: "completely-unrelated@example.com", // ignored when ID matches
+			Additions:   5, Deletions: 3,
+		}
+		result := EvaluateCommit(commit, model.EnrichmentResult{}, exempt, nil, nil)
+		assert.True(t, result.IsCompliant)
+		assert.True(t, result.IsExemptAuthor)
+	})
+}
+
 // TestEvaluateCommit_Rule2_EmptyCommit covers Architecture.md §2.
 //
 // A commit with zero additions AND zero deletions is compliant, flagged
@@ -489,6 +599,192 @@ func TestEvaluateCommit_Rule4_StaleApproval(t *testing.T) {
 		},
 	}
 	runEvalCases(t, cases)
+}
+
+// TestEvaluateCommit_Rule4_AutomatedSyncMergeRefresh covers the §4
+// carve-out for automated CI-bot branch-sync merges (the bot merges
+// the base branch into an open PR's branch to keep it current). Such
+// a merge moves the PR head SHA without adding human-authored bytes,
+// so a legitimate prior approval still covers the merged content.
+//
+// The carve-out: when every PR-branch commit committed strictly
+// after a non-self APPROVED review's submitted_at is a 2+-parent
+// merge whose message starts with the `git merge` default prefix
+// (`Merge branch '`) AND whose author ID is on the operator's
+// exempt-authors list, promote the review to "fresh" and clear the
+// staleApproval flag. The structural-shape check (parent count +
+// message prefix) is forgeable on its own; the exempt-author ID
+// match is the unforgeable trust boundary (GitHub-verified
+// email→account binding).
+//
+// Negative cases must continue to fire stale: any post-approval
+// commit that is (a) authored by a non-exempt account, (b) lacks
+// the structural shape (single-parent, or non-matching message),
+// invalidates the carve-out.
+func TestEvaluateCommit_Rule4_AutomatedSyncMergeRefresh(t *testing.T) {
+	// Compact baseline reused across the matrix. The PR's HeadSHA
+	// is whatever the last post-approval commit's SHA happens to
+	// be — each case wires that explicitly.
+	now := time.Now()
+	approvalAt := now.Add(-2 * time.Hour)
+	freshAt := now.Add(-1 * time.Hour)
+
+	mkPR := func(headSHA string) model.PullRequest {
+		return model.PullRequest{
+			Org: "myorg", Repo: "myrepo", Number: 42,
+			HeadSHA: headSHA, MergeCommitSHA: "merge-abc", AuthorLogin: "human-author",
+			Href: "https://github.com/myorg/myrepo/pull/42",
+		}
+	}
+	approvedReview := model.Review{
+		Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1,
+		ReviewerLogin: "human-reviewer", ReviewerID: 999001, State: "APPROVED",
+		CommitID: "approval-target", SubmittedAt: approvalAt,
+	}
+	mergeCommit := model.Commit{
+		Org: "myorg", Repo: "myrepo", SHA: "merge-abc",
+		AuthorLogin: "human-author", AuthorID: 555111,
+		Additions: 50, Deletions: 5,
+		Href: "https://github.com/myorg/myrepo/commit/merge-abc",
+	}
+	required := []RequiredCheck{{Name: "Owner Approval", Conclusion: "success"}}
+	checks := []model.CheckRun{
+		{Org: "myorg", Repo: "myrepo", CommitSHA: "head-fg", CheckRunID: 100, CheckName: "Owner Approval", Status: "completed", Conclusion: "success"},
+	}
+	exempt := []model.ExemptAuthor{
+		{Login: "ci-bot[bot]", ID: 127780896, Type: "Bot"},
+		{Login: "svc-ci-account", ID: 135765466, Type: "User"},
+	}
+
+	t.Run("post-approval automated branch-sync merge by exempt bot — refreshes the approval", func(t *testing.T) {
+		pr := mkPR("head-sync")
+		pr.HeadSHA = "head-sync"
+		checks := []model.CheckRun{
+			{Org: "myorg", Repo: "myrepo", CommitSHA: "head-sync", CheckRunID: 100, CheckName: "Owner Approval", Status: "completed", Conclusion: "success"},
+		}
+		enrichment := model.EnrichmentResult{
+			Commit: mergeCommit, PRs: []model.PullRequest{pr},
+			Reviews:   []model.Review{approvedReview},
+			CheckRuns: checks,
+			PRBranchCommits: map[int][]model.Commit{
+				42: {
+					{Org: "myorg", Repo: "myrepo", SHA: "approval-target", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: approvalAt.Add(-time.Hour), ParentCount: 1, Additions: 50, Deletions: 5},
+					{Org: "myorg", Repo: "myrepo", SHA: "head-sync", AuthorLogin: "ci-bot[bot]", AuthorID: 127780896, CommittedAt: freshAt, ParentCount: 2, Message: "Merge branch 'master' into 'feature' to keep PR fresh."},
+				},
+			},
+		}
+		result := EvaluateCommit(mergeCommit, enrichment, exempt, required, nil)
+		assert.True(t, result.IsCompliant, "approval refreshed by exempt-bot branch-sync merge — should be compliant. reasons=%v", result.Reasons)
+		assert.False(t, result.HasStaleApproval, "stale flag must clear when the only post-approval commits are exempt-bot branch-sync merges")
+	})
+
+	t.Run("post-approval branch-sync merge by NON-exempt user — still stale", func(t *testing.T) {
+		pr := mkPR("head-sync")
+		enrichment := model.EnrichmentResult{
+			Commit: mergeCommit, PRs: []model.PullRequest{pr},
+			Reviews:   []model.Review{approvedReview},
+			CheckRuns: checks,
+			PRBranchCommits: map[int][]model.Commit{
+				42: {
+					{Org: "myorg", Repo: "myrepo", SHA: "approval-target", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: approvalAt.Add(-time.Hour), ParentCount: 1, Additions: 50, Deletions: 5},
+					// Same structural shape, but author is the human PR author (not exempt). Trust boundary blocks the carve-out.
+					{Org: "myorg", Repo: "myrepo", SHA: "head-sync", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: freshAt, ParentCount: 2, Message: "Merge branch 'master' into 'feature' to keep PR fresh."},
+				},
+			},
+		}
+		result := EvaluateCommit(mergeCommit, enrichment, exempt, required, nil)
+		assert.True(t, result.HasStaleApproval, "non-exempt author cannot refresh approval even if message and parent count match")
+		assert.False(t, result.IsCompliant)
+	})
+
+	t.Run("post-approval mix of branch-sync merge AND real code commit — still stale", func(t *testing.T) {
+		pr := mkPR("head-real")
+		enrichment := model.EnrichmentResult{
+			Commit: mergeCommit, PRs: []model.PullRequest{pr},
+			Reviews:   []model.Review{approvedReview},
+			CheckRuns: checks,
+			PRBranchCommits: map[int][]model.Commit{
+				42: {
+					{Org: "myorg", Repo: "myrepo", SHA: "approval-target", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: approvalAt.Add(-time.Hour), ParentCount: 1, Additions: 50, Deletions: 5},
+					{Org: "myorg", Repo: "myrepo", SHA: "sync1", AuthorLogin: "ci-bot[bot]", AuthorID: 127780896, CommittedAt: freshAt.Add(-30 * time.Minute), ParentCount: 2, Message: "Merge branch 'master' into 'feature' to keep PR fresh."},
+					// Author pushed real code AFTER approval — invalidates carve-out.
+					{Org: "myorg", Repo: "myrepo", SHA: "head-real", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: freshAt, ParentCount: 1, Additions: 12, Deletions: 0, Message: "tighten error handling"},
+				},
+			},
+		}
+		result := EvaluateCommit(mergeCommit, enrichment, exempt, required, nil)
+		assert.True(t, result.HasStaleApproval, "any single-parent post-approval commit by a non-exempt author voids the carve-out")
+		assert.False(t, result.IsCompliant)
+	})
+
+	t.Run("regression: PR-branch list includes the squash-merge commit on master — must be skipped", func(t *testing.T) {
+		// PRBranchCommits[n] comes from commit_prs ⨝ commits, which
+		// links the squash-merge commit (pr.merge_commit_sha) to the
+		// PR. That commit's author is the PR author (a human), not the
+		// CI bot — so a naive "every post-approval commit must be
+		// exempt" check would always void the carve-out for
+		// human-authored PRs. The fix: skip pr.merge_commit_sha when
+		// iterating; it's the merge destination, not a branch
+		// contribution.
+		approvedReviewSamePR := approvedReview
+		approvedReviewSamePR.SubmittedAt = approvalAt
+		mergeCommit := model.Commit{
+			Org: "myorg", Repo: "myrepo", SHA: "merge-sha",
+			AuthorLogin: "human-author", AuthorID: 555111,
+			Additions: 200, Deletions: 50,
+			Href: "https://github.com/myorg/myrepo/commit/merge-sha",
+		}
+		pr := mkPR("head-bot")
+		pr.MergeCommitSHA = "merge-sha"
+		pr.AuthorLogin = "human-author"
+		checks := []model.CheckRun{
+			{Org: "myorg", Repo: "myrepo", CommitSHA: "head-bot", CheckRunID: 100, CheckName: "Owner Approval", Status: "completed", Conclusion: "success"},
+		}
+		enrichment := model.EnrichmentResult{
+			Commit: mergeCommit, PRs: []model.PullRequest{pr},
+			Reviews:   []model.Review{approvedReviewSamePR},
+			CheckRuns: checks,
+			PRBranchCommits: map[int][]model.Commit{
+				42: {
+					{Org: "myorg", Repo: "myrepo", SHA: "approval-target", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: approvalAt.Add(-time.Hour), ParentCount: 1, Additions: 50, Deletions: 5},
+					{Org: "myorg", Repo: "myrepo", SHA: "head-bot", AuthorLogin: "ci-bot[bot]", AuthorID: 127780896, CommittedAt: freshAt, ParentCount: 2, Message: "Merge branch 'master' into 'feature' to keep PR fresh."},
+					// The squash-merge commit on master, ALSO linked to the
+					// PR via commit_prs. Must be skipped: it's not a branch
+					// contribution.
+					{Org: "myorg", Repo: "myrepo", SHA: "merge-sha", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: freshAt.Add(time.Hour), ParentCount: 1, Additions: 200, Deletions: 50},
+				},
+			},
+		}
+		result := EvaluateCommit(mergeCommit, enrichment, exempt, required, nil)
+		assert.True(t, result.IsCompliant, "merge-sha must be skipped from the post-approval check; carve-out should fire. reasons=%v", result.Reasons)
+		assert.False(t, result.HasStaleApproval)
+	})
+
+	t.Run("post-approval commit by exempt bot regardless of message shape — refreshes the approval", func(t *testing.T) {
+		// The exempt-author ID is the trust boundary; the commit message
+		// is not consulted. A vetted bot account's post-approval commits
+		// — sync merge, dependency bump, autoformat, anything — don't
+		// invalidate the human reviewer's approval coverage (§1 already
+		// trusts these accounts to ship without human review).
+		pr := mkPR("head-bot")
+		checks := []model.CheckRun{
+			{Org: "myorg", Repo: "myrepo", CommitSHA: "head-bot", CheckRunID: 100, CheckName: "Owner Approval", Status: "completed", Conclusion: "success"},
+		}
+		enrichment := model.EnrichmentResult{
+			Commit: mergeCommit, PRs: []model.PullRequest{pr},
+			Reviews:   []model.Review{approvedReview},
+			CheckRuns: checks,
+			PRBranchCommits: map[int][]model.Commit{
+				42: {
+					{Org: "myorg", Repo: "myrepo", SHA: "approval-target", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: approvalAt.Add(-time.Hour), ParentCount: 1, Additions: 50, Deletions: 5},
+					{Org: "myorg", Repo: "myrepo", SHA: "head-bot", AuthorLogin: "ci-bot[bot]", AuthorID: 127780896, CommittedAt: freshAt, ParentCount: 1, Message: "Apply patch from upstream"},
+				},
+			},
+		}
+		result := EvaluateCommit(mergeCommit, enrichment, exempt, required, nil)
+		assert.True(t, result.IsCompliant, "exempt-bot post-approval commit refreshes the approval regardless of message. reasons=%v", result.Reasons)
+		assert.False(t, result.HasStaleApproval)
+	})
 }
 
 // TestEvaluateCommit_Rule4_PostMergeCutoff covers Architecture.md §4
@@ -1224,8 +1520,8 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			PRs:    []model.PullRequest{botPR},
 			PRBranchCommits: map[int][]model.Commit{
 				10: {
-					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dependabot[bot]", AuthorID: 49699333},
-					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "human-dev", AuthorID: 1234567},
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dependabot[bot]", AuthorID: 49699333, Additions: 5, Deletions: 1},
+					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "human-dev", AuthorID: 1234567, Additions: 30, Deletions: 2},
 				},
 			},
 		}

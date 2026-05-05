@@ -6,22 +6,32 @@ For every commit on a protected branch, gh-audit evaluates a decision tree (in o
 
 ### 1. Exempt author
 
-If the commit author's GitHub login is in the configured `exemptions.authors` list (case-insensitive match against `commit.author_login` — not email, not display name), the commit is **compliant** immediately. No further checks run.
+If the commit author matches an entry in `exemptions.authors`, the commit is **compliant** immediately. No further checks run.
 
-`author_login` is the GitHub handle (e.g. `stefanpenner`, `dependabot[bot]`) — not `author.name` or `author.email`. Empty if the commit email isn't linked to a GitHub account, in which case no exemption can match.
+The match prefers the **numeric account id** (`commit.author_id` against `ExemptAuthor.id`) — GitHub-controlled, immutable, never reused, and not forgeable client-side.
+
+For service accounts whose git-author email isn't bound to a GitHub account (so `commit.author_id` arrives as 0), the rule falls back to matching `commit.author_email` against the exempt entry's curated `verified_emails` list. This covers internal service accounts that push commits with a generic email GitHub doesn't recognize. The email path is forgeable in isolation, so when the audited commit is a squash-merge, **every** PR-branch commit must independently pass the same id-or-email check (`hasNonExemptPRContributors`); a single human contributor in the squash voids the carve-out. The combination "operator-vetted email list + every contributor passes" recovers the same trust property id-only matching provides.
 
 ```
-config.yaml: exemptions.authors      ← SOT: user-configured list
+config.yaml: exemptions.authors[]    ← SOT: operator-curated list (id, verified_emails)
       │
       ▼
 GET /repos/{o}/{r}/commits/{sha}
-      → commit.author_login           ← SOT: GitHub REST API
+      → commit.author_id              ← preferred, set by GitHub from verified email binding
+      → commit.author_email           ← fallback when author_id == 0
       │
       ▼
 EvaluateCommit (audit.go)
-      → case-insensitive match?
-          yes → IsCompliant=true, IsExemptAuthor=true, reason="exempt: configured author"
-          no  → continue to rule 2
+      isExemptCommit(id, email):
+        author_id matches exempt.id?         → exempt
+        author_id == 0 AND email ∈ verified_emails? → exempt (subject to PR-branch check below)
+        else                                 → not exempt, continue to rule 2
+      │
+      ▼ (when exempt and PR exists)
+      hasNonExemptPRContributors():
+        any branch commit fails isExemptCommit? → grant IsExemptAuthor flag for visibility,
+                                                  but audit the squash content normally
+        all branch commits exempt?              → IsCompliant=true, reason="exempt: configured author"
 ```
 
 ### 2. Empty commit
@@ -115,6 +125,16 @@ Any APPROVED (non-self)?     yes → HasStaleApproval=true
 ```
 
 **Stale approval detection**: When no approval exists on the final commit but an approval exists on an earlier SHA, the reason is `approval is stale — not on final commit` instead of `no approval on final commit`. This distinguishes "never reviewed" from "reviewed, then code changed."
+
+#### Exempt-author post-approval carve-out
+
+CI tooling at many orgs auto-merges the base branch (e.g. `master`) into open PR branches to keep them current, or applies routine post-approval automation (dependency bumps, autoformatting, sync merges). Each such commit moves the PR's head SHA without adding human-authored code that needs review — and naïvely fires §4 stale-approval against any PR whose reviewer approved before the bot ran.
+
+The carve-out — implemented as `isApprovalRefreshable` in `internal/sync/audit.go` — promotes such an approval to `approvalOnFinal` when **every** PR-branch commit committed strictly after the approval's `submitted_at` is **authored by an account on the configured exempt list (matched by numeric ID)**.
+
+The exempt-author ID is the unforgeable trust boundary. GitHub binds `AuthorID` to a verified email account; the exempt list contains the curated set of bot/service-account IDs the operator has already vetted as not requiring human review (the same list that drives §1). A local actor cannot make a commit appear to be authored by another account's verified ID without compromising that account. If §1 trusts these accounts to ship without human review, §4 trusts their post-approval commits not to invalidate the reviewer's approval coverage.
+
+If any post-approval commit is by a non-exempt account, the original §4 stale-approval verdict stands. The carve-out never weakens compliance for cases where real human-authored code shipped after the approval.
 
 ### 
 A review is self-approval if the reviewer's **immutable numeric GitHub ID** matches any of:
