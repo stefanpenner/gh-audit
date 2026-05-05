@@ -131,7 +131,9 @@ type PullRequest struct {
 	HeadBranch     string
 	MergeCommitSHA string
 	AuthorLogin    string
+	AuthorID       int64
 	MergedByLogin  string
+	MergedByID     int64
 	MergedAt       time.Time
 	Href           string
 }
@@ -148,6 +150,7 @@ type Review struct {
 	PRNumber      int
 	ReviewID      int64
 	ReviewerLogin string
+	ReviewerID    int64
 	State         string // APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED
 	CommitID      string
 	SubmittedAt   time.Time

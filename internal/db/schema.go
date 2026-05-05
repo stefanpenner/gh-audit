@@ -70,7 +70,9 @@ const (
 		head_branch      TEXT,
 		merge_commit_sha TEXT,
 		author_login     TEXT,
+		author_id        BIGINT,
 		merged_by_login  TEXT,
+		merged_by_id     BIGINT,
 		merged_at        TIMESTAMP,
 		href             TEXT,
 		fetched_at       TIMESTAMP DEFAULT current_timestamp,
@@ -83,6 +85,7 @@ const (
 		pr_number      INTEGER NOT NULL,
 		review_id      BIGINT NOT NULL,
 		reviewer_login TEXT,
+		reviewer_id    BIGINT DEFAULT 0,
 		state          review_state,
 		commit_id      TEXT,
 		submitted_at   TIMESTAMP,
@@ -185,6 +188,9 @@ var addColumnMigrations = []string{
 	`ALTER TABLE audit_results ADD COLUMN annotations TEXT[]`,
 	`ALTER TABLE commits ADD COLUMN is_verified BOOLEAN DEFAULT false`,
 	`ALTER TABLE commits ADD COLUMN author_id BIGINT`,
+	`ALTER TABLE reviews ADD COLUMN reviewer_id BIGINT DEFAULT 0`,
+	`ALTER TABLE pull_requests ADD COLUMN author_id BIGINT`,
+	`ALTER TABLE pull_requests ADD COLUMN merged_by_id BIGINT`,
 }
 
 // allTables is the ordered list of DDL statements to run during migration.

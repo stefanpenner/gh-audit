@@ -295,7 +295,7 @@ type prVerdict struct {
 	pr               *model.PullRequest
 	reasons          []string
 	approvers        []string
-	commitAuthors    []string // distinct PR-branch commit authors (for self-approval check)
+	prBranchCommits  []model.Commit // PR-branch commits (for self-approval ID check)
 	approvalOnFinal  bool     // §4: non-self APPROVED on pr.HeadSHA
 	selfApproved     bool     // §5: any APPROVED whose reviewer is a code author
 	staleApproval    bool     // §4: non-self APPROVED on older SHA
@@ -317,7 +317,7 @@ type prVerdict struct {
 //	Phase 4: evaluate §6 required status checks and append any failure.
 func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *model.PullRequest, requiredChecks []RequiredCheck, fetchStats StatsFetcher) prVerdict {
 	v := prVerdict{pr: pr}
-	v.commitAuthors = distinctPRCommitAuthors(commit.Org, commit.Repo, enrichment.PRBranchCommits[pr.Number], fetchStats)
+	v.prBranchCommits = filterNonEmptyContributors(commit.Org, commit.Repo, enrichment.PRBranchCommits[pr.Number], fetchStats)
 
 	// Phase 1 — per-reviewer latest state on pr.HeadSHA with merge-time cutoff.
 	latestByReviewer, postMergeConcern := latestReviewStatesOnFinal(enrichment.Reviews, *pr)
@@ -326,7 +326,10 @@ func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *mode
 		if review.State != "APPROVED" {
 			continue
 		}
-		if isSelfApproval(review, commit, *pr, v.commitAuthors) {
+		if review.ReviewerID == 0 {
+			continue
+		}
+		if isSelfApproval(review, commit, *pr, v.prBranchCommits) {
 			v.selfApproved = true
 			continue
 		}
@@ -340,7 +343,10 @@ func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *mode
 			if review.PRNumber != pr.Number || review.CommitID == pr.HeadSHA {
 				continue
 			}
-			if review.State == "APPROVED" && !isSelfApproval(review, commit, *pr, v.commitAuthors) {
+			if review.ReviewerID == 0 {
+				continue
+			}
+			if review.State == "APPROVED" && !isSelfApproval(review, commit, *pr, v.prBranchCommits) {
 				v.staleApproval = true
 				break
 			}
@@ -439,7 +445,7 @@ func finalizeNonCompliant(result model.AuditResult, commit model.Commit, enrichm
 		result.OwnerApprovalCheck = best.ownerApproval
 		fallbackLatest, _ := latestReviewStatesOnFinal(enrichment.Reviews, *best.pr)
 		for _, review := range fallbackLatest {
-			if review.State == "APPROVED" && !isSelfApproval(review, commit, *best.pr, best.commitAuthors) {
+			if review.State == "APPROVED" && review.ReviewerID != 0 && !isSelfApproval(review, commit, *best.pr, best.prBranchCommits) {
 				result.HasFinalApproval = true
 				break
 			}
@@ -464,7 +470,7 @@ func latestReviewStatesOnFinal(reviews []model.Review, pr model.PullRequest) (ma
 	latest := make(map[string]model.Review)
 	postMergeConcern := false
 	for _, review := range reviews {
-		if review.PRNumber != pr.Number || review.CommitID != pr.HeadSHA || review.ReviewerLogin == "" {
+		if review.PRNumber != pr.Number || review.CommitID != pr.HeadSHA || review.ReviewerID == 0 {
 			continue
 		}
 		if !pr.MergedAt.IsZero() && review.SubmittedAt.After(pr.MergedAt) {
@@ -473,7 +479,7 @@ func latestReviewStatesOnFinal(reviews []model.Review, pr model.PullRequest) (ma
 			}
 			continue
 		}
-		key := strings.ToLower(review.ReviewerLogin)
+		key := reviewerKey(review)
 		existing, exists := latest[key]
 		if !exists {
 			latest[key] = review
@@ -491,6 +497,13 @@ func latestReviewStatesOnFinal(reviews []model.Review, pr model.PullRequest) (ma
 		latest[key] = review
 	}
 	return latest, postMergeConcern
+}
+
+// reviewerKey returns a stable per-reviewer identity for map deduplication.
+// Prefers the immutable numeric ReviewerID (immune to login renames); falls
+// back to lowercased login for legacy data where ReviewerID is zero.
+func reviewerKey(r model.Review) string {
+	return fmt.Sprintf("id:%d", r.ReviewerID)
 }
 
 // evaluateRequiredChecks determines the owner approval status for a set
@@ -531,55 +544,55 @@ func evaluateRequiredChecks(checkRuns []model.CheckRun, headSHA string, required
 // isSelfApproval checks whether a review's reviewer is also a code
 // contributor and therefore cannot count as an independent approval.
 //
-// Five identities are tested against review.ReviewerLogin:
+// ID-only: all identity matching uses immutable numeric GitHub account
+// IDs. Returns false when ReviewerID is 0 (unresolved reviewer cannot
+// be proven to be the same person). No login-string fallback — logins
+// are mutable and forgery-prone.
 //
-//   - PR author                 — always.
-//   - Commit author             — skipped on CleanMerge.
-//   - Commit committer          — skipped on CleanMerge; web-flow / github
-//     are ignored always.
-//   - Co-authored-by trailers   — every login listed on the commit.
-//   - PR-branch commit authors  — every author on the PR's commits,
+// Three identity sources are tested against ReviewerID:
+//
+//   - PR author (AuthorID)        — always.
+//   - Commit author (AuthorID)    — skipped on CleanMerge.
+//   - PR-branch commit authors    — every AuthorID on the PR's commits,
 //     for squash-merge coverage.
 //
-// See Architecture.md §5 for why CleanMerge exempts the author/committer
-// check: GitHub's merge button refuses to produce a CleanMerge under
-// conflicts, so no committer-authored bytes can ride along.
-func isSelfApproval(review model.Review, commit model.Commit, pr model.PullRequest, prCommitAuthors []string) bool {
-	reviewer := strings.ToLower(review.ReviewerLogin)
-
-	if reviewer == "" {
+// Co-authored-by trailers and committer login are intentionally excluded:
+// trailers are unvalidated (forgeable), and committer has no API-provided
+// numeric ID on the commit object.
+//
+// See Architecture.md §5 for why CleanMerge exempts the author check:
+// GitHub's merge button refuses to produce a CleanMerge under conflicts,
+// so no author-contributed bytes can ride along.
+func isSelfApproval(review model.Review, commit model.Commit, pr model.PullRequest, prBranchCommits []model.Commit) bool {
+	if review.ReviewerID == 0 {
 		return false
 	}
 
-	if strings.EqualFold(pr.AuthorLogin, reviewer) {
+	if sameUser(review.ReviewerID, pr.AuthorID) {
 		return true
 	}
 
 	mergeKind := github.ClassifyMerge(commit.ParentCount, commit.Message, commit.CommitterLogin, commit.IsVerified)
 	if mergeKind != github.CleanMerge {
-		if strings.EqualFold(commit.AuthorLogin, reviewer) {
-			return true
-		}
-
-		committer := strings.ToLower(commit.CommitterLogin)
-		if committer != "" && committer != "web-flow" && committer != "github" && committer == reviewer {
+		if sameUser(review.ReviewerID, commit.AuthorID) {
 			return true
 		}
 	}
 
-	for _, ca := range commit.CoAuthors {
-		if strings.EqualFold(ca.Login, reviewer) {
-			return true
-		}
-	}
-
-	for _, author := range prCommitAuthors {
-		if strings.EqualFold(author, reviewer) {
+	for _, c := range prBranchCommits {
+		if sameUser(review.ReviewerID, c.AuthorID) {
 			return true
 		}
 	}
 
 	return false
+}
+
+// sameUser returns true if two GitHub identities refer to the same account.
+// ID-only: returns true only when both IDs are non-zero and equal. Returns
+// false when either ID is missing — no identity claim without immutable proof.
+func sameUser(id1, id2 int64) bool {
+	return id1 != 0 && id2 != 0 && id1 == id2
 }
 
 // ----- Pure utilities -----
@@ -619,8 +632,46 @@ func hasNonExemptPRContributors(enrichment model.EnrichmentResult, exemptAuthors
 	return false
 }
 
+// filterNonEmptyContributors returns one representative commit per unique
+// author from a PR's branch commits, keeping only authors with non-empty
+// contributions. Used by isSelfApproval to compare reviewer identity
+// against PR branch contributors using both AuthorID and AuthorLogin.
+func filterNonEmptyContributors(org, repo string, commits []model.Commit, fetchStats StatsFetcher) []model.Commit {
+	type authorGroup struct {
+		representative model.Commit
+		all            []model.Commit
+	}
+	byKey := make(map[string]*authorGroup)
+	var order []string
+	for _, c := range commits {
+		if c.AuthorID == 0 && c.AuthorLogin == "" {
+			continue
+		}
+		var key string
+		if c.AuthorID != 0 {
+			key = fmt.Sprintf("id:%d", c.AuthorID)
+		} else {
+			key = strings.ToLower(c.AuthorLogin)
+		}
+		if _, ok := byKey[key]; !ok {
+			byKey[key] = &authorGroup{representative: c}
+			order = append(order, key)
+		}
+		byKey[key].all = append(byKey[key].all, c)
+	}
+
+	var out []model.Commit
+	for _, key := range order {
+		g := byKey[key]
+		if hasNonEmptyContribution(org, repo, g.all, fetchStats) {
+			out = append(out, g.representative)
+		}
+	}
+	return out
+}
+
 // distinctPRCommitAuthors returns unique author logins from a single PR's
-// branch commits (for self-approval checks scoped to that PR).
+// branch commits (for the PRCommitAuthorLogins report column).
 //
 // Authors whose every contribution to this PR branch is an empty commit
 // (zero additions and zero deletions) are dropped. The reviewer pushing an

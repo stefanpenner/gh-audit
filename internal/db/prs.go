@@ -12,7 +12,7 @@ import (
 
 var prColumns = []string{
 	"org", "repo", "number", "title", "merged", "head_sha", "head_branch",
-	"merge_commit_sha", "author_login", "merged_by_login", "merged_at", "href",
+	"merge_commit_sha", "author_login", "author_id", "merged_by_login", "merged_by_id", "merged_at", "href",
 }
 
 // UpsertPullRequests batch-inserts pull requests using the DuckDB Appender API
@@ -26,7 +26,8 @@ func (d *DB) UpsertPullRequests(ctx context.Context, prs []model.PullRequest) er
 	for i, pr := range prs {
 		rows[i] = []driver.Value{
 			pr.Org, pr.Repo, pr.Number, pr.Title, pr.Merged,
-			pr.HeadSHA, pr.HeadBranch, pr.MergeCommitSHA, pr.AuthorLogin, pr.MergedByLogin, pr.MergedAt, pr.Href,
+			pr.HeadSHA, pr.HeadBranch, pr.MergeCommitSHA, pr.AuthorLogin, pr.AuthorID,
+			pr.MergedByLogin, pr.MergedByID, pr.MergedAt, pr.Href,
 		}
 	}
 
@@ -34,7 +35,7 @@ func (d *DB) UpsertPullRequests(ctx context.Context, prs []model.PullRequest) er
 }
 
 var reviewColumns = []string{
-	"org", "repo", "pr_number", "review_id", "reviewer_login",
+	"org", "repo", "pr_number", "review_id", "reviewer_login", "reviewer_id",
 	"state", "commit_id", "submitted_at", "href",
 }
 
@@ -48,7 +49,7 @@ func (d *DB) UpsertReviews(ctx context.Context, reviews []model.Review) error {
 	rows := make([][]driver.Value, len(reviews))
 	for i, r := range reviews {
 		rows[i] = []driver.Value{
-			r.Org, r.Repo, r.PRNumber, r.ReviewID, r.ReviewerLogin,
+			r.Org, r.Repo, r.PRNumber, r.ReviewID, r.ReviewerLogin, r.ReviewerID,
 			nullIfEmpty(r.State), r.CommitID, r.SubmittedAt, r.Href,
 		}
 	}
@@ -103,13 +104,14 @@ func (d *DB) GetPullRequest(ctx context.Context, org, repo string, number int) (
 	row := d.DB.QueryRowContext(ctx, `
 		SELECT org, repo, number, title, merged, head_sha,
 		       COALESCE(head_branch, ''), merge_commit_sha, author_login,
-		       COALESCE(merged_by_login, ''), merged_at, href
+		       COALESCE(author_id, 0), COALESCE(merged_by_login, ''),
+		       COALESCE(merged_by_id, 0), merged_at, href
 		FROM pull_requests
 		WHERE org = ? AND repo = ? AND number = ?`, org, repo, number)
 	var pr model.PullRequest
 	if err := row.Scan(&pr.Org, &pr.Repo, &pr.Number, &pr.Title, &pr.Merged,
 		&pr.HeadSHA, &pr.HeadBranch, &pr.MergeCommitSHA, &pr.AuthorLogin,
-		&pr.MergedByLogin, &pr.MergedAt, &pr.Href); err != nil {
+		&pr.AuthorID, &pr.MergedByLogin, &pr.MergedByID, &pr.MergedAt, &pr.Href); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -123,7 +125,8 @@ func (d *DB) GetPRsForCommit(ctx context.Context, org, repo, sha string) ([]mode
 	rows, err := d.DB.QueryContext(ctx, `
 		SELECT p.org, p.repo, p.number, p.title, p.merged, p.head_sha,
 		       COALESCE(p.head_branch, ''), p.merge_commit_sha, p.author_login,
-		       COALESCE(p.merged_by_login, ''), p.merged_at, p.href
+		       COALESCE(p.author_id, 0), COALESCE(p.merged_by_login, ''),
+		       COALESCE(p.merged_by_id, 0), p.merged_at, p.href
 		FROM pull_requests p
 		INNER JOIN commit_prs cp ON p.org = cp.org AND p.repo = cp.repo AND p.number = cp.pr_number
 		WHERE cp.org = ? AND cp.repo = ? AND cp.sha = ?`, org, repo, sha)
@@ -137,7 +140,7 @@ func (d *DB) GetPRsForCommit(ctx context.Context, org, repo, sha string) ([]mode
 		var pr model.PullRequest
 		if err := rows.Scan(&pr.Org, &pr.Repo, &pr.Number, &pr.Title, &pr.Merged,
 			&pr.HeadSHA, &pr.HeadBranch, &pr.MergeCommitSHA, &pr.AuthorLogin,
-			&pr.MergedByLogin, &pr.MergedAt, &pr.Href); err != nil {
+			&pr.AuthorID, &pr.MergedByLogin, &pr.MergedByID, &pr.MergedAt, &pr.Href); err != nil {
 			return nil, fmt.Errorf("scan PR: %w", err)
 		}
 		result = append(result, pr)
@@ -171,7 +174,8 @@ func (d *DB) GetCommitsForPR(ctx context.Context, org, repo string, prNumber int
 // GetReviewsForPR retrieves reviews for a specific pull request.
 func (d *DB) GetReviewsForPR(ctx context.Context, org, repo string, prNumber int) ([]model.Review, error) {
 	rows, err := d.DB.QueryContext(ctx, `
-		SELECT org, repo, pr_number, review_id, reviewer_login, COALESCE(state::TEXT, ''), commit_id, submitted_at, href
+		SELECT org, repo, pr_number, review_id, reviewer_login, COALESCE(reviewer_id, 0),
+		       COALESCE(state::TEXT, ''), commit_id, submitted_at, href
 		FROM reviews
 		WHERE org = ? AND repo = ? AND pr_number = ?
 		ORDER BY submitted_at`, org, repo, prNumber)
@@ -183,7 +187,7 @@ func (d *DB) GetReviewsForPR(ctx context.Context, org, repo string, prNumber int
 	var result []model.Review
 	for rows.Next() {
 		var r model.Review
-		if err := rows.Scan(&r.Org, &r.Repo, &r.PRNumber, &r.ReviewID, &r.ReviewerLogin,
+		if err := rows.Scan(&r.Org, &r.Repo, &r.PRNumber, &r.ReviewID, &r.ReviewerLogin, &r.ReviewerID,
 			&r.State, &r.CommitID, &r.SubmittedAt, &r.Href); err != nil {
 			return nil, fmt.Errorf("scan review: %w", err)
 		}

@@ -472,9 +472,11 @@ func buildPRModel(org, repo string, pr *gogithub.PullRequest) *model.PullRequest
 	}
 	if pr.GetUser() != nil {
 		p.AuthorLogin = pr.GetUser().GetLogin()
+		p.AuthorID = pr.GetUser().GetID()
 	}
 	if pr.GetMergedBy() != nil {
 		p.MergedByLogin = pr.GetMergedBy().GetLogin()
+		p.MergedByID = pr.GetMergedBy().GetID()
 	}
 	return p
 }
@@ -520,9 +522,11 @@ func (c *Client) ListCommitPullRequests(ctx context.Context, org, repo, sha stri
 			}
 			if pr.GetUser() != nil {
 				p.AuthorLogin = pr.GetUser().GetLogin()
+				p.AuthorID = pr.GetUser().GetID()
 			}
 			if pr.GetMergedBy() != nil {
 				p.MergedByLogin = pr.GetMergedBy().GetLogin()
+				p.MergedByID = pr.GetMergedBy().GetID()
 			}
 			allPRs = append(allPRs, p)
 		}
@@ -565,6 +569,7 @@ func (c *Client) ListReviews(ctx context.Context, org, repo string, prNumber int
 			}
 			if r.User != nil {
 				review.ReviewerLogin = r.User.GetLogin()
+				review.ReviewerID = r.User.GetID()
 			}
 			if r.CommitID != nil {
 				review.CommitID = r.GetCommitID()
@@ -662,9 +667,11 @@ func (c *Client) GetPullRequest(ctx context.Context, org, repo string, number in
 	}
 	if pr.GetUser() != nil {
 		p.AuthorLogin = pr.GetUser().GetLogin()
+		p.AuthorID = pr.GetUser().GetID()
 	}
 	if pr.GetMergedBy() != nil {
 		p.MergedByLogin = pr.GetMergedBy().GetLogin()
+		p.MergedByID = pr.GetMergedBy().GetID()
 	}
 	if pr.MergedAt != nil {
 		p.MergedAt = pr.MergedAt.Time

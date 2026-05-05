@@ -959,18 +959,18 @@ func TestPipelineRealisticMix(t *testing.T) {
 				{Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa2", Additions: 3, Deletions: 1}},
 				// aaa3: alice's commit, proper approval on final commit → compliant
 				{
-					Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa3", Additions: 10, Deletions: 4},
-					PRs:    []model.PullRequest{{Org: "acme", Repo: "app", Number: 10, Merged: true, HeadSHA: "aaa3", AuthorLogin: "alice"}},
+					Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa3", AuthorID: 101, Additions: 10, Deletions: 4},
+					PRs:    []model.PullRequest{{Org: "acme", Repo: "app", Number: 10, Merged: true, HeadSHA: "aaa3", AuthorLogin: "alice", AuthorID: 101}},
 					Reviews: []model.Review{
-						{Org: "acme", Repo: "app", PRNumber: 10, ReviewID: 100, ReviewerLogin: "bob", State: "APPROVED", CommitID: "aaa3"},
+						{Org: "acme", Repo: "app", PRNumber: 10, ReviewID: 100, ReviewerLogin: "bob", ReviewerID: 102, State: "APPROVED", CommitID: "aaa3"},
 					},
 				},
 				// aaa4: bob's commit, approval on OLD commit (stale) → non-compliant
 				{
-					Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa4", Additions: 7, Deletions: 3},
-					PRs:    []model.PullRequest{{Org: "acme", Repo: "app", Number: 20, Merged: true, HeadSHA: "aaa4", AuthorLogin: "bob"}},
+					Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa4", AuthorID: 102, Additions: 7, Deletions: 3},
+					PRs:    []model.PullRequest{{Org: "acme", Repo: "app", Number: 20, Merged: true, HeadSHA: "aaa4", AuthorLogin: "bob", AuthorID: 102}},
 					Reviews: []model.Review{
-						{Org: "acme", Repo: "app", PRNumber: 20, ReviewID: 200, ReviewerLogin: "alice", State: "APPROVED", CommitID: "old-sha-xyz"},
+						{Org: "acme", Repo: "app", PRNumber: 20, ReviewID: 200, ReviewerLogin: "alice", ReviewerID: 101, State: "APPROVED", CommitID: "old-sha-xyz"},
 					},
 				},
 				// aaa5: charlie, direct push no PR → non-compliant
@@ -979,19 +979,19 @@ func TestPipelineRealisticMix(t *testing.T) {
 				{Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa6", Additions: 0, Deletions: 0}},
 				// aaa7: eve self-approves her own PR → non-compliant
 				{
-					Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa7", Additions: 4, Deletions: 1},
-					PRs:    []model.PullRequest{{Org: "acme", Repo: "app", Number: 30, Merged: true, HeadSHA: "aaa7", AuthorLogin: "eve"}},
+					Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa7", AuthorID: 103, Additions: 4, Deletions: 1},
+					PRs:    []model.PullRequest{{Org: "acme", Repo: "app", Number: 30, Merged: true, HeadSHA: "aaa7", AuthorLogin: "eve", AuthorID: 103}},
 					Reviews: []model.Review{
-						{Org: "acme", Repo: "app", PRNumber: 30, ReviewID: 300, ReviewerLogin: "eve", State: "APPROVED", CommitID: "aaa7"},
+						{Org: "acme", Repo: "app", PRNumber: 30, ReviewID: 300, ReviewerLogin: "eve", ReviewerID: 103, State: "APPROVED", CommitID: "aaa7"},
 					},
 				},
 				// aaa8: frank self-approves BUT independent approval also exists → compliant
 				{
-					Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa8", Additions: 2, Deletions: 1},
-					PRs:    []model.PullRequest{{Org: "acme", Repo: "app", Number: 40, Merged: true, HeadSHA: "aaa8", AuthorLogin: "frank"}},
+					Commit: model.Commit{Org: "acme", Repo: "app", SHA: "aaa8", AuthorID: 104, Additions: 2, Deletions: 1},
+					PRs:    []model.PullRequest{{Org: "acme", Repo: "app", Number: 40, Merged: true, HeadSHA: "aaa8", AuthorLogin: "frank", AuthorID: 104}},
 					Reviews: []model.Review{
-						{Org: "acme", Repo: "app", PRNumber: 40, ReviewID: 400, ReviewerLogin: "frank", State: "APPROVED", CommitID: "aaa8"},
-						{Org: "acme", Repo: "app", PRNumber: 40, ReviewID: 401, ReviewerLogin: "alice", State: "APPROVED", CommitID: "aaa8"},
+						{Org: "acme", Repo: "app", PRNumber: 40, ReviewID: 400, ReviewerLogin: "frank", ReviewerID: 104, State: "APPROVED", CommitID: "aaa8"},
+						{Org: "acme", Repo: "app", PRNumber: 40, ReviewID: 401, ReviewerLogin: "alice", ReviewerID: 101, State: "APPROVED", CommitID: "aaa8"},
 					},
 				},
 			},

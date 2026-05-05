@@ -117,36 +117,39 @@ Any APPROVED (non-self)?     yes → HasStaleApproval=true
 **Stale approval detection**: When no approval exists on the final commit but an approval exists on an earlier SHA, the reason is `approval is stale — not on final commit` instead of `no approval on final commit`. This distinguishes "never reviewed" from "reviewed, then code changed."
 
 ### 
-A review is self-approval if the reviewer matches any of:
-- PR author
-- Commit author (skipped for `CleanMerge` commits — see below)
-- Committer (skipped for `CleanMerge`)
-- Any co-author (from `Co-authored-by:` trailers)
-- Any **PR-branch commit author with a non-empty contribution** (catches squash-merge cases where the reviewer pushed real code that landed in the squash). Authors whose every PR-branch commit is zero-diff (the prototypical "Empty commit to rerun check") are dropped from this set; see "Empty-commit exclusion" below.
+A review is self-approval if the reviewer's **immutable numeric GitHub ID** matches any of:
+- PR author (`AuthorID`)
+- Commit author (`AuthorID`) — skipped for `CleanMerge` commits (see below)
+- Any **PR-branch commit author** (`AuthorID`) with a non-empty contribution — catches squash-merge cases where the reviewer pushed real code that landed in the squash. Authors whose every PR-branch commit is zero-diff (the prototypical "Empty commit to rerun check") are dropped from this set; see "Empty-commit exclusion" below.
 
-**CleanMerge exclusion**: A `CleanMerge` (2 parents + `Merge pull request #…` message + `web-flow` committer + verified GitHub signature — see [ClassifyMerge](#classifymerge-internalgithubmergego)) cannot contain committer-authored code. GitHub's merge button refuses to produce one when there are conflicts, and the verified `web-flow` signature can't be forged locally. For these commits the author/committer is just "who clicked merge," so skipping the author/committer check avoids false positives. `DirtyMerge` (any 2-parent merge missing one of those signals) and `OctopusMerge` (3+ parents) may contain conflict-resolution or edits authored by the committer, so the check still runs.
+**ID-only matching**: All identity comparison uses immutable numeric GitHub account IDs — never login strings. IDs are never reused, never transferred by renames, and not forgeable. A review with `ReviewerID == 0` (deleted/ghost account, unresolved identity) is not trusted: it cannot count as self-approval, nor as an independent approval. This eliminates login-rename attacks and casing ambiguities.
+
+**CleanMerge exclusion**: A `CleanMerge` (2 parents + `Merge pull request #…` message + `web-flow` committer + verified GitHub signature — see [ClassifyMerge](#classifymerge-internalgithubmergego)) cannot contain author-contributed code. GitHub's merge button refuses to produce one when there are conflicts, and the verified `web-flow` signature can't be forged locally. For these commits the author is just "who clicked merge," so skipping the `AuthorID` check avoids false positives. `DirtyMerge` (any 2-parent merge missing one of those signals) and `OctopusMerge` (3+ parents) may contain conflict-resolution or edits authored by the commit author, so the check still runs.
 
 **Empty-commit exclusion** (PR-branch authors only): a reviewer who pushed only zero-diff commits onto the PR branch — typically `Empty commit to rerun check` to re-trigger CI — has not contributed code and must not invalidate their own review. The check verifies emptiness against the commit's actual `additions`/`deletions`. The `/pulls/{n}/commits` listing endpoint omits diff stats, so when an author's listed contributions all *appear* zero locally, `GetCommitDetail` is fetched lazily (DB-cached) to disambiguate a truly empty commit from un-fetched stats. Any non-zero stat short-circuits before any API call. A fetch error fails open (treats as contributor) so we never silently downgrade a real contributor.
 
-If the only approvals are self-approvals, the commit is **non-compliant**.
+**Excluded identity sources** (intentionally not checked):
+- **Committer login** — GitHub does not provide a CommitterID on the commit API object. Login-only comparison is forgery-prone and mutable.
+- **Co-authored-by trailers** — unvalidated commit message text; trivially forgeable. No API-resolved ID available.
+
+If the only approvals are self-approvals (or all approvals are from unresolved identities), the commit is **non-compliant**.
 
 ```
-review.reviewer_login               ← SOT: GitHub REST API (reviews)
+review.ReviewerID                    ← SOT: GitHub REST API (reviews → user.id)
       │
       ▼
-isSelfApproval (audit.go) checks against five identities:
+isSelfApproval (audit.go) — ID-only matching via sameUser():
       │
-      ├── pr.author_login                ← SOT: GET /commits/{sha}/pulls
-      ├── commit.author_login            ← SOT: GET /commits/{sha} (skip if CleanMerge)
-      ├── commit.committer_login         ← SOT: GET /commits/{sha} (skip "web-flow", "github"; skip if CleanMerge)
-      ├── commit.co_authors[].login      ← SOT: co_authors table (persisted from "Co-authored-by:" trailers)
-      └── pr_branch_commits[].author     ← SOT: GET /pulls/{n}/commits (filtered: drop authors whose every contribution is empty;
+      ├── pr.AuthorID                    ← SOT: GET /commits/{sha}/pulls → user.id
+      ├── commit.AuthorID                ← SOT: GET /commits/{sha} → author.id (skip if CleanMerge)
+      └── pr_branch_commits[].AuthorID   ← SOT: GET /pulls/{n}/commits → author.id
+                                              (filtered: drop authors whose every contribution is empty;
                                               GetCommitDetail fetched lazily when local stats are zero)
       │
       ▼
-All approvals are self?
+All approvals are self (or ReviewerID==0)?
       yes → IsSelfApproved=true, reason="self-approved (reviewer is code author)"
-      no  → at least one independent approval exists, continue to rule 6
+      no  → at least one verified independent approval exists, continue to rule 6
 ```
 
 ### 6. Required status checks

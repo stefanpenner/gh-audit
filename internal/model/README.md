@@ -34,6 +34,7 @@ classDiagram
         Repo string
         SHA string
         AuthorLogin string
+        AuthorID int64
         AuthorEmail string
         CommitterLogin string
         CoAuthors []CoAuthor
@@ -56,7 +57,9 @@ classDiagram
         HeadSHA string
         MergeCommitSHA string
         AuthorLogin string
+        AuthorID int64
         MergedByLogin string
+        MergedByID int64
         MergedAt time.Time
         Href string
     }
@@ -67,6 +70,7 @@ classDiagram
         PRNumber int
         ReviewID int64
         ReviewerLogin string
+        ReviewerID int64
         State string
         CommitID string
         SubmittedAt time.Time

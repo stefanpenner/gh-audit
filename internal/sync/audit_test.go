@@ -84,6 +84,7 @@ func newAuditBaseline() auditBaseline {
 			Repo:        "myrepo",
 			SHA:         "abc123",
 			AuthorLogin: "developer",
+			AuthorID:    1001,
 			CommittedAt: now,
 			Message:     "feat: add feature",
 			Additions:   10,
@@ -99,6 +100,7 @@ func newAuditBaseline() auditBaseline {
 			HeadSHA:        "head123",
 			MergeCommitSHA: "abc123",
 			AuthorLogin:    "developer",
+			AuthorID:       1001,
 			MergedAt:       now,
 			Href:           "https://github.com/myorg/myrepo/pull/42",
 		},
@@ -108,6 +110,7 @@ func newAuditBaseline() auditBaseline {
 			PRNumber:      42,
 			ReviewID:      1,
 			ReviewerLogin: "reviewer1",
+			ReviewerID:    2001,
 			State:         "APPROVED",
 			CommitID:      "head123",
 			SubmittedAt:   now,
@@ -245,8 +248,8 @@ func TestEvaluateCommit_Rule4_ApprovalOnFinal(t *testing.T) {
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{f.pr},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "CHANGES_REQUESTED", CommitID: "head123", SubmittedAt: f.now.Add(-time.Hour)},
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer2", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "CHANGES_REQUESTED", CommitID: "head123", SubmittedAt: f.now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer2", ReviewerID: 2002, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -261,8 +264,8 @@ func TestEvaluateCommit_Rule4_ApprovalOnFinal(t *testing.T) {
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{f.pr},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "old-force-pushed-sha", SubmittedAt: f.now.Add(-time.Hour)},
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "APPROVED", CommitID: "old-force-pushed-sha", SubmittedAt: f.now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -277,7 +280,7 @@ func TestEvaluateCommit_Rule4_ApprovalOnFinal(t *testing.T) {
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{f.pr},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "DISMISSED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "DISMISSED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -292,8 +295,8 @@ func TestEvaluateCommit_Rule4_ApprovalOnFinal(t *testing.T) {
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{f.pr},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now.Add(-time.Hour)},
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer1", State: "DISMISSED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "DISMISSED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -308,8 +311,8 @@ func TestEvaluateCommit_Rule4_ApprovalOnFinal(t *testing.T) {
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{f.pr},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now.Add(-time.Hour)},
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer1", State: "COMMENTED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "COMMENTED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -324,8 +327,8 @@ func TestEvaluateCommit_Rule4_ApprovalOnFinal(t *testing.T) {
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{f.pr},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "CHANGES_REQUESTED", CommitID: "head123", SubmittedAt: f.now.Add(-time.Hour)},
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer2", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "CHANGES_REQUESTED", CommitID: "head123", SubmittedAt: f.now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer2", ReviewerID: 2002, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -351,7 +354,7 @@ func TestEvaluateCommit_Rule4_ApprovalOnFinal(t *testing.T) {
 					f.approvedReview, // APPROVED at `now`
 					{
 						Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 6,
-						ReviewerLogin: "reviewer1", State: "CHANGES_REQUESTED",
+						ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "CHANGES_REQUESTED",
 						CommitID: "head123", SubmittedAt: f.now.Add(2 * time.Minute),
 					},
 				},
@@ -381,7 +384,7 @@ func TestEvaluateCommit_Rule4_StaleApproval(t *testing.T) {
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{f.pr},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "old-commit-sha"},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "APPROVED", CommitID: "old-commit-sha"},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -397,7 +400,7 @@ func TestEvaluateCommit_Rule4_StaleApproval(t *testing.T) {
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{f.pr},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "old-force-pushed-sha", SubmittedAt: f.now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "APPROVED", CommitID: "old-force-pushed-sha", SubmittedAt: f.now.Add(-time.Hour)},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -413,8 +416,8 @@ func TestEvaluateCommit_Rule4_StaleApproval(t *testing.T) {
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{f.pr},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "old-force-pushed-sha", SubmittedAt: f.now.Add(-2 * time.Hour)},
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer2", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "APPROVED", CommitID: "old-force-pushed-sha", SubmittedAt: f.now.Add(-2 * time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer2", ReviewerID: 2002, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -429,8 +432,8 @@ func TestEvaluateCommit_Rule4_StaleApproval(t *testing.T) {
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{f.pr},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "old-sha", SubmittedAt: f.now.Add(-time.Hour)},
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer1", State: "CHANGES_REQUESTED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "APPROVED", CommitID: "old-sha", SubmittedAt: f.now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "CHANGES_REQUESTED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -449,7 +452,7 @@ func TestEvaluateCommit_Rule4_StaleApproval(t *testing.T) {
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{f.pr},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "developer", State: "APPROVED", CommitID: "old-sha", SubmittedAt: f.now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "developer", ReviewerID: 1001, State: "APPROVED", CommitID: "old-sha", SubmittedAt: f.now.Add(-time.Hour)},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -469,8 +472,8 @@ func TestEvaluateCommit_Rule4_StaleApproval(t *testing.T) {
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{f.pr},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", State: "APPROVED", CommitID: "old-sha", SubmittedAt: f.now.Add(-time.Hour)},
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "developer", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "APPROVED", CommitID: "old-sha", SubmittedAt: f.now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "developer", ReviewerID: 1001, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -505,7 +508,7 @@ func TestEvaluateCommit_Rule4_PostMergeCutoff(t *testing.T) {
 					f.approvedReview, // submitted at `now`, matches pr.MergedAt — included (After is strict)
 					{
 						Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2,
-						ReviewerLogin: "reviewer1", State: "CHANGES_REQUESTED",
+						ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "CHANGES_REQUESTED",
 						CommitID: "head123", SubmittedAt: f.now.Add(time.Minute),
 					},
 				},
@@ -526,7 +529,7 @@ func TestEvaluateCommit_Rule4_PostMergeCutoff(t *testing.T) {
 					f.approvedReview,
 					{
 						Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 3,
-						ReviewerLogin: "reviewer1", State: "DISMISSED",
+						ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "DISMISSED",
 						CommitID: "head123", SubmittedAt: f.now.Add(2 * time.Minute),
 					},
 				},
@@ -547,7 +550,7 @@ func TestEvaluateCommit_Rule4_PostMergeCutoff(t *testing.T) {
 					f.approvedReview,
 					{
 						Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 4,
-						ReviewerLogin: "reviewer2", State: "COMMENTED",
+						ReviewerLogin: "reviewer2", ReviewerID: 2002, State: "COMMENTED",
 						CommitID: "head123", SubmittedAt: f.now.Add(time.Minute),
 					},
 				},
@@ -573,7 +576,7 @@ func TestEvaluateCommit_Rule4_PostMergeCutoff(t *testing.T) {
 					f.approvedReview,
 					{
 						Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 5,
-						ReviewerLogin: "reviewer1", State: "CHANGES_REQUESTED",
+						ReviewerLogin: "reviewer1", ReviewerID: 2001, State: "CHANGES_REQUESTED",
 						CommitID: "head123", SubmittedAt: f.now.Add(time.Minute),
 					},
 				},
@@ -591,21 +594,20 @@ func TestEvaluateCommit_Rule4_PostMergeCutoff(t *testing.T) {
 
 // TestEvaluateCommit_Rule5_SelfApproval covers Architecture.md §5.
 //
-// A review is self-approval when the reviewer matches any of: PR author,
-// commit author (skipped for CleanMerge), committer (skipped for
-// CleanMerge; web-flow/github always excluded), or any Co-authored-by
-// trailer. For squash merges the check extends to all PR branch commit
-// authors — see TestSquashMergePRCommitAuthors for deeper coverage.
+// A review is self-approval when the reviewer's immutable ID matches any of:
+// PR author ID, commit author ID (skipped for CleanMerge), or any PR-branch
+// commit author ID. All matching is ID-only — no login string comparison.
+// Reviews with ReviewerID == 0 are untrusted and ignored entirely.
 func TestEvaluateCommit_Rule5_SelfApproval(t *testing.T) {
 	f := newAuditBaseline()
 	cases := []evalCase{
 		{
-			name:   "PR author == reviewer is self-approval",
+			name:   "PR author == reviewer (by ID) is self-approval",
 			commit: f.commit,
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{f.pr},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "developer", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "developer", ReviewerID: 1001, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -616,18 +618,18 @@ func TestEvaluateCommit_Rule5_SelfApproval(t *testing.T) {
 			wantReasons:      []string{"self-approved (reviewer is code author) (PR #42)"},
 		},
 		{
-			name: "commit author == reviewer is self-approval",
+			name: "commit author == reviewer (by ID) is self-approval",
 			commit: model.Commit{
 				Org: "myorg", Repo: "myrepo", SHA: "abc123",
-				AuthorLogin: "coder", Additions: 10, Deletions: 5,
+				AuthorLogin: "coder", AuthorID: 3001, Additions: 10, Deletions: 5,
 				Href: "https://github.com/myorg/myrepo/commit/abc123",
 			},
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{
-					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "abc123", AuthorLogin: "prauthor", Href: "https://github.com/myorg/myrepo/pull/42"},
+					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "abc123", AuthorLogin: "prauthor", AuthorID: 3002, Href: "https://github.com/myorg/myrepo/pull/42"},
 				},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "coder", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "coder", ReviewerID: 3001, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -638,65 +640,39 @@ func TestEvaluateCommit_Rule5_SelfApproval(t *testing.T) {
 			wantReasons:      []string{"self-approved (reviewer is code author) (PR #42)"},
 		},
 		{
-			name: "co-author == reviewer is self-approval",
+			name: "reviewer with ID=0 is untrusted — approval ignored, not self-approval",
 			commit: model.Commit{
 				Org: "myorg", Repo: "myrepo", SHA: "abc123",
-				AuthorLogin: "maindev", Additions: 10, Deletions: 5,
-				CoAuthors: []model.CoAuthor{{Login: "codev", Email: "codev@example.com"}},
-				Href:      "https://github.com/myorg/myrepo/commit/abc123",
-			},
-			enrichment: model.EnrichmentResult{
-				PRs: []model.PullRequest{
-					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "abc123", AuthorLogin: "maindev", Href: "https://github.com/myorg/myrepo/pull/42"},
-				},
-				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "codev", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
-				},
-				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
-			},
-			requiredChecks:   f.requiredChecks,
-			wantCompliant:    false,
-			wantHasPR:        true,
-			wantSelfApproved: true,
-			wantReasons:      []string{"self-approved (reviewer is code author) (PR #42)"},
-		},
-		{
-			name: "committer == reviewer (non-bot) is self-approval",
-			commit: model.Commit{
-				Org: "myorg", Repo: "myrepo", SHA: "abc123",
-				AuthorLogin: "maindev", CommitterLogin: "deployer",
-				Additions: 10, Deletions: 5,
+				AuthorLogin: "developer", AuthorID: 1001, Additions: 10, Deletions: 5,
 				Href: "https://github.com/myorg/myrepo/commit/abc123",
 			},
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{
-					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "abc123", AuthorLogin: "maindev", Href: "https://github.com/myorg/myrepo/pull/42"},
+					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "abc123", AuthorLogin: "developer", AuthorID: 1001, Href: "https://github.com/myorg/myrepo/pull/42"},
 				},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "deployer", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "developer", ReviewerID: 0, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
-			requiredChecks:   f.requiredChecks,
-			wantCompliant:    false,
-			wantHasPR:        true,
-			wantSelfApproved: true,
-			wantReasons:      []string{"self-approved (reviewer is code author) (PR #42)"},
+			requiredChecks: f.requiredChecks,
+			wantCompliant:  false,
+			wantHasPR:      true,
+			wantReasons:    []string{"no approval on final commit (PR #42)"},
 		},
 		{
-			name: "committer is web-flow and matches reviewer is NOT self-approval",
+			name: "same login different IDs — NOT self-approval (rename/reclaim scenario)",
 			commit: model.Commit{
 				Org: "myorg", Repo: "myrepo", SHA: "abc123",
-				AuthorLogin: "maindev", CommitterLogin: "web-flow",
-				Additions: 10, Deletions: 5,
+				AuthorLogin: "developer", AuthorID: 1001, Additions: 10, Deletions: 5,
 				Href: "https://github.com/myorg/myrepo/commit/abc123",
 			},
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{
-					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "abc123", AuthorLogin: "maindev", Href: "https://github.com/myorg/myrepo/pull/42"},
+					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "abc123", AuthorLogin: "developer", AuthorID: 1001, Href: "https://github.com/myorg/myrepo/pull/42"},
 				},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "web-flow", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "developer", ReviewerID: 9999, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -706,16 +682,13 @@ func TestEvaluateCommit_Rule5_SelfApproval(t *testing.T) {
 			wantReasons:    []string{"compliant"},
 		},
 		{
-			// Self-approval never disqualifies when an independent
-			// approval also exists — a co-author review is redundant, not
-			// fatal.
-			name:   "self-approval exists but another non-self approval also exists is compliant",
+			name:   "self-approval exists but another independent approval also exists is compliant",
 			commit: f.commit,
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{f.pr},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "developer", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "independent-reviewer", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "developer", ReviewerID: 1001, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "independent-reviewer", ReviewerID: 5001, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -725,12 +698,12 @@ func TestEvaluateCommit_Rule5_SelfApproval(t *testing.T) {
 			wantReasons:    []string{"compliant"},
 		},
 		{
-			// CleanMerge: author/committer is "who clicked merge", not a
-			// code author. Reviewer == merger must stay clean.
+			// CleanMerge: commit author is "who clicked merge", not a
+			// code author. Reviewer == merger must NOT trigger self-approval.
 			name: "CleanMerge: commit author is merger not code author — not self-approval",
 			commit: model.Commit{
 				Org: "myorg", Repo: "myrepo", SHA: "mergeabc",
-				AuthorLogin: "merger", CommitterLogin: "web-flow",
+				AuthorLogin: "merger", AuthorID: 4001, CommitterLogin: "web-flow",
 				IsVerified: true,
 				Additions:  10, Deletions: 5, ParentCount: 2,
 				Message: "Merge pull request #42 from codeauthor/feature",
@@ -738,10 +711,10 @@ func TestEvaluateCommit_Rule5_SelfApproval(t *testing.T) {
 			},
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{
-					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "mergeabc", AuthorLogin: "codeauthor", Href: "https://github.com/myorg/myrepo/pull/42"},
+					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "mergeabc", AuthorLogin: "codeauthor", AuthorID: 4002, Href: "https://github.com/myorg/myrepo/pull/42"},
 				},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "merger", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "merger", ReviewerID: 4001, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -751,19 +724,19 @@ func TestEvaluateCommit_Rule5_SelfApproval(t *testing.T) {
 			wantReasons:    []string{"compliant"},
 		},
 		{
-			name: "non-merge commit author == reviewer is still self-approval",
+			name: "non-merge commit author == reviewer (by ID) is still self-approval",
 			commit: model.Commit{
 				Org: "myorg", Repo: "myrepo", SHA: "abc123",
-				AuthorLogin: "coder", CommitterLogin: "web-flow",
+				AuthorLogin: "coder", AuthorID: 3001, CommitterLogin: "web-flow",
 				Additions: 10, Deletions: 5, ParentCount: 1,
 				Href: "https://github.com/myorg/myrepo/commit/abc123",
 			},
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{
-					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "abc123", AuthorLogin: "prauthor", Href: "https://github.com/myorg/myrepo/pull/42"},
+					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "abc123", AuthorLogin: "prauthor", AuthorID: 3002, Href: "https://github.com/myorg/myrepo/pull/42"},
 				},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "coder", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "coder", ReviewerID: 3001, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
@@ -774,26 +747,31 @@ func TestEvaluateCommit_Rule5_SelfApproval(t *testing.T) {
 			wantReasons:      []string{"self-approved (reviewer is code author) (PR #42)"},
 		},
 		{
-			name: "multiple reviewers one self one legitimate is compliant",
+			name: "PR-branch commit author == reviewer (by ID) is self-approval (squash merge)",
 			commit: model.Commit{
-				Org: "myorg", Repo: "myrepo", SHA: "abc123",
-				AuthorLogin: "developer", CommitterLogin: "deployer",
-				Additions: 10, Deletions: 5,
-				CoAuthors: []model.CoAuthor{{Login: "codev"}},
-				Href:      "https://github.com/myorg/myrepo/commit/abc123",
+				Org: "myorg", Repo: "myrepo", SHA: "squashabc",
+				AuthorLogin: "prauthor", AuthorID: 6001, Additions: 10, Deletions: 5,
+				Href: "https://github.com/myorg/myrepo/commit/squashabc",
 			},
 			enrichment: model.EnrichmentResult{
-				PRs: []model.PullRequest{f.pr},
+				PRs: []model.PullRequest{
+					{Org: "myorg", Repo: "myrepo", Number: 42, HeadSHA: "head123", MergeCommitSHA: "squashabc", AuthorLogin: "prauthor", AuthorID: 6001, Href: "https://github.com/myorg/myrepo/pull/42"},
+				},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "codev", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "external-reviewer", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "contributor", ReviewerID: 6002, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now},
+				},
+				PRBranchCommits: map[int][]model.Commit{
+					42: {
+						{Org: "myorg", Repo: "myrepo", SHA: "branch1", AuthorLogin: "contributor", AuthorID: 6002, Additions: 5},
+					},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
-			requiredChecks: f.requiredChecks,
-			wantCompliant:  true,
-			wantHasPR:      true,
-			wantReasons:    []string{"compliant"},
+			requiredChecks:   f.requiredChecks,
+			wantCompliant:    false,
+			wantHasPR:        true,
+			wantSelfApproved: true,
+			wantReasons:      []string{"self-approved (reviewer is code author) (PR #42)"},
 		},
 	}
 	runEvalCases(t, cases)
@@ -963,7 +941,7 @@ func TestEvaluateCommit_Rule7_Verdict(t *testing.T) {
 		},
 		{
 			name:   "merge commit treated normally",
-			commit: model.Commit{Org: "myorg", Repo: "myrepo", SHA: "merge123", AuthorLogin: "developer", ParentCount: 2, Additions: 10, Deletions: 5, Href: "https://github.com/myorg/myrepo/commit/merge123"},
+			commit: model.Commit{Org: "myorg", Repo: "myrepo", SHA: "merge123", AuthorLogin: "developer", AuthorID: 1001, ParentCount: 2, Additions: 10, Deletions: 5, Href: "https://github.com/myorg/myrepo/commit/merge123"},
 			enrichment: model.EnrichmentResult{
 				PRs:       []model.PullRequest{f.pr},
 				Reviews:   []model.Review{f.approvedReview},
@@ -1151,6 +1129,7 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 		Repo:        "myrepo",
 		SHA:         "squash1",
 		AuthorLogin: "dev-a",
+		AuthorID:    10001,
 		CommittedAt: now,
 		Message:     "feat: squash merged",
 		ParentCount: 1,
@@ -1165,6 +1144,7 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 		Number:      10,
 		HeadSHA:     "head1",
 		AuthorLogin: "dev-a",
+		AuthorID:    10001,
 		Merged:      true,
 		Href:        "https://github.com/myorg/myrepo/pull/10",
 	}
@@ -1175,6 +1155,7 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 		PRNumber:      10,
 		ReviewID:      1,
 		ReviewerLogin: "dev-b",
+		ReviewerID:    10002,
 		State:         "APPROVED",
 		CommitID:      "head1",
 		SubmittedAt:   now,
@@ -1186,6 +1167,7 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 		PRNumber:      10,
 		ReviewID:      2,
 		ReviewerLogin: "independent-reviewer",
+		ReviewerID:    10003,
 		State:         "APPROVED",
 		CommitID:      "head1",
 		SubmittedAt:   now,
@@ -1198,8 +1180,8 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			Reviews: []model.Review{approvalFromDevB},
 			PRBranchCommits: map[int][]model.Commit{
 				10: {
-					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a"},
-					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "dev-b"},
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a", AuthorID: 10001},
+					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "dev-b", AuthorID: 10002},
 				},
 			},
 		}
@@ -1218,8 +1200,8 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			Reviews: []model.Review{approvalFromIndependent},
 			PRBranchCommits: map[int][]model.Commit{
 				10: {
-					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a"},
-					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "dev-b"},
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a", AuthorID: 10001},
+					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "dev-b", AuthorID: 10002},
 				},
 			},
 		}
@@ -1316,8 +1298,8 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			Reviews: []model.Review{approvalFromDevB},
 			PRBranchCommits: map[int][]model.Commit{
 				10: {
-					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a"},
-					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "dev-b"},
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a", AuthorID: 10001},
+					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "dev-b", AuthorID: 10002},
 				},
 			},
 		}
@@ -1326,15 +1308,17 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 		assert.True(t, result.IsSelfApproved, "dev-b is both reviewer and PR commit author")
 	})
 
-	t.Run("CleanMerge — committer-as-reviewer is NOT self-approval", func(t *testing.T) {
+	t.Run("CleanMerge — merger-as-reviewer is NOT self-approval", func(t *testing.T) {
 		// GitHub's merge-button produces a 2-parent commit with a canned
-		// message. The committer is whoever clicked merge; they did not
+		// message. The author is whoever clicked merge; they did not
 		// author any code in this commit (GitHub refuses the button on
-		// conflicts). Reviewer == committer must stay clean.
+		// conflicts). Reviewer == merger must stay clean because the
+		// CleanMerge exemption skips the commit.AuthorID check.
 		cleanMerge := squashCommit
 		cleanMerge.ParentCount = 2
 		cleanMerge.Message = "Merge pull request #10 from dev-a/feature"
 		cleanMerge.AuthorLogin = "dev-b"
+		cleanMerge.AuthorID = 10002
 		cleanMerge.CommitterLogin = "web-flow"
 		cleanMerge.IsVerified = true
 
@@ -1347,7 +1331,7 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			Reviews: []model.Review{approvalFromDevB},
 			PRBranchCommits: map[int][]model.Commit{
 				10: {
-					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a"},
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a", AuthorID: 10001},
 				},
 			},
 		}
@@ -1357,14 +1341,15 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 		assert.True(t, result.IsCompliant)
 	})
 
-	t.Run("DirtyMerge — committer-as-reviewer IS self-approval", func(t *testing.T) {
+	t.Run("DirtyMerge — author-as-reviewer IS self-approval", func(t *testing.T) {
 		// A 2-parent commit with a non-auto message may include
-		// conflict-resolution code authored by the committer. If the
-		// committer also approves, that's self-approval.
+		// conflict-resolution code authored by the commit author. If the
+		// author also approves, that's self-approval via AuthorID match.
 		dirtyMerge := squashCommit
 		dirtyMerge.ParentCount = 2
 		dirtyMerge.Message = "Resolve conflicts in foo.go"
 		dirtyMerge.AuthorLogin = "dev-b"
+		dirtyMerge.AuthorID = 10002
 		dirtyMerge.CommitterLogin = "dev-b"
 
 		mergePR := pr
@@ -1376,7 +1361,7 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			Reviews: []model.Review{approvalFromDevB},
 			PRBranchCommits: map[int][]model.Commit{
 				10: {
-					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a"},
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a", AuthorID: 10001},
 				},
 			},
 		}
@@ -1386,16 +1371,17 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 		assert.False(t, result.IsCompliant)
 	})
 
-	t.Run("spoofed CleanMerge message — committer-as-reviewer IS self-approval", func(t *testing.T) {
+	t.Run("spoofed CleanMerge message — author-as-reviewer IS self-approval", func(t *testing.T) {
 		// A malicious actor could craft a local merge commit with a message
 		// that matches GitHub's `Merge pull request #N` format. Without
 		// requiring committer == web-flow AND is_verified, the classifier
-		// would trust the message and skip the committer check. This test
+		// would trust the message and skip the author check. This test
 		// guards against that.
 		spoofed := squashCommit
 		spoofed.ParentCount = 2
 		spoofed.Message = "Merge pull request #10 from dev-a/feature"
 		spoofed.AuthorLogin = "dev-b"
+		spoofed.AuthorID = 10002
 		spoofed.CommitterLogin = "dev-b" // not web-flow
 		spoofed.IsVerified = false
 
@@ -1408,7 +1394,7 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			Reviews: []model.Review{approvalFromDevB},
 			PRBranchCommits: map[int][]model.Commit{
 				10: {
-					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a"},
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a", AuthorID: 10001},
 				},
 			},
 		}
@@ -1418,12 +1404,13 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 		assert.False(t, result.IsCompliant)
 	})
 
-	t.Run("web-flow committer but unverified — committer-as-reviewer IS self-approval", func(t *testing.T) {
+	t.Run("web-flow committer but unverified — author-as-reviewer IS self-approval", func(t *testing.T) {
 		// Verification must also hold; otherwise the signal is forgeable.
 		commit := squashCommit
 		commit.ParentCount = 2
 		commit.Message = "Merge pull request #10 from dev-a/feature"
 		commit.AuthorLogin = "dev-b"
+		commit.AuthorID = 10002
 		commit.CommitterLogin = "web-flow"
 		commit.IsVerified = false
 
@@ -1440,11 +1427,12 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 		assert.True(t, result.IsSelfApproved, "unverified commit must not be trusted as CleanMerge")
 	})
 
-	t.Run("OctopusMerge — committer-as-reviewer IS self-approval", func(t *testing.T) {
+	t.Run("OctopusMerge — author-as-reviewer IS self-approval", func(t *testing.T) {
 		octopus := squashCommit
 		octopus.ParentCount = 3
 		octopus.Message = "Merge branches 'a', 'b', 'c'"
 		octopus.AuthorLogin = "dev-b"
+		octopus.AuthorID = 10002
 		octopus.CommitterLogin = "dev-b"
 
 		mergePR := pr
@@ -1456,7 +1444,7 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			Reviews: []model.Review{approvalFromDevB},
 			PRBranchCommits: map[int][]model.Commit{
 				10: {
-					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a"},
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dev-a", AuthorID: 10001},
 				},
 			},
 		}
@@ -1482,19 +1470,19 @@ func TestSelfApproval_EmptyAdminCommitByReviewer(t *testing.T) {
 
 	commit := model.Commit{
 		Org: "myorg", Repo: "myrepo", SHA: "merge1",
-		AuthorLogin: "dev-a", CommittedAt: now,
+		AuthorLogin: "dev-a", AuthorID: 5001, CommittedAt: now,
 		Message:     "feat: real change",
 		ParentCount: 1, Additions: 50, Deletions: 5,
 		Href: "https://github.com/myorg/myrepo/commit/merge1",
 	}
 	pr := model.PullRequest{
 		Org: "myorg", Repo: "myrepo", Number: 10, HeadSHA: "head1",
-		AuthorLogin: "dev-a", Merged: true,
+		AuthorLogin: "dev-a", AuthorID: 5001, Merged: true,
 		Href: "https://github.com/myorg/myrepo/pull/10",
 	}
 	approvalFromReviewer := model.Review{
 		Org: "myorg", Repo: "myrepo", PRNumber: 10, ReviewID: 1,
-		ReviewerLogin: "reviewer-r", State: "APPROVED",
+		ReviewerLogin: "reviewer-r", ReviewerID: 5002, State: "APPROVED",
 		CommitID: "head1", SubmittedAt: now,
 	}
 	checks := []model.CheckRun{
@@ -1517,7 +1505,7 @@ func TestSelfApproval_EmptyAdminCommitByReviewer(t *testing.T) {
 			PRBranchCommits: map[int][]model.Commit{
 				10: {
 					{Org: "myorg", Repo: "myrepo", SHA: "real1", AuthorLogin: "dev-a", Additions: 50, Deletions: 5},
-					{Org: "myorg", Repo: "myrepo", SHA: "empty1", AuthorLogin: "reviewer-r"}, // Empty commit to rerun check
+					{Org: "myorg", Repo: "myrepo", SHA: "empty1", AuthorLogin: "reviewer-r", AuthorID: 5002}, // Empty commit to rerun check
 				},
 			},
 		}
@@ -1539,8 +1527,8 @@ func TestSelfApproval_EmptyAdminCommitByReviewer(t *testing.T) {
 			Reviews: []model.Review{approvalFromReviewer}, CheckRuns: checks,
 			PRBranchCommits: map[int][]model.Commit{
 				10: {
-					{Org: "myorg", Repo: "myrepo", SHA: "empty1", AuthorLogin: "reviewer-r"},
-					{Org: "myorg", Repo: "myrepo", SHA: "real-by-reviewer", AuthorLogin: "reviewer-r", Additions: 30, Deletions: 1},
+					{Org: "myorg", Repo: "myrepo", SHA: "empty1", AuthorLogin: "reviewer-r", AuthorID: 5002},
+					{Org: "myorg", Repo: "myrepo", SHA: "real-by-reviewer", AuthorLogin: "reviewer-r", AuthorID: 5002, Additions: 30, Deletions: 1},
 				},
 			},
 		}
@@ -1562,7 +1550,7 @@ func TestSelfApproval_EmptyAdminCommitByReviewer(t *testing.T) {
 			Reviews: []model.Review{approvalFromReviewer}, CheckRuns: checks,
 			PRBranchCommits: map[int][]model.Commit{
 				10: {
-					{Org: "myorg", Repo: "myrepo", SHA: "stats-hidden", AuthorLogin: "reviewer-r"},
+					{Org: "myorg", Repo: "myrepo", SHA: "stats-hidden", AuthorLogin: "reviewer-r", AuthorID: 5002},
 				},
 			},
 		}
@@ -1580,7 +1568,7 @@ func TestSelfApproval_EmptyAdminCommitByReviewer(t *testing.T) {
 			Reviews: []model.Review{approvalFromReviewer}, CheckRuns: checks,
 			PRBranchCommits: map[int][]model.Commit{
 				10: {
-					{Org: "myorg", Repo: "myrepo", SHA: "unknown", AuthorLogin: "reviewer-r"},
+					{Org: "myorg", Repo: "myrepo", SHA: "unknown", AuthorLogin: "reviewer-r", AuthorID: 5002},
 				},
 			},
 		}
@@ -1594,7 +1582,7 @@ func TestSelfApproval_EmptyAdminCommitByReviewer(t *testing.T) {
 			Reviews: []model.Review{approvalFromReviewer}, CheckRuns: checks,
 			PRBranchCommits: map[int][]model.Commit{
 				10: {
-					{Org: "myorg", Repo: "myrepo", SHA: "empty1", AuthorLogin: "reviewer-r"},
+					{Org: "myorg", Repo: "myrepo", SHA: "empty1", AuthorLogin: "reviewer-r", AuthorID: 5002},
 				},
 			},
 		}
@@ -1609,20 +1597,16 @@ func TestEvaluateCommit_LazyStatsFetcher(t *testing.T) {
 	t.Run("approved PR never invokes fetchStats", func(t *testing.T) {
 		mergedAt := time.Now().Add(-time.Hour)
 		commit := model.Commit{
-			Org: "o", Repo: "r", SHA: "abc", AuthorLogin: "dev-a",
-			// Additions/Deletions deliberately zero — pre-refactor this
-			// would have flagged the commit "empty" and short-circuited
-			// BEFORE the PR check, masking bugs. Now the PR check runs
-			// first.
+			Org: "o", Repo: "r", SHA: "abc", AuthorLogin: "dev-a", AuthorID: 11001,
 		}
 		pr := model.PullRequest{
 			Org: "o", Repo: "r", Number: 1, HeadSHA: "head",
-			MergedAt: mergedAt,
+			AuthorLogin: "dev-a", AuthorID: 11001, MergedAt: mergedAt,
 		}
 		enrichment := model.EnrichmentResult{
 			PRs: []model.PullRequest{pr},
 			Reviews: []model.Review{
-				{Org: "o", Repo: "r", PRNumber: 1, CommitID: "head", ReviewerLogin: "reviewer", State: "APPROVED", SubmittedAt: mergedAt.Add(-time.Minute)},
+				{Org: "o", Repo: "r", PRNumber: 1, CommitID: "head", ReviewerLogin: "reviewer", ReviewerID: 11002, State: "APPROVED", SubmittedAt: mergedAt.Add(-time.Minute)},
 			},
 		}
 		called := false
@@ -1819,10 +1803,10 @@ func TestEvaluateRevertCompliance(t *testing.T) {
 	}
 }
 
-// TestLatestReviewStatesOnFinal_CaseSensitivity verifies that the per-reviewer
-// latest-state map treats login casing as equivalent. GitHub normalizes logins
-// but cached data or renamed accounts may introduce casing variance.
-func TestLatestReviewStatesOnFinal_CaseSensitivity(t *testing.T) {
+// TestLatestReviewStatesOnFinal_IDDedup verifies that the per-reviewer
+// latest-state map deduplicates by ReviewerID. Reviews from the same
+// ID collapse to one entry regardless of login string.
+func TestLatestReviewStatesOnFinal_IDDedup(t *testing.T) {
 	pr := model.PullRequest{
 		Number:  1,
 		HeadSHA: "head",
@@ -1831,28 +1815,36 @@ func TestLatestReviewStatesOnFinal_CaseSensitivity(t *testing.T) {
 	t1 := time.Date(2025, 5, 1, 10, 0, 0, 0, time.UTC)
 	t2 := time.Date(2025, 5, 1, 11, 0, 0, 0, time.UTC)
 
-	t.Run("same reviewer different casing collapses to one entry", func(t *testing.T) {
+	t.Run("same reviewer ID collapses to one entry", func(t *testing.T) {
 		reviews := []model.Review{
-			{PRNumber: 1, CommitID: "head", ReviewerLogin: "Alice", ReviewID: 1, State: "APPROVED", SubmittedAt: t1},
-			{PRNumber: 1, CommitID: "head", ReviewerLogin: "alice", ReviewID: 2, State: "CHANGES_REQUESTED", SubmittedAt: t2},
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "Alice", ReviewerID: 7001, ReviewID: 1, State: "APPROVED", SubmittedAt: t1},
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "alice", ReviewerID: 7001, ReviewID: 2, State: "CHANGES_REQUESTED", SubmittedAt: t2},
 		}
 		latest, _ := latestReviewStatesOnFinal(reviews, pr)
-		require.Len(t, latest, 1, "same reviewer with different casing must collapse to one map entry")
+		require.Len(t, latest, 1, "same reviewer ID must collapse to one map entry")
 		for _, r := range latest {
 			assert.Equal(t, "CHANGES_REQUESTED", r.State, "later CHANGES_REQUESTED must clobber earlier APPROVED")
 		}
 	})
 
-	t.Run("COMMENTED with different casing does not clobber APPROVED", func(t *testing.T) {
+	t.Run("COMMENTED does not clobber APPROVED from same reviewer", func(t *testing.T) {
 		reviews := []model.Review{
-			{PRNumber: 1, CommitID: "head", ReviewerLogin: "Bob", ReviewID: 1, State: "APPROVED", SubmittedAt: t1},
-			{PRNumber: 1, CommitID: "head", ReviewerLogin: "bob", ReviewID: 2, State: "COMMENTED", SubmittedAt: t2},
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "Bob", ReviewerID: 7002, ReviewID: 1, State: "APPROVED", SubmittedAt: t1},
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "bob", ReviewerID: 7002, ReviewID: 2, State: "COMMENTED", SubmittedAt: t2},
 		}
 		latest, _ := latestReviewStatesOnFinal(reviews, pr)
 		require.Len(t, latest, 1)
 		for _, r := range latest {
-			assert.Equal(t, "APPROVED", r.State, "COMMENTED must not clobber APPROVED even with casing mismatch")
+			assert.Equal(t, "APPROVED", r.State, "COMMENTED must not clobber APPROVED")
 		}
+	})
+
+	t.Run("ReviewerID=0 reviews are excluded", func(t *testing.T) {
+		reviews := []model.Review{
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "ghost", ReviewerID: 0, ReviewID: 1, State: "APPROVED", SubmittedAt: t1},
+		}
+		latest, _ := latestReviewStatesOnFinal(reviews, pr)
+		require.Len(t, latest, 0, "reviews with unresolved identity must not enter the map")
 	})
 }
 
@@ -1870,41 +1862,40 @@ func TestLatestReviewStatesOnFinal_SameTimestampTiebreak(t *testing.T) {
 
 	t.Run("higher ReviewID wins when timestamps are equal", func(t *testing.T) {
 		reviews := []model.Review{
-			{PRNumber: 1, CommitID: "head", ReviewerLogin: "reviewer", ReviewID: 100, State: "APPROVED", SubmittedAt: sameTime},
-			{PRNumber: 1, CommitID: "head", ReviewerLogin: "reviewer", ReviewID: 200, State: "CHANGES_REQUESTED", SubmittedAt: sameTime},
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "reviewer", ReviewerID: 8001, ReviewID: 100, State: "APPROVED", SubmittedAt: sameTime},
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "reviewer", ReviewerID: 8001, ReviewID: 200, State: "CHANGES_REQUESTED", SubmittedAt: sameTime},
 		}
 		latest, _ := latestReviewStatesOnFinal(reviews, pr)
 		require.Len(t, latest, 1)
-		assert.Equal(t, "CHANGES_REQUESTED", latest["reviewer"].State,
+		assert.Equal(t, "CHANGES_REQUESTED", latest["id:8001"].State,
 			"higher ReviewID must win as tiebreaker when timestamps are equal")
 	})
 
 	t.Run("order independence with same timestamp", func(t *testing.T) {
-		// Reversed slice order — must produce the same result.
 		reviews := []model.Review{
-			{PRNumber: 1, CommitID: "head", ReviewerLogin: "reviewer", ReviewID: 200, State: "CHANGES_REQUESTED", SubmittedAt: sameTime},
-			{PRNumber: 1, CommitID: "head", ReviewerLogin: "reviewer", ReviewID: 100, State: "APPROVED", SubmittedAt: sameTime},
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "reviewer", ReviewerID: 8001, ReviewID: 200, State: "CHANGES_REQUESTED", SubmittedAt: sameTime},
+			{PRNumber: 1, CommitID: "head", ReviewerLogin: "reviewer", ReviewerID: 8001, ReviewID: 100, State: "APPROVED", SubmittedAt: sameTime},
 		}
 		latest, _ := latestReviewStatesOnFinal(reviews, pr)
 		require.Len(t, latest, 1)
-		assert.Equal(t, "CHANGES_REQUESTED", latest["reviewer"].State,
+		assert.Equal(t, "CHANGES_REQUESTED", latest["id:8001"].State,
 			"result must be order-independent — higher ReviewID wins regardless of slice position")
 	})
 }
 
-// TestEvaluateCommit_ReviewerCasingBug is an integration test proving that
-// reviewer login casing differences do not create a false-compliant verdict.
-func TestEvaluateCommit_ReviewerCasingBug(t *testing.T) {
+// TestEvaluateCommit_ReviewerIdentityBug is an integration test proving that
+// reviewer identity is resolved by immutable ID, not login string.
+func TestEvaluateCommit_ReviewerIdentityBug(t *testing.T) {
 	f := newAuditBaseline()
 	cases := []evalCase{
 		{
-			name:   "APPROVED then CHANGES_REQUESTED from same reviewer (different casing) → non-compliant",
+			name:   "APPROVED then CHANGES_REQUESTED from same reviewer ID → non-compliant",
 			commit: f.commit,
 			enrichment: model.EnrichmentResult{
 				PRs: []model.PullRequest{f.pr},
 				Reviews: []model.Review{
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "Reviewer1", State: "APPROVED", CommitID: "head123", SubmittedAt: f.now.Add(-time.Hour)},
-					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer1", State: "CHANGES_REQUESTED", CommitID: "head123", SubmittedAt: f.now},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 1, ReviewerLogin: "Reviewer1", ReviewerID: 9001, State: "APPROVED", CommitID: "head123", SubmittedAt: f.now.Add(-time.Hour)},
+					{Org: "myorg", Repo: "myrepo", PRNumber: 42, ReviewID: 2, ReviewerLogin: "reviewer1", ReviewerID: 9001, State: "CHANGES_REQUESTED", CommitID: "head123", SubmittedAt: f.now},
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
