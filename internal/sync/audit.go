@@ -65,7 +65,7 @@ type StatsFetcher func(org, repo, sha string) (additions, deletions int, err err
 //   - §8 (clean-revert waiver) is standalone: it judges the revert on its own
 //     signals and does not inspect the reverted commit's verdict. See
 //     TODO.md for the stricter cross-commit variant.
-func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []string, requiredChecks []RequiredCheck, fetchStats StatsFetcher) model.AuditResult {
+func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor, requiredChecks []RequiredCheck, fetchStats StatsFetcher) model.AuditResult {
 	// Informational fields shared by every return path (revert/merge
 	// signals, annotations, IsBot). Populated once, before any rule runs.
 	result := initAuditResult(commit, enrichment)
@@ -151,19 +151,49 @@ func initAuditResult(commit model.Commit, enrichment model.EnrichmentResult) mod
 // merge with human work), the exemption is NOT granted — IsExemptAuthor is
 // still marked so reviewers can see the match — and the function returns
 // false so downstream rules audit the human code.
-func applyExemptAuthorRule(result *model.AuditResult, commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []string) bool {
-	for _, exempt := range exemptAuthors {
-		if !strings.EqualFold(commit.AuthorLogin, exempt) {
-			continue
+//
+// Matching is strict id-only — see isExempt for the full rationale.
+// commit.AuthorID is guaranteed populated by ingestion (client.go's
+// requireAuthor refuses commits without it), so the rule never has to
+// fall back to login or other forgeable signals.
+func applyExemptAuthorRule(result *model.AuditResult, commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor) bool {
+	if !isExempt(commit.AuthorID, exemptAuthors) {
+		return false
+	}
+	result.IsExemptAuthor = true
+	if hasNonExemptPRContributors(enrichment, exemptAuthors) {
+		return false
+	}
+	result.IsCompliant = true
+	result.Reasons = []string{"exempt: configured author"}
+	result.MergeStrategy = classifyMergeStrategy(commit, false)
+	return true
+}
+
+// isExempt is the shared id-only matcher used by §1 and the
+// PR-branch-contributor scan. Numeric account IDs are the only signal
+// trusted for exempt-author matching:
+//
+//   - GitHub-controlled and immutable per account.
+//   - Never reused across deletions (unlike usernames, which return to
+//     the pool after a 90-day cooldown and can be claimed by anyone).
+//   - Cannot be forged client-side — the operator cannot fabricate a
+//     commit whose author.id resolves to a particular account.
+//
+// Commit ingestion (internal/github/client.go::requireAuthor) refuses
+// commits with no resolved author id and surfaces a fix-it message. By
+// the time isExempt is called, every commit in scope is guaranteed to
+// have AuthorID != 0; an entry whose ID is zero (the YAML schema allows
+// it for un-resolved bare-string legacy entries, though those are no
+// longer accepted) is silently ignored — never matches.
+func isExempt(authorID int64, exemptAuthors []model.ExemptAuthor) bool {
+	if authorID == 0 {
+		return false
+	}
+	for _, e := range exemptAuthors {
+		if e.ID != 0 && e.ID == authorID {
+			return true
 		}
-		result.IsExemptAuthor = true
-		if hasNonExemptPRContributors(enrichment, exemptAuthors) {
-			return false
-		}
-		result.IsCompliant = true
-		result.Reasons = []string{"exempt: configured author"}
-		result.MergeStrategy = classifyMergeStrategy(commit, false)
-		return true
 	}
 	return false
 }
@@ -537,20 +567,25 @@ func truncateSHA(sha string) string {
 	return sha[:12]
 }
 
-// hasNonExemptPRContributors returns true if any PR branch commit author is
-// not in the exempt list. Used to prevent exempt-author early return when a
-// squash merge contains human contributions.
-func hasNonExemptPRContributors(enrichment model.EnrichmentResult, exemptAuthors []string) bool {
+// hasNonExemptPRContributors returns true if any PR branch commit author
+// is not in the exempt list. Used to prevent exempt-author early return
+// when a squash merge contains human contributions. Strict id-only,
+// matching applyExemptAuthorRule.
+//
+// Note: PR-branch commits come from /pulls/{n}/commits which (unlike
+// /repos/{o}/{r}/commits) does not go through requireAuthor. A
+// PR-branch commit with AuthorID == 0 means GitHub couldn't bind the
+// branch commit's git author email to a verified account. We treat
+// that as "non-exempt contributor present" — fail closed — because
+// the bot exempt path is meant to short-circuit "no human code", and
+// an unverifiable contributor cannot be presumed exempt.
+func hasNonExemptPRContributors(enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor) bool {
 	if len(enrichment.PRBranchCommits) == 0 {
 		return false
 	}
-	exemptSet := make(map[string]bool, len(exemptAuthors))
-	for _, a := range exemptAuthors {
-		exemptSet[strings.ToLower(a)] = true
-	}
 	for _, commits := range enrichment.PRBranchCommits {
 		for _, c := range commits {
-			if c.AuthorLogin != "" && !exemptSet[strings.ToLower(c.AuthorLogin)] {
+			if !isExempt(c.AuthorID, exemptAuthors) {
 				return true
 			}
 		}

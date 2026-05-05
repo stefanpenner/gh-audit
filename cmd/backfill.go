@@ -74,8 +74,7 @@ PR attribution, which on a typical sweep is well under 1% of in-scope commits.`,
 				return nil
 			}
 
-			var exemptAuthors []string
-			exemptAuthors = append(exemptAuthors, cfg.Exemptions.Authors...)
+			exemptAuthors := append([]model.ExemptAuthor(nil), cfg.Exemptions.Authors...)
 
 			var requiredChecks []syncer.RequiredCheck
 			for _, rc := range cfg.AuditRules.RequiredChecks {
@@ -234,7 +233,7 @@ func runBackfill(
 	client *ghclient.Client,
 	cfg *config.Config,
 	logger *slog.Logger,
-	exemptAuthors []string,
+	exemptAuthors []model.ExemptAuthor,
 	requiredChecks []syncer.RequiredCheck,
 	opts backfillOpts,
 ) error {
@@ -485,7 +484,7 @@ func reauditSingleCommit(
 	ctx context.Context,
 	dbConn *db.DB,
 	org, repo, sha string,
-	exemptAuthors []string,
+	exemptAuthors []model.ExemptAuthor,
 	requiredChecks []syncer.RequiredCheck,
 ) ([]model.AuditResult, error) {
 	commits, err := dbConn.GetCommitsBySHA(ctx, org, repo, []string{sha})

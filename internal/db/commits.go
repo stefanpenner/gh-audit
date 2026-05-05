@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"fmt"
 	"strings"
@@ -13,7 +14,7 @@ import (
 const batchSize = 500
 
 var commitColumns = []string{
-	"org", "repo", "sha", "author_login", "author_email", "committer_login",
+	"org", "repo", "sha", "author_login", "author_id", "author_email", "committer_login",
 	"committed_at", "message", "parent_count", "additions", "deletions", "is_verified", "href",
 }
 
@@ -27,7 +28,7 @@ func (d *DB) UpsertCommits(ctx context.Context, commits []model.Commit) error {
 	rows := make([][]driver.Value, len(commits))
 	for i, c := range commits {
 		rows[i] = []driver.Value{
-			c.Org, c.Repo, c.SHA, c.AuthorLogin, c.AuthorEmail, c.CommitterLogin,
+			c.Org, c.Repo, c.SHA, c.AuthorLogin, c.AuthorID, c.AuthorEmail, c.CommitterLogin,
 			c.CommittedAt, c.Message, c.ParentCount, c.Additions, c.Deletions, c.IsVerified, c.Href,
 		}
 	}
@@ -57,7 +58,7 @@ func (d *DB) UpsertCommitBranches(ctx context.Context, org, repo string, shas []
 // the full historical backlog, matching the original behaviour).
 func (d *DB) GetUnauditedCommits(ctx context.Context, org, repo string, since, until time.Time) ([]model.Commit, error) {
 	q := `
-		SELECT c.org, c.repo, c.sha, c.author_login, c.author_email, c.committer_login,
+		SELECT c.org, c.repo, c.sha, c.author_login, c.author_id, c.author_email, c.committer_login,
 		       c.committed_at, c.message, c.parent_count, c.additions, c.deletions, c.is_verified, c.href
 		FROM commits c
 		LEFT JOIN audit_results a ON c.org = a.org AND c.repo = a.repo AND c.sha = a.sha
@@ -92,7 +93,7 @@ func (d *DB) GetUnauditedCommits(ctx context.Context, org, repo string, since, u
 // GetAllCommits returns all commits for an org/repo.
 func (d *DB) GetAllCommits(ctx context.Context, org, repo string) ([]model.Commit, error) {
 	rows, err := d.DB.QueryContext(ctx, `
-		SELECT org, repo, sha, author_login, author_email, committer_login,
+		SELECT org, repo, sha, author_login, author_id, author_email, committer_login,
 		       committed_at, message, parent_count, additions, deletions, is_verified, href
 		FROM commits
 		WHERE org = ? AND repo = ?
@@ -137,7 +138,7 @@ func (d *DB) GetCommitsBySHA(ctx context.Context, org, repo string, shas []strin
 		args = append(args, sha)
 	}
 
-	q := fmt.Sprintf(`SELECT org, repo, sha, author_login, author_email, committer_login,
+	q := fmt.Sprintf(`SELECT org, repo, sha, author_login, author_id, author_email, committer_login,
 		committed_at, message, parent_count, additions, deletions, is_verified, href
 		FROM commits
 		WHERE org = ? AND repo = ? AND sha IN (%s)`, strings.Join(placeholders, ", "))
@@ -251,9 +252,13 @@ func scanCommits(rows interface {
 	var result []model.Commit
 	for rows.Next() {
 		var c model.Commit
-		if err := rows.Scan(&c.Org, &c.Repo, &c.SHA, &c.AuthorLogin, &c.AuthorEmail, &c.CommitterLogin,
+		var authorID sql.NullInt64
+		if err := rows.Scan(&c.Org, &c.Repo, &c.SHA, &c.AuthorLogin, &authorID, &c.AuthorEmail, &c.CommitterLogin,
 			&c.CommittedAt, &c.Message, &c.ParentCount, &c.Additions, &c.Deletions, &c.IsVerified, &c.Href); err != nil {
 			return nil, fmt.Errorf("scan commit: %w", err)
+		}
+		if authorID.Valid {
+			c.AuthorID = authorID.Int64
 		}
 		result = append(result, c)
 	}

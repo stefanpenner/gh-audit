@@ -64,8 +64,12 @@ sync:
   initial_lookback_days: 180
 exemptions:
   authors:
-    - dependabot[bot]
-    - renovate[bot]
+    - login: dependabot[bot]
+      id: 49699333
+      type: Bot
+    - login: renovate[bot]
+      id: 2740337
+      type: Bot
 `,
 		},
 		{

@@ -62,7 +62,7 @@ func TestRecoverPRFromMergeMessage_HappyPath(t *testing.T) {
 				"message": commitFirstLine,
 				"author":  map[string]any{"email": "dev@example.com", "date": "2026-03-30T16:24:17Z"},
 			},
-			"author":  map[string]any{"login": "shkotha"},
+			"author":  map[string]any{"login": "shkotha", "id": 999001},
 			"parents": []map[string]any{{"sha": "parent1"}},
 		})
 	})
@@ -119,7 +119,7 @@ func TestRecoverPRFromMergeMessage_MismatchRejected(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"sha":     sha,
 			"commit":  map[string]any{"message": commitFirstLine, "author": map[string]any{"date": "2026-03-30T16:24:17Z"}},
-			"author":  map[string]any{"login": "attacker"},
+			"author":  map[string]any{"login": "attacker", "id": 999002},
 			"parents": []map[string]any{{"sha": "parent1"}},
 		})
 	})
@@ -160,7 +160,7 @@ func TestRecoverPRFromMergeMessage_NoPRReference(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"sha":     sha,
 			"commit":  map[string]any{"message": "feat: bump dep", "author": map[string]any{"date": "2026-03-30T16:24:17Z"}},
-			"author":  map[string]any{"login": "dev"},
+			"author":  map[string]any{"login": "dev", "id": 999003},
 			"parents": []map[string]any{{"sha": "parent1"}},
 		})
 	})

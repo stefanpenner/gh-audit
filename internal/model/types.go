@@ -65,10 +65,20 @@ func LoginFromNoreplyEmail(email string) string {
 //	                ├──→ AuditResult
 //	                └──→ EnrichmentResult
 type Commit struct {
-	Org            string
-	Repo           string
-	SHA            string
-	AuthorLogin    string
+	Org         string
+	Repo        string
+	SHA         string
+	AuthorLogin string
+	// AuthorID is the immutable numeric GitHub account ID. Zero when
+	// the commit's email isn't bound to a verified GH user — but
+	// commit ingestion (internal/github/client.go::requireAuthor)
+	// refuses such commits with a fix-it message, so by the time a
+	// row reaches the audit it is guaranteed non-zero. The ID is the
+	// only forgery-resistant author identity GitHub exposes (logins
+	// can be renamed and reclaimed; numeric IDs are immutable per
+	// account and never reused), so it's the sole signal used by §1
+	// (exempt author) and §5 (self-approval) matching.
+	AuthorID       int64
 	AuthorEmail    string
 	CommitterLogin string
 	CoAuthors      []CoAuthor
@@ -283,4 +293,37 @@ type EnrichmentResult struct {
 	// fields of the same name for semantics).
 	IsCleanMerge      bool
 	MergeVerification string
+}
+
+// ExemptAuthor is a single entry in the exempt-author list (see
+// Architecture.md §1). Loaded from `~/.config/gh-audit/config.yaml`
+// and consulted on every commit's audit by sync.applyExemptAuthorRule.
+//
+// The matching contract:
+//
+//   - ID, when non-zero, is the canonical key. It's the immutable
+//     numeric GitHub account ID — never reused across deletions,
+//     never transferred by renames, not forgeable.
+//   - Login is the fallback for commits whose author.id couldn't be
+//     resolved (commit's git author email isn't bound to a verified
+//     GH user; service accounts often hit this). Forgery-prone:
+//     renames + 90-day cooldown can transfer the username to a
+//     different account.
+//   - Type and Name are display-only metadata captured at resolution
+//     time.
+//   - Comment is a user-supplied annotation preserved through the
+//     YAML round-trip; useful for "was: <old-login>, renamed
+//     YYYY-MM" notes.
+//
+// New entries enter the config as bare logins via tooling that calls
+// GET /users/{login} once to populate ID; the populated form is what
+// gh-audit consumes thereafter. The schema is structured-only —
+// bare-string entries are no longer accepted (see migration
+// 2026-05-04).
+type ExemptAuthor struct {
+	Login   string `yaml:"login"`
+	ID      int64  `yaml:"id,omitempty"`
+	Type    string `yaml:"type,omitempty"`
+	Name    string `yaml:"name,omitempty"`
+	Comment string `yaml:"comment,omitempty"`
 }

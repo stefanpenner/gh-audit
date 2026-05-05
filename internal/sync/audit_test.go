@@ -18,7 +18,7 @@ type evalCase struct {
 	name                 string
 	commit               model.Commit
 	enrichment           model.EnrichmentResult
-	exemptAuthors        []string
+	exemptAuthors        []model.ExemptAuthor
 	requiredChecks       []RequiredCheck
 	wantCompliant        bool
 	wantBot              bool
@@ -137,9 +137,12 @@ func TestEvaluateCommit_Rule1_ExemptAuthor(t *testing.T) {
 	cases := []evalCase{
 		{
 			name:          "exempt author is compliant",
-			commit:        model.Commit{Org: "myorg", Repo: "myrepo", SHA: "abc123", AuthorLogin: "dependabot[bot]", Additions: 5, Deletions: 3},
+			commit:        model.Commit{Org: "myorg", Repo: "myrepo", SHA: "abc123", AuthorLogin: "dependabot[bot]", AuthorID: 49699333, Additions: 5, Deletions: 3},
 			enrichment:    model.EnrichmentResult{},
-			exemptAuthors: []string{"dependabot[bot]", "renovate[bot]"},
+			exemptAuthors: []model.ExemptAuthor{
+				{Login: "dependabot[bot]", ID: 49699333},
+				{Login: "renovate[bot]", ID: 2740337},
+			},
 			wantCompliant: true,
 			wantBot:       true,
 			wantExempt:    true,
@@ -149,7 +152,7 @@ func TestEvaluateCommit_Rule1_ExemptAuthor(t *testing.T) {
 			name:          "bot not in exempt list is not exempt",
 			commit:        model.Commit{Org: "myorg", Repo: "myrepo", SHA: "abc123", AuthorLogin: "some-ci[bot]", Additions: 5, Deletions: 3},
 			enrichment:    model.EnrichmentResult{},
-			exemptAuthors: []string{"dependabot[bot]"},
+			exemptAuthors: []model.ExemptAuthor{{Login: "dependabot[bot]", ID: 49699333}},
 			wantCompliant: false,
 			wantBot:       true,
 			wantExempt:    false,
@@ -157,9 +160,9 @@ func TestEvaluateCommit_Rule1_ExemptAuthor(t *testing.T) {
 		},
 		{
 			name:          "non-bot exempt author is exempt but not bot",
-			commit:        model.Commit{Org: "myorg", Repo: "myrepo", SHA: "abc123", AuthorLogin: "service-account", Additions: 5, Deletions: 3},
+			commit:        model.Commit{Org: "myorg", Repo: "myrepo", SHA: "abc123", AuthorLogin: "service-account", AuthorID: 88001, Additions: 5, Deletions: 3},
 			enrichment:    model.EnrichmentResult{},
-			exemptAuthors: []string{"service-account"},
+			exemptAuthors: []model.ExemptAuthor{{Login: "service-account", ID: 88001}},
 			wantCompliant: true,
 			wantBot:       false,
 			wantExempt:    true,
@@ -1229,6 +1232,7 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 	t.Run("exempt bot + human contributor, no review — non-compliant", func(t *testing.T) {
 		botCommit := squashCommit
 		botCommit.AuthorLogin = "dependabot[bot]"
+		botCommit.AuthorID = 49699333
 
 		botPR := pr
 		botPR.AuthorLogin = "dependabot[bot]"
@@ -1238,13 +1242,13 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			PRs:    []model.PullRequest{botPR},
 			PRBranchCommits: map[int][]model.Commit{
 				10: {
-					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dependabot[bot]"},
-					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "human-dev"},
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dependabot[bot]", AuthorID: 49699333},
+					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "human-dev", AuthorID: 1234567},
 				},
 			},
 		}
 
-		result := EvaluateCommit(botCommit, enrichment, []string{"dependabot[bot]"}, nil, nil)
+		result := EvaluateCommit(botCommit, enrichment, []model.ExemptAuthor{{Login: "dependabot[bot]", ID: 49699333}}, nil, nil)
 		assert.True(t, result.IsExemptAuthor, "commit author is exempt")
 		assert.False(t, result.IsCompliant, "non-exempt contributor needs review")
 	})
@@ -1252,6 +1256,7 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 	t.Run("exempt bot + human contributor, reviewed — compliant", func(t *testing.T) {
 		botCommit := squashCommit
 		botCommit.AuthorLogin = "dependabot[bot]"
+		botCommit.AuthorID = 49699333
 
 		botPR := pr
 		botPR.AuthorLogin = "dependabot[bot]"
@@ -1262,13 +1267,13 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			Reviews: []model.Review{approvalFromIndependent},
 			PRBranchCommits: map[int][]model.Commit{
 				10: {
-					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dependabot[bot]"},
-					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "human-dev"},
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dependabot[bot]", AuthorID: 49699333},
+					{Org: "myorg", Repo: "myrepo", SHA: "c2", AuthorLogin: "human-dev", AuthorID: 1234567},
 				},
 			},
 		}
 
-		result := EvaluateCommit(botCommit, enrichment, []string{"dependabot[bot]"}, nil, nil)
+		result := EvaluateCommit(botCommit, enrichment, []model.ExemptAuthor{{Login: "dependabot[bot]", ID: 49699333}}, nil, nil)
 		assert.True(t, result.IsExemptAuthor)
 		assert.True(t, result.IsCompliant, "independent review covers human contributor")
 	})
@@ -1276,6 +1281,7 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 	t.Run("bot-only PR — stays compliant via exempt", func(t *testing.T) {
 		botCommit := squashCommit
 		botCommit.AuthorLogin = "dependabot[bot]"
+		botCommit.AuthorID = 49699333
 
 		botPR := pr
 		botPR.AuthorLogin = "dependabot[bot]"
@@ -1285,12 +1291,12 @@ func TestSquashMergePRCommitAuthors(t *testing.T) {
 			PRs:    []model.PullRequest{botPR},
 			PRBranchCommits: map[int][]model.Commit{
 				10: {
-					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dependabot[bot]"},
+					{Org: "myorg", Repo: "myrepo", SHA: "c1", AuthorLogin: "dependabot[bot]", AuthorID: 49699333},
 				},
 			},
 		}
 
-		result := EvaluateCommit(botCommit, enrichment, []string{"dependabot[bot]"}, nil, nil)
+		result := EvaluateCommit(botCommit, enrichment, []model.ExemptAuthor{{Login: "dependabot[bot]", ID: 49699333}}, nil, nil)
 		require.True(t, result.IsCompliant)
 		assert.True(t, result.IsExemptAuthor)
 		assert.Equal(t, []string{"exempt: configured author"}, result.Reasons)

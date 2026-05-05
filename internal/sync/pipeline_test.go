@@ -920,7 +920,7 @@ func TestPipelineRealisticMix(t *testing.T) {
 	now := time.Now()
 
 	commits := []model.Commit{
-		{Org: "acme", Repo: "app", SHA: "aaa1", AuthorLogin: "dependabot[bot]", CommittedAt: now, Additions: 5, Deletions: 2},
+		{Org: "acme", Repo: "app", SHA: "aaa1", AuthorLogin: "dependabot[bot]", AuthorID: 49699333, CommittedAt: now, Additions: 5, Deletions: 2},
 		{Org: "acme", Repo: "app", SHA: "aaa2", AuthorLogin: "some-ci[bot]", CommittedAt: now, Additions: 3, Deletions: 1},
 		{Org: "acme", Repo: "app", SHA: "aaa3", AuthorLogin: "alice", CommittedAt: now, Additions: 10, Deletions: 4},
 		{Org: "acme", Repo: "app", SHA: "aaa4", AuthorLogin: "bob", CommittedAt: now, Additions: 7, Deletions: 3},
@@ -991,7 +991,7 @@ func TestPipelineRealisticMix(t *testing.T) {
 	cfg := &SyncConfig{
 		Orgs:          []OrgConfig{{Name: "acme"}},
 		Concurrency:   1,
-		ExemptAuthors: []string{"dependabot[bot]"},
+		ExemptAuthors: []model.ExemptAuthor{{Login: "dependabot[bot]", ID: 49699333}},
 	}
 
 	p := NewPipeline(source, enricher, store, cfg, slog.Default())

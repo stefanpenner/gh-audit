@@ -64,7 +64,7 @@ type SyncConfig struct {
 	Since               time.Time // override, zero means use cursor
 	Until               time.Time // override, zero means now
 	InitialLookbackDays int
-	ExemptAuthors       []string
+	ExemptAuthors       []model.ExemptAuthor
 	RequiredChecks      []RequiredCheck
 }
 

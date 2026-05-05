@@ -28,6 +28,7 @@ const (
 		repo             TEXT NOT NULL,
 		sha              TEXT NOT NULL,
 		author_login     TEXT,
+		author_id        BIGINT,
 		author_email     TEXT,
 		committer_login  TEXT,
 		committed_at     TIMESTAMP,
@@ -168,6 +169,7 @@ var addColumnMigrations = []string{
 	`ALTER TABLE audit_results ADD COLUMN merge_verification TEXT`,
 	`ALTER TABLE audit_results ADD COLUMN annotations TEXT[]`,
 	`ALTER TABLE commits ADD COLUMN is_verified BOOLEAN DEFAULT false`,
+	`ALTER TABLE commits ADD COLUMN author_id BIGINT`,
 }
 
 // allTables is the ordered list of DDL statements to run during migration.

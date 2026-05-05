@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/stefanpenner/gh-audit/internal/model"
 	"gopkg.in/yaml.v3"
 )
 
@@ -76,8 +77,17 @@ type SyncConfig struct {
 }
 
 // ExemptionsConfig lists authors exempt from audit rules.
+//
+// Authors entries are structured (login + numeric ID + metadata) —
+// bare-string entries are no longer accepted as of the 2026-05-04
+// schema migration. The migration was driven by a real-world finding:
+// a bare entry "mae" had been silently exempting a human user (Mae de
+// Leon, GitHub id 12399), not the bot mae_LinkedIn (id 170686495).
+// The numeric ID makes the exemption forgery-resistant — renames and
+// username squatting cannot transfer the exemption to a different
+// account.
 type ExemptionsConfig struct {
-	Authors []string `yaml:"authors"`
+	Authors []model.ExemptAuthor `yaml:"authors"`
 }
 
 // DefaultDBPath returns the default database file path.

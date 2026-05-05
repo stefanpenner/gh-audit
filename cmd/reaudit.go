@@ -52,8 +52,7 @@ func newReAuditCmd() *cobra.Command {
 
 			logger := slog.Default()
 
-			var exemptAuthors []string
-			exemptAuthors = append(exemptAuthors, cfg.Exemptions.Authors...)
+			exemptAuthors := append([]model.ExemptAuthor(nil), cfg.Exemptions.Authors...)
 
 			var requiredChecks []syncer.RequiredCheck
 			for _, rc := range cfg.AuditRules.RequiredChecks {
@@ -83,7 +82,7 @@ type reAuditFilter struct {
 	repos        []string
 }
 
-func runReAudit(ctx context.Context, dbConn *db.DB, logger *slog.Logger, exemptAuthors []string, requiredChecks []syncer.RequiredCheck, filter reAuditFilter) error {
+func runReAudit(ctx context.Context, dbConn *db.DB, logger *slog.Logger, exemptAuthors []model.ExemptAuthor, requiredChecks []syncer.RequiredCheck, filter reAuditFilter) error {
 	flipped, total, err := runReAuditPass(ctx, dbConn, logger, exemptAuthors, requiredChecks, filter)
 	if err != nil {
 		return err
@@ -98,7 +97,7 @@ func runReAuditPass(
 	ctx context.Context,
 	dbConn *db.DB,
 	logger *slog.Logger,
-	exemptAuthors []string,
+	exemptAuthors []model.ExemptAuthor,
 	requiredChecks []syncer.RequiredCheck,
 	filter reAuditFilter,
 ) (flipped, total int, err error) {

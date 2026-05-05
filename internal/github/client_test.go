@@ -148,6 +148,7 @@ func TestListCommits(t *testing.T) {
 						},
 						"author": map[string]any{
 							"login": "developer",
+							"id":    200001,
 						},
 						"parents": []map[string]any{
 							{"sha": "parent1"},
@@ -173,7 +174,7 @@ func TestListCommits(t *testing.T) {
 									"date":  "2024-01-15T10:00:00Z",
 								},
 							},
-							"author":  map[string]any{"login": "dev1"},
+							"author": map[string]any{"login": "dev1", "id": 100001},
 							"parents": []map[string]any{},
 						},
 					}
@@ -190,7 +191,7 @@ func TestListCommits(t *testing.T) {
 									"date":  "2024-01-16T10:00:00Z",
 								},
 							},
-							"author":  map[string]any{"login": "dev2"},
+							"author": map[string]any{"login": "dev2", "id": 100002},
 							"parents": []map[string]any{},
 						},
 					}
@@ -237,6 +238,7 @@ func TestGetCommitDetail(t *testing.T) {
 			},
 			"author": map[string]any{
 				"login": "developer",
+				"id":    200001,
 			},
 			"parents": []map[string]any{
 				{"sha": "parent1"},
@@ -283,7 +285,7 @@ func TestListCommitsUsesCommitterDate(t *testing.T) {
 						"date":  committerDate,
 					},
 				},
-				"author":  map[string]any{"login": "developer"},
+				"author": map[string]any{"login": "developer", "id": 200001},
 				"parents": []map[string]any{},
 			},
 		}
@@ -321,7 +323,7 @@ func TestGetCommitDetailUsesCommitterDate(t *testing.T) {
 					"date":  committerDate,
 				},
 			},
-			"author":    map[string]any{"login": "developer"},
+			"author":    map[string]any{"login": "developer", "id": 200001},
 			"committer": map[string]any{"login": "merger"},
 			"parents":   []map[string]any{{"sha": "parent1"}},
 			"stats":     map[string]any{"additions": 10, "deletions": 5},
