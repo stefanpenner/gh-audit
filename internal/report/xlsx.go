@@ -63,7 +63,7 @@ func (r *Reporter) GenerateXLSX(ctx context.Context, opts ReportOpts, outputPath
 	}
 
 	f.SetSheetName("Sheet1", SheetREADME)
-	if err := b.writeREADME(opts); err != nil {
+	if err := b.writeREADME(opts, summary, details); err != nil {
 		return fmt.Errorf("README: %w", err)
 	}
 
@@ -169,13 +169,15 @@ func newBuilder(f *excelize.File) (*xlsxBuilder, error) {
 
 // --- README ---------------------------------------------------------------
 
-func (b *xlsxBuilder) writeREADME(opts ReportOpts) error {
+func (b *xlsxBuilder) writeREADME(opts ReportOpts, summary []SummaryRow, details []DetailRow) error {
 	sheet := SheetREADME
 	f := b.f
 
 	title, _ := f.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true, Size: 16}})
 	h2, _ := f.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true, Size: 12}})
 	body, _ := f.NewStyle(&excelize.Style{Alignment: &excelize.Alignment{WrapText: true, Vertical: "top"}})
+
+	stats := summarizeReport(summary, details)
 
 	lines := []struct {
 		text  string
@@ -184,6 +186,16 @@ func (b *xlsxBuilder) writeREADME(opts ReportOpts) error {
 		{"gh-audit compliance report", title},
 		{fmt.Sprintf("Generated: %s", time.Now().UTC().Format("2006-01-02 15:04 MST")), 0},
 		{reportPeriod(opts), 0},
+		{"", 0},
+		{"At a glance", h2},
+		{fmt.Sprintf("Repos audited:        %s", formatInt(stats.Repos)), body},
+		{fmt.Sprintf("Commits audited:      %s", formatInt(stats.Commits)), body},
+		{fmt.Sprintf("  compliant:          %s  (%.2f%%)", formatInt(stats.Compliant), stats.CompliancePct), body},
+		{fmt.Sprintf("  non-compliant:      %s", formatInt(stats.NonCompliant)), body},
+		{fmt.Sprintf("  waived (R1/R2/R8):  %s", formatInt(stats.Waived)), body},
+		{fmt.Sprintf("Distinct PRs:         %s", formatInt(stats.PRs)), body},
+		{fmt.Sprintf("Distinct authors:     %s", formatInt(stats.Authors)), body},
+		{fmt.Sprintf("Action queue:         %s commit%s need attention", formatInt(stats.ActionQueue), pluralS(stats.ActionQueue)), body},
 		{"", 0},
 		{"How to read this workbook", h2},
 		{"• Action Queue — prioritized list of commits that need attention. Start here.", body},
@@ -228,6 +240,68 @@ func (b *xlsxBuilder) writeREADME(opts ReportOpts) error {
 	return nil
 }
 
+// reportStats are the aggregate counts shown in the README "At a glance"
+// block. Sourced from per-repo SummaryRow totals (compliance buckets) and
+// per-commit DetailRow data (distinct PRs / authors), so they always match
+// the sheets the reader is about to drill into.
+type reportStats struct {
+	Repos         int
+	Commits       int
+	Compliant     int
+	NonCompliant  int
+	Waived        int
+	PRs           int
+	Authors       int
+	ActionQueue   int
+	CompliancePct float64
+}
+
+func summarizeReport(summary []SummaryRow, details []DetailRow) reportStats {
+	var s reportStats
+	s.Repos = len(summary)
+	for _, r := range summary {
+		s.Commits += r.TotalCommits
+		s.Compliant += r.CompliantCount
+		s.NonCompliant += r.NonCompliantCount
+		s.Waived += r.WaivedCount
+		s.ActionQueue += r.ActionQueueCount
+	}
+	if s.Commits > 0 {
+		s.CompliancePct = 100 * float64(s.Compliant) / float64(s.Commits)
+	}
+	prs := map[string]struct{}{}
+	authors := map[string]struct{}{}
+	for _, d := range details {
+		if d.PRNumber > 0 {
+			prs[fmt.Sprintf("%s/%s#%d", d.Org, d.Repo, d.PRNumber)] = struct{}{}
+		}
+		if d.AuthorLogin != "" {
+			authors[d.AuthorLogin] = struct{}{}
+		}
+	}
+	s.PRs = len(prs)
+	s.Authors = len(authors)
+	return s
+}
+
+func formatInt(n int) string {
+	// Thousands-separated, e.g. 880987 → "880,987".
+	if n < 0 {
+		return "-" + formatInt(-n)
+	}
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	return formatInt(n/1000) + "," + fmt.Sprintf("%03d", n%1000)
+}
+
+func pluralS(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
 func reportPeriod(opts ReportOpts) string {
 	if opts.Since.IsZero() && opts.Until.IsZero() {
 		return "Report period: all time"
@@ -250,7 +324,7 @@ func (b *xlsxBuilder) writeActionQueue(details []DetailRow) error {
 
 	headers := []string{
 		"Priority", "Severity", "Repo", "SHA", "PR #", "Author", "Merged By",
-		"Failing Rule", "Prescribed Action", "Days Since Commit", "Resolution", "Notes",
+		"Failing Rule", "Prescribed Action", "Context", "Committed", "Days Since Commit", "Resolution", "Notes",
 	}
 
 	type queueRow struct {
@@ -258,6 +332,7 @@ func (b *xlsxBuilder) writeActionQueue(details []DetailRow) error {
 		severity Severity
 		rule     string
 		action   string
+		context  string
 	}
 	var queue []queueRow
 	for _, d := range details {
@@ -266,7 +341,7 @@ func (b *xlsxBuilder) writeActionQueue(details []DetailRow) error {
 			continue
 		}
 		sev, rule, act := SynthesizeAction(d, o)
-		queue = append(queue, queueRow{d: d, severity: sev, rule: rule, action: act})
+		queue = append(queue, queueRow{d: d, severity: sev, rule: rule, action: act, context: SynthesizeContext(d)})
 	}
 
 	sort.SliceStable(queue, func(i, j int) bool {
@@ -294,14 +369,16 @@ func (b *xlsxBuilder) writeActionQueue(details []DetailRow) error {
 		f.SetCellValue(sheet, cellName(7, row), sanitizeCell(d.MergedByLogin))
 		f.SetCellValue(sheet, cellName(8, row), q.rule)
 		f.SetCellValue(sheet, cellName(9, row), sanitizeCell(q.action))
+		f.SetCellValue(sheet, cellName(10, row), sanitizeCell(q.context))
 		if !d.CommittedAt.IsZero() {
-			f.SetCellValue(sheet, cellName(10, row), int(now.Sub(d.CommittedAt).Hours()/24))
+			f.SetCellValue(sheet, cellName(11, row), d.CommittedAt.UTC().Format("2006-01-02"))
+			f.SetCellValue(sheet, cellName(12, row), int(now.Sub(d.CommittedAt).Hours()/24))
 		}
 		// Resolution + Notes intentionally blank for auditor use.
 	}
 
 	b.finalizeSheet(sheet, headers, len(queue))
-	widths := []float64{8, 10, 25, 12, 8, 18, 18, 22, 50, 12, 25, 30}
+	widths := []float64{8, 10, 25, 12, 8, 18, 18, 22, 50, 40, 12, 12, 25, 30}
 	applyWidths(f, sheet, widths)
 	return nil
 }

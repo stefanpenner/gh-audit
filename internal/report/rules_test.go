@@ -182,3 +182,119 @@ func TestSynthesizeActionPriority(t *testing.T) {
 		})
 	}
 }
+
+func TestSynthesizeContext(t *testing.T) {
+	cases := []struct {
+		name string
+		d    DetailRow
+		want string
+	}{
+		{
+			name: "no notable signals → empty",
+			d:    DetailRow{},
+			want: "",
+		},
+		{
+			name: "self-merged with squash strategy",
+			d: DetailRow{
+				AuthorLogin:   "alice",
+				MergedByLogin: "alice",
+				MergeStrategy: "squash",
+			},
+			want: "self-merged · squash",
+		},
+		{
+			name: "different author and merger — no self-merged signal",
+			d: DetailRow{
+				AuthorLogin:   "alice",
+				MergedByLogin: "bob",
+				MergeStrategy: "squash",
+			},
+			want: "squash",
+		},
+		{
+			name: "merge_strategy 'unknown' is suppressed",
+			d: DetailRow{
+				MergeStrategy: "unknown",
+			},
+			want: "",
+		},
+		{
+			name: "revert classifier ran but didn't grant waiver — surface verification + truncated target",
+			d: DetailRow{
+				IsCleanRevert:      false,
+				RevertVerification: "diff-mismatch",
+				RevertedSHA:        "8423dc092a39ebd38e6021e24055dc5fa5e8437a",
+			},
+			want: "revert: diff-mismatch (target 8423dc09)",
+		},
+		{
+			name: "clean revert (waiver granted) — no revert signal in context (R8 already handles it)",
+			d: DetailRow{
+				IsCleanRevert:      true,
+				RevertVerification: "diff-verified",
+				RevertedSHA:        "abc123",
+			},
+			want: "",
+		},
+		{
+			name: "revert_verification 'none' is suppressed",
+			d: DetailRow{
+				RevertVerification: "none",
+			},
+			want: "",
+		},
+		{
+			name: "stale + post-merge concern + multiple PRs + bot, all signals",
+			d: DetailRow{
+				HasStaleApproval:    true,
+				HasPostMergeConcern: true,
+				PRCount:             3,
+				IsBot:               true,
+			},
+			want: "stale · post-merge concern · 3 PRs · bot",
+		},
+		{
+			name: "PRCount==1 doesn't emit multi-PR signal",
+			d: DetailRow{
+				PRCount: 1,
+				IsBot:   true,
+			},
+			want: "bot",
+		},
+		{
+			name: "ordering: self-merged → strategy → revert → stale → post-merge → multi-pr → bot",
+			d: DetailRow{
+				AuthorLogin:         "alice",
+				MergedByLogin:       "alice",
+				MergeStrategy:       "merge",
+				RevertVerification:  "message-only",
+				RevertedSHA:         "deadbeef00000000",
+				HasStaleApproval:    true,
+				HasPostMergeConcern: true,
+				PRCount:             2,
+				IsBot:               true,
+			},
+			want: "self-merged · merge · revert: message-only (target deadbeef) · stale · post-merge concern · 2 PRs · bot",
+		},
+		{
+			name: "revert without target SHA — emits verification only, no parens",
+			d: DetailRow{
+				RevertVerification: "diff-mismatch",
+			},
+			want: "revert: diff-mismatch",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, SynthesizeContext(tc.d))
+		})
+	}
+}
+
+func TestTruncSHA8(t *testing.T) {
+	assert.Equal(t, "abcdef12", truncSHA8("abcdef1234567890"))
+	assert.Equal(t, "abc", truncSHA8("abc"))
+	assert.Equal(t, "", truncSHA8(""))
+	assert.Equal(t, "abcdef12", truncSHA8("abcdef12"))
+}

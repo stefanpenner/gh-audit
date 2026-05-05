@@ -168,6 +168,60 @@ func (o RuleOutcomes) RequiresAction() bool {
 	return true
 }
 
+// SynthesizeContext returns a compact, human-readable string of secondary
+// signals about a commit — the "fact pattern" the auditor needs to decide
+// what action to take, beyond the single primary failing rule that
+// SynthesizeAction picks. Empty when no signals are notable.
+//
+// Signals are ordered most-to-least decision-relevant, joined with " · ":
+//
+//   - self-merged          — author == merger (no independent gatekeeper)
+//   - squash / merge / rebase — merge strategy when known
+//   - revert: <verification> [target <sha8>] — clean-revert classifier ran
+//     but didn't grant the §8 waiver; surfaces *why* (diff-mismatch,
+//     message-only, etc.) so the auditor knows R8 was attempted
+//   - stale                 — approval exists but not on final commit
+//   - post-merge concern    — DISMISSED / CHANGES_REQUESTED after merge
+//   - multiple PRs          — commit associated with >1 PR (possible
+//     cherry-pick or backport)
+//   - bot                   — author is a bot account
+func SynthesizeContext(d DetailRow) string {
+	var parts []string
+	if d.AuthorLogin != "" && d.MergedByLogin != "" && d.AuthorLogin == d.MergedByLogin {
+		parts = append(parts, "self-merged")
+	}
+	if d.MergeStrategy != "" && d.MergeStrategy != "unknown" {
+		parts = append(parts, d.MergeStrategy)
+	}
+	if d.RevertVerification != "" && d.RevertVerification != "none" && !d.IsCleanRevert {
+		s := "revert: " + d.RevertVerification
+		if d.RevertedSHA != "" {
+			s += " (target " + truncSHA8(d.RevertedSHA) + ")"
+		}
+		parts = append(parts, s)
+	}
+	if d.HasStaleApproval {
+		parts = append(parts, "stale")
+	}
+	if d.HasPostMergeConcern {
+		parts = append(parts, "post-merge concern")
+	}
+	if d.PRCount > 1 {
+		parts = append(parts, fmt.Sprintf("%d PRs", d.PRCount))
+	}
+	if d.IsBot {
+		parts = append(parts, "bot")
+	}
+	return strings.Join(parts, " · ")
+}
+
+func truncSHA8(sha string) string {
+	if len(sha) <= 8 {
+		return sha
+	}
+	return sha[:8]
+}
+
 // SynthesizeAction picks a primary failing rule and returns (severity, rule
 // label, prescribed action). Returns ("", "", "") for compliant commits.
 //
