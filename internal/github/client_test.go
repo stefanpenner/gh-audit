@@ -73,7 +73,8 @@ func TestListOrgRepos(t *testing.T) {
 						"default_branch": "master",
 						"archived":       false,
 					}
-					w.Header().Set("Link", fmt.Sprintf(`<%s/orgs/testorg/repos?page=2>; rel="next"`, "http://"+r.Host))
+					base := "http://" + r.Host + "/orgs/testorg/repos"
+					w.Header().Set("Link", fmt.Sprintf(`<%s?page=2>; rel="next", <%s?page=2>; rel="last"`, base, base))
 					json.NewEncoder(w).Encode(repos)
 				} else {
 					repos := []map[string]any{

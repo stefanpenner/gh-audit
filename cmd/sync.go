@@ -20,12 +20,19 @@ import (
 
 func newSyncCmd() *cobra.Command {
 	var (
-		orgs            []string
-		repos           []string
-		since           string
-		until           string
-		concurrency     int
-		telemetryOutput string
+		orgs                   []string
+		repos                  []string
+		since                  string
+		until                  string
+		concurrency            int
+		telemetryOutput        string
+		orgReposCacheFreshness time.Duration
+		// orgReposCacheFreshnessSet records whether the user passed the
+		// flag, so we can distinguish "leave config default" (unset)
+		// from "explicitly disabled" (--org-repos-cache=0). Cobra
+		// doesn't expose Changed() to RunE without a handle to the
+		// flag; we shadow that with a small bool the closure can read.
+		orgReposCacheFreshnessSet bool
 	)
 
 	cmd := &cobra.Command{
@@ -41,6 +48,14 @@ func newSyncCmd() *cobra.Command {
 			defer dbConn.Close()
 
 			syncCfg, err := buildSyncConfig(cfg, orgs, repos, since, until, concurrency)
+			if orgReposCacheFreshnessSet {
+				// Negative durations (and zero) explicitly disable
+				// the cache. The pipeline reads
+				// `OrgReposCacheFreshness > 0` as the trigger to
+				// consult the cache; any non-positive value
+				// short-circuits to live fetch every time.
+				syncCfg.OrgReposCacheFreshness = orgReposCacheFreshness
+			}
 			if err != nil {
 				return err
 			}
@@ -214,6 +229,13 @@ func newSyncCmd() *cobra.Command {
 	cmd.Flags().StringVar(&since, "since", "", "sync since date (ISO 8601)")
 	cmd.Flags().StringVar(&until, "until", "", "sync until date (ISO 8601)")
 	cmd.Flags().IntVar(&concurrency, "concurrency", 0, "max concurrent repo syncs (default from config)")
+	cmd.Flags().DurationVar(&orgReposCacheFreshness, "org-repos-cache", 0,
+		`how long to trust a cached /orgs/{org}/repos enumeration before re-fetching `+
+			`(e.g. "24h", "1h30m", "0s" to disable). Overrides sync.org_repos_cache_freshness `+
+			`in the config file. Default is taken from config (24h if unset there).`)
+	cmd.PreRun = func(c *cobra.Command, _ []string) {
+		orgReposCacheFreshnessSet = c.Flag("org-repos-cache").Changed
+	}
 	cmd.Flags().StringVar(&telemetryOutput, "telemetry-output", "",
 		`path to append JSONL telemetry records (one line per tick). `+
 			`Default: "telemetry.jsonl" next to the DB. Use "-" to disable.`)
@@ -322,10 +344,11 @@ func resolveDBPath(cfg *config.Config) string {
 
 func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until string, concurrency int) (*sync.SyncConfig, error) {
 	syncCfg := &sync.SyncConfig{
-		Concurrency:         cfg.Sync.Concurrency,
-		EnrichConcurrency:   cfg.Sync.EnrichConcurrency,
-		InitialLookbackDays: cfg.Sync.InitialLookbackDays,
-		ExemptAuthors:       cfg.Exemptions.Authors,
+		Concurrency:            cfg.Sync.Concurrency,
+		EnrichConcurrency:      cfg.Sync.EnrichConcurrency,
+		InitialLookbackDays:    cfg.Sync.InitialLookbackDays,
+		OrgReposCacheFreshness: cfg.Sync.OrgReposCacheFreshness,
+		ExemptAuthors:          cfg.Exemptions.Authors,
 	}
 
 	for _, rc := range cfg.AuditRules.RequiredChecks {

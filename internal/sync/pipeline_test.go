@@ -195,6 +195,17 @@ func (m *mockStore) UpdateCommitStats(_ context.Context, org, repo, sha string, 
 	return nil
 }
 
+func (m *mockStore) CacheOrgRepos(_ context.Context, _ string, _ []model.RepoInfo) error {
+	return nil
+}
+
+func (m *mockStore) GetCachedOrgRepos(_ context.Context, _ string, _ time.Duration) ([]model.RepoInfo, bool, error) {
+	// Mock store: cache always misses, force the live ListOrgRepos
+	// path through the mock source so existing pipeline tests
+	// continue to exercise the discovery code.
+	return nil, false, nil
+}
+
 func (m *mockStore) GetUnauditedCommits(_ context.Context, org, repo string, since, until time.Time) ([]model.Commit, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

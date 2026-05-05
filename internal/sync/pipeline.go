@@ -55,6 +55,13 @@ type Store interface {
 	// Zero-valued since/until disables that side of the bound; both zero =
 	// unbounded (mops up the full historical backlog).
 	GetUnauditedCommits(ctx context.Context, org, repo string, since, until time.Time) ([]model.Commit, error)
+	// CacheOrgRepos atomically replaces the cached repo list for org.
+	// Used after a live ListOrgRepos enumeration to populate the cache.
+	CacheOrgRepos(ctx context.Context, org string, repos []model.RepoInfo) error
+	// GetCachedOrgRepos returns the cached repo list for org if it's
+	// fresher than `freshness`. Returns (nil, false, nil) on cache
+	// miss/stale; the pipeline then falls through to a live fetch.
+	GetCachedOrgRepos(ctx context.Context, org string, freshness time.Duration) ([]model.RepoInfo, bool, error)
 }
 
 // SyncConfig controls the sync pipeline behaviour.
@@ -64,6 +71,12 @@ type SyncConfig struct {
 	EnrichConcurrency   int
 	Since               time.Time // override, zero means use cursor
 	Until               time.Time // override, zero means now
+	// OrgReposCacheFreshness is how long a cached /orgs/{org}/repos
+	// listing is trusted before we re-fetch. Zero disables the cache
+	// entirely (always live-enumerate); negative values are treated as
+	// zero. The default for sync runs is 24h (set in cmd/sync.go via
+	// the config validator).
+	OrgReposCacheFreshness time.Duration
 	InitialLookbackDays int
 	ExemptAuthors       []model.ExemptAuthor
 	RequiredChecks      []RequiredCheck
@@ -541,13 +554,54 @@ func (p *Pipeline) Run(ctx context.Context) error {
 			continue
 		}
 
-		repos, err := p.source.ListOrgRepos(ctx, orgCfg.Name)
-		if err != nil {
-			return fmt.Errorf("listing repos for org %s: %w", orgCfg.Name, err)
+		// DB cache short-circuit: a freshly-enumerated repo list is
+		// stable on the timescale of org membership churn (new
+		// services land days/weeks apart, not seconds), so trusting
+		// a 24h-old listing skips the 60-90s ListOrgRepos call on
+		// every cron run. Cache miss / stale falls through to live
+		// fetch, which we then write back so the *next* run hits
+		// the fast path. Set OrgReposCacheFreshness to 0 to force
+		// live fetch every time.
+		var (
+			repos       []model.RepoInfo
+			discoveredVia = "api"
+		)
+		listStart := time.Now()
+		if p.config.OrgReposCacheFreshness > 0 {
+			cached, fresh, cacheErr := p.store.GetCachedOrgRepos(ctx, orgCfg.Name, p.config.OrgReposCacheFreshness)
+			if cacheErr != nil {
+				p.logger.Warn("org_repos_cache read failed; falling through to live fetch",
+					"org", orgCfg.Name, "error", cacheErr)
+			} else if fresh {
+				repos = cached
+				discoveredVia = "cache"
+			}
+		}
+		if repos == nil {
+			fetched, err := p.source.ListOrgRepos(ctx, orgCfg.Name)
+			if err != nil {
+				return fmt.Errorf("listing repos for org %s: %w", orgCfg.Name, err)
+			}
+			repos = fetched
+			if p.config.OrgReposCacheFreshness > 0 {
+				if err := p.store.CacheOrgRepos(ctx, orgCfg.Name, fetched); err != nil {
+					// Cache write failure is non-fatal — proceed
+					// with the live data and log so the next run
+					// can be investigated.
+					p.logger.Warn("org_repos_cache write failed; proceeding with live data",
+						"org", orgCfg.Name, "error", err)
+				}
+			}
 		}
 
 		filtered := filterRepos(repos, orgCfg)
-		p.logger.Info("discovered repos", "org", orgCfg.Name, "total", len(repos), "after_filter", len(filtered))
+		p.logger.Info("discovered repos",
+			"org", orgCfg.Name,
+			"total", len(repos),
+			"after_filter", len(filtered),
+			"via", discoveredVia,
+			"duration", time.Since(listStart).Round(time.Millisecond),
+		)
 		for _, r := range filtered {
 			allRepos = append(allRepos, repoWithOrg{repo: r, orgCfg: orgCfg})
 		}

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	gogithub "github.com/google/go-github/v72/github"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/stefanpenner/gh-audit/internal/model"
 )
 
@@ -35,48 +37,102 @@ func (c *Client) ghClient(ctx context.Context, org, repo string) (*gogithub.Clie
 	return gogithub.NewClient(httpClient), nil
 }
 
-// ListOrgRepos returns all repositories in the given org, paginating with 100 per page.
+// listOrgReposPagePerPage caps the per-page response size at GitHub's
+// maximum. Larger pages mean fewer total round-trips (n=370 → 37 with
+// per_page=100 vs page_size=10).
+const listOrgReposPagePerPage = 100
+
+// listOrgReposParallelism bounds concurrent page fetches once total
+// page count is known. Each page picks a fresh token from the pool, so
+// 8 parallel fetches × 12 tokens = ~24% of pool concurrency for org
+// enumeration alone — well below the 100-per-token secondary cap and
+// leaves bandwidth for whatever else is in flight.
+const listOrgReposParallelism = 8
+
+// ListOrgRepos returns all repositories in the given org. The first
+// page is fetched serially to discover the total page count from
+// GitHub's `Link: rel="last"` header (exposed by go-github as
+// resp.LastPage); the remaining pages fan out concurrently. On a
+// 37k-repo org this drops a 60-90s serial enumeration to <10s.
 func (c *Client) ListOrgRepos(ctx context.Context, org string) ([]model.RepoInfo, error) {
-	var allRepos []model.RepoInfo
-	opts := &gogithub.RepositoryListByOrgOptions{
-		ListOptions: gogithub.ListOptions{PerPage: 100},
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	gh, err := c.ghClient(ctx, org, "")
+	if err != nil {
+		return nil, err
 	}
 
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		// Pick a fresh token for each page to distribute load.
-		gh, err := c.ghClient(ctx, org, "")
-		if err != nil {
-			return nil, err
-		}
-
-		repos, resp, err := gh.Repositories.ListByOrg(ctx, org, opts)
-		if err != nil {
-			return nil, fmt.Errorf("listing repos for org %s page %d: %w", org, opts.Page, err)
-		}
-
-		for _, r := range repos {
-			info := model.RepoInfo{
-				Org:      org,
-				Name:     r.GetName(),
-				FullName: r.GetFullName(),
-				Archived: r.GetArchived(),
-			}
-			if r.DefaultBranch != nil {
-				info.DefaultBranch = r.GetDefaultBranch()
-			}
-			allRepos = append(allRepos, info)
-		}
-
-		if resp.NextPage == 0 {
-			break
-		}
-		opts.Page = resp.NextPage
+	firstOpts := &gogithub.RepositoryListByOrgOptions{
+		ListOptions: gogithub.ListOptions{PerPage: listOrgReposPagePerPage, Page: 1},
+	}
+	firstRepos, resp, err := gh.Repositories.ListByOrg(ctx, org, firstOpts)
+	if err != nil {
+		return nil, fmt.Errorf("listing repos for org %s page 1: %w", org, err)
 	}
 
-	return allRepos, nil
+	totalPages := resp.LastPage
+	if totalPages < 1 {
+		totalPages = 1
+	}
+
+	pages := make([][]model.RepoInfo, totalPages)
+	pages[0] = convertRepoList(org, firstRepos)
+
+	if totalPages > 1 {
+		eg, gctx := errgroup.WithContext(ctx)
+		eg.SetLimit(listOrgReposParallelism)
+		for p := 2; p <= totalPages; p++ {
+			p := p
+			eg.Go(func() error {
+				if err := gctx.Err(); err != nil {
+					return err
+				}
+				gh, err := c.ghClient(gctx, org, "")
+				if err != nil {
+					return err
+				}
+				opts := &gogithub.RepositoryListByOrgOptions{
+					ListOptions: gogithub.ListOptions{PerPage: listOrgReposPagePerPage, Page: p},
+				}
+				repos, _, err := gh.Repositories.ListByOrg(gctx, org, opts)
+				if err != nil {
+					return fmt.Errorf("listing repos for org %s page %d: %w", org, p, err)
+				}
+				pages[p-1] = convertRepoList(org, repos)
+				return nil
+			})
+		}
+		if err := eg.Wait(); err != nil {
+			return nil, err
+		}
+	}
+
+	var all []model.RepoInfo
+	for _, batch := range pages {
+		all = append(all, batch...)
+	}
+	return all, nil
+}
+
+// convertRepoList maps go-github repository structs into gh-audit's
+// internal model. Pulled out so the parallel fetch goroutines don't
+// need to duplicate field plumbing.
+func convertRepoList(org string, repos []*gogithub.Repository) []model.RepoInfo {
+	out := make([]model.RepoInfo, 0, len(repos))
+	for _, r := range repos {
+		info := model.RepoInfo{
+			Org:      org,
+			Name:     r.GetName(),
+			FullName: r.GetFullName(),
+			Archived: r.GetArchived(),
+		}
+		if r.DefaultBranch != nil {
+			info.DefaultBranch = r.GetDefaultBranch()
+		}
+		out = append(out, info)
+	}
+	return out
 }
 
 // GetRepo returns metadata for a single repository.

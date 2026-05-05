@@ -199,19 +199,43 @@ audit_rules:
 
 sync:
   concurrency: 10
+  enrich_concurrency: 16
   initial_lookback_days: 90
+  org_repos_cache_freshness: 24h   # default; "0s" disables the cache
 
 exemptions:
   authors:
-    # [bot] accounts
-    - "dependabot[bot]"
-    - "renovate[bot]"
-    - "li-auto-merge[bot]"
-    # Automation accounts — match on the full login GitHub returns (e.g. in
-    # GHES enterprise deployments these often carry an org/domain suffix).
-    - "bot-translation"
-    - "bot-i18n-github_LinkedIn"
+    # Each entry is a structured map. The matching key is `id` (the
+    # immutable GitHub numeric account id); `login` is display
+    # metadata. Bare-string entries are no longer accepted — see the
+    # 2026-05-04 schema migration in Architecture.md §1 for why.
+    - login: "dependabot[bot]"
+      id: 49699333
+      type: Bot
+    - login: "renovate[bot]"
+      id: 2740337
+      type: Bot
+    - login: "li-auto-merge[bot]"
+      id: 127378383
+      type: Bot
+    # Service accounts. id is canonical; login can be any GitHub
+    # username and is treated as display only. Comments are
+    # preserved through round-trip and are useful for "was: <old>,
+    # renamed YYYY-MM" notes.
+    - login: svc-tg_LinkedIn
+      id: 12345678  # replace with the real numeric id
+      type: User
+      name: Trunk-Guardian
+      comment: was svc-tg, renamed when account migrated to _LinkedIn form
 ```
+
+### `sync.org_repos_cache_freshness`
+
+Caps how long a cached `/orgs/{org}/repos` enumeration is trusted before re-fetching. Default `24h`; the in-pipeline `ListOrgRepos` short-circuits to a DuckDB-backed cache when the cached listing is fresher than this window, skipping the 60-90s parallel-paginated enumeration on every subsequent run.
+
+Override at the command line with `gh-audit sync --org-repos-cache=<duration>` (e.g. `--org-repos-cache=1h` for tighter freshness, `--org-repos-cache=0s` to disable the cache and always live-fetch). The flag overrides the config file value.
+
+When you add or remove a repo in the org and want gh-audit to see it immediately, pass `--org-repos-cache=0s` for that one run.
 
 The exempt shortcut only fires when every PR-branch commit author is also in this list. See [Exempt authors](#exempt-authors).
 

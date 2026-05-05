@@ -112,6 +112,21 @@ const (
 		PRIMARY KEY (org, repo, sha, branch)
 	)`
 
+	// org_repos_cache memoises the result of GitHub's
+	// /orgs/{org}/repos enumeration. fetched_at is the same on every
+	// row in a given org because cache replacement is atomic per-org
+	// (DELETE WHERE org=? then INSERT). Reads filter against
+	// fetched_at < now - freshness to skip the cache.
+	createOrgReposCache = `CREATE TABLE IF NOT EXISTS org_repos_cache (
+		org            TEXT NOT NULL,
+		name           TEXT NOT NULL,
+		full_name      TEXT,
+		default_branch TEXT,
+		archived       BOOLEAN,
+		fetched_at     TIMESTAMP NOT NULL,
+		PRIMARY KEY (org, name)
+	)`
+
 	createAuditResults = `CREATE TABLE IF NOT EXISTS audit_results (
 		org                  TEXT NOT NULL,
 		repo                 TEXT NOT NULL,
@@ -183,4 +198,5 @@ var allTables = []string{
 	createReviews,
 	createCheckRuns,
 	createAuditResults,
+	createOrgReposCache,
 }

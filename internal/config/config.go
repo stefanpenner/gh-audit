@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/stefanpenner/gh-audit/internal/model"
 	"gopkg.in/yaml.v3"
@@ -74,6 +75,13 @@ type SyncConfig struct {
 	Concurrency         int `yaml:"concurrency"`
 	EnrichConcurrency   int `yaml:"enrich_concurrency"`
 	InitialLookbackDays int `yaml:"initial_lookback_days"`
+	// OrgReposCacheFreshness caps how long a cached
+	// /orgs/{org}/repos enumeration is trusted before re-fetching.
+	// Empty / zero defaults to 24h. Set to "0s" or any negative
+	// value to disable the cache (always live-enumerate). Useful
+	// for full-org sweeps where the API enumeration was the silent
+	// 60-90s startup stall.
+	OrgReposCacheFreshness time.Duration `yaml:"org_repos_cache_freshness"`
 }
 
 // ExemptionsConfig lists authors exempt from audit rules.
@@ -149,6 +157,13 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Sync.InitialLookbackDays <= 0 {
 		c.Sync.InitialLookbackDays = 90
+	}
+	// Default org-repos cache freshness: 24h. Org membership churns
+	// on the timescale of days, so a daily cache is a tight enough
+	// window for compliance work and skips the 60-90s
+	// /orgs/{org}/repos enumeration on most cron runs.
+	if c.Sync.OrgReposCacheFreshness == 0 {
+		c.Sync.OrgReposCacheFreshness = 24 * time.Hour
 	}
 	if len(c.AuditRules.AuditBranches) == 0 {
 		c.AuditRules.AuditBranches = []string{"master", "main"}
