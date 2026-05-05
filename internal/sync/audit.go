@@ -39,12 +39,34 @@ type RequiredCheck struct {
 	Conclusion string
 }
 
-// StatsFetcher resolves a commit's additions/deletions. Used by EvaluateCommit
-// for the empty-commit fallback so we only pay for GetCommitDetail when no
-// other compliance path has succeeded. Implementations should check the DB
-// first and fall through to the REST API; returning any error leaves the
-// stats at whatever the caller passed in (typically zero).
-type StatsFetcher func(org, repo, sha string) (additions, deletions int, err error)
+// StatsTrigger labels which audit rule triggered a lazy stats lookup.
+// Threaded through StatsFetcher so the implementation can split the
+// lazy commit_detail counter by trigger — useful for deciding whether
+// eager batched prefetching of additions/deletions would pay off, or
+// whether a different path (§5 PR-branch-author empty-stats lookup)
+// dominates and needs separate handling.
+type StatsTrigger string
+
+const (
+	// StatsTriggerEmptyCommit is rule §2's empty-commit fallback —
+	// fired when an otherwise non-compliant commit has zero local
+	// additions/deletions and we need GetCommitDetail to confirm
+	// before letting the empty-commit waiver fire.
+	StatsTriggerEmptyCommit StatsTrigger = "empty"
+	// StatsTriggerSelfApproval is rule §5's "did this PR-branch
+	// author actually contribute code?" disambiguation — fired
+	// when a reviewer's PR-branch commits all look zero-stat
+	// locally and we need GetCommitDetail to tell whether to drop
+	// them from the self-approval check.
+	StatsTriggerSelfApproval StatsTrigger = "self"
+)
+
+// StatsFetcher resolves a commit's additions/deletions. Used by
+// EvaluateCommit for the §2 empty-commit fallback and the §5 PR-branch-
+// author empty-stats disambiguation. Implementations should check the
+// DB first and fall through to the REST API; returning any error
+// leaves the stats at whatever the caller passed in (typically zero).
+type StatsFetcher func(trigger StatsTrigger, org, repo, sha string) (additions, deletions int, err error)
 
 // ----- Orchestration -----
 
@@ -214,7 +236,7 @@ func applyEmptyCommitFallback(result *model.AuditResult, commit *model.Commit, f
 		return false
 	}
 	if fetchStats != nil {
-		if adds, dels, err := fetchStats(commit.Org, commit.Repo, commit.SHA); err == nil {
+		if adds, dels, err := fetchStats(StatsTriggerEmptyCommit, commit.Org, commit.Repo, commit.SHA); err == nil {
 			commit.Additions, commit.Deletions = adds, dels
 		}
 	}
@@ -646,7 +668,7 @@ func hasNonEmptyContribution(org, repo string, commits []model.Commit, fetchStat
 		return true
 	}
 	for _, c := range commits {
-		a, d, err := fetchStats(org, repo, c.SHA)
+		a, d, err := fetchStats(StatsTriggerSelfApproval, org, repo, c.SHA)
 		if err != nil {
 			return true
 		}

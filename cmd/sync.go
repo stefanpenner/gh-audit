@@ -73,17 +73,27 @@ func newSyncCmd() *cobra.Command {
 			})
 			pipeline.SetAPIStatsFn(func() sync.APIStatsSnapshot {
 				return sync.APIStatsSnapshot{
-					CommitDetailEager:  enricher.Stats.CommitDetailEager.Load(),
-					CommitDetailLazy:   enricher.Stats.CommitDetailLazy.Load(),
-					CommitPRs:          enricher.Stats.CommitPRs.Load(),
+					CommitDetailEager:     enricher.Stats.CommitDetailEager.Load(),
+					CommitDetailLazyEmpty: enricher.Stats.CommitDetailLazyEmpty.Load(),
+					CommitDetailLazySelf:  enricher.Stats.CommitDetailLazySelf.Load(),
+					CommitPRs:             enricher.Stats.CommitPRs.Load(),
 					PRDetail:           enricher.Stats.PRDetail.Load(),
 					Reviews:            enricher.Stats.Reviews.Load(),
 					CheckRuns:          enricher.Stats.CheckRuns.Load(),
 					PRCommits:          enricher.Stats.PRCommits.Load(),
-					RevertVerification: enricher.Stats.RevertVerification.Load(),
-					PRRecovered:        enricher.Stats.PRRecovered.Load(),
-					CacheHits:          enricher.Stats.CacheHits.Load(),
-					DBHits:             enricher.Stats.DBHits.Load(),
+					RevertVerification:         enricher.Stats.RevertVerification.Load(),
+					PRRecovered:                enricher.Stats.PRRecovered.Load(),
+					CacheHits:                  enricher.Stats.CacheHits.Load(),
+					DBHits:                     enricher.Stats.DBHits.Load(),
+					CommitDetailEagerNanos:     enricher.Stats.CommitDetailEagerNanos.Load(),
+					CommitDetailLazyEmptyNanos: enricher.Stats.CommitDetailLazyEmptyNanos.Load(),
+					CommitDetailLazySelfNanos:  enricher.Stats.CommitDetailLazySelfNanos.Load(),
+					CommitPRsNanos:             enricher.Stats.CommitPRsNanos.Load(),
+					PRDetailNanos:              enricher.Stats.PRDetailNanos.Load(),
+					ReviewsNanos:               enricher.Stats.ReviewsNanos.Load(),
+					CheckRunsNanos:             enricher.Stats.CheckRunsNanos.Load(),
+					PRCommitsNanos:             enricher.Stats.PRCommitsNanos.Load(),
+					RevertVerificationNanos:    enricher.Stats.RevertVerificationNanos.Load(),
 				}
 			})
 
@@ -94,7 +104,7 @@ func newSyncCmd() *cobra.Command {
 			// no ambient context; use the cobra command's context so the REST
 			// call honours SIGINT/SIGTERM.
 			ctxForFetcher := cmd.Context()
-			pipeline.SetStatsFetcher(func(org, repo, sha string) (int, int, error) {
+			pipeline.SetStatsFetcher(func(trigger sync.StatsTrigger, org, repo, sha string) (int, int, error) {
 				if commits, err := dbConn.GetCommitsBySHA(ctxForFetcher, org, repo, []string{sha}); err == nil {
 					for _, c := range commits {
 						if c.Additions != 0 || c.Deletions != 0 {
@@ -103,8 +113,27 @@ func newSyncCmd() *cobra.Command {
 						}
 					}
 				}
-				enricher.Stats.CommitDetailLazy.Add(1)
+				// Split the lazy commit_detail counter by audit-rule
+				// trigger. This is the empirical signal we use to decide
+				// whether eager batched additions/deletions prefetching
+				// during enrichment would pay off (high "empty" share),
+				// or whether the §5 self-approval lazy lookup dominates
+				// and warrants a different optimization.
+				switch trigger {
+				case sync.StatsTriggerEmptyCommit:
+					enricher.Stats.CommitDetailLazyEmpty.Add(1)
+				case sync.StatsTriggerSelfApproval:
+					enricher.Stats.CommitDetailLazySelf.Add(1)
+				}
+				startLazy := time.Now()
 				detail, err := client.GetCommitDetail(ctxForFetcher, org, repo, sha)
+				dur := time.Since(startLazy).Nanoseconds()
+				switch trigger {
+				case sync.StatsTriggerEmptyCommit:
+					enricher.Stats.CommitDetailLazyEmptyNanos.Add(dur)
+				case sync.StatsTriggerSelfApproval:
+					enricher.Stats.CommitDetailLazySelfNanos.Add(dur)
+				}
 				if err != nil {
 					return 0, 0, err
 				}
@@ -167,7 +196,8 @@ func newSyncCmd() *cobra.Command {
 				"cache_hits", s.CacheHits.Load(),
 				"db_hits", s.DBHits.Load(),
 				"commit_detail_eager", s.CommitDetailEager.Load(),
-				"commit_detail_lazy", s.CommitDetailLazy.Load(),
+				"commit_detail_lazy_empty", s.CommitDetailLazyEmpty.Load(),
+				"commit_detail_lazy_self", s.CommitDetailLazySelf.Load(),
 				"commit_prs", s.CommitPRs.Load(),
 				"pr_detail", s.PRDetail.Load(),
 				"reviews", s.Reviews.Load(),

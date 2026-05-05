@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -104,10 +105,12 @@ type APIStatsSnapshot struct {
 	// CommitDetailEager: GetCommitDetail called from enrichment
 	// (caching.go::getCommit). Defensive fallback for missing DB rows.
 	CommitDetailEager int64
-	// CommitDetailLazy: GetCommitDetail called from the audit's
-	// statsFetcher closure (cmd/sync.go) — the §2 empty-commit
-	// fallback and §5 PR-branch-author empty-stats disambiguation.
-	CommitDetailLazy   int64
+	// CommitDetailLazyEmpty: GetCommitDetail fired by audit rule §2's
+	// empty-commit fallback. The dominant lazy path on cold sweeps.
+	CommitDetailLazyEmpty int64
+	// CommitDetailLazySelf: GetCommitDetail fired by audit rule §5's
+	// PR-branch-author empty-stats disambiguation. Lower volume.
+	CommitDetailLazySelf  int64
 	CommitPRs          int64
 	PRDetail           int64
 	Reviews            int64
@@ -116,6 +119,20 @@ type APIStatsSnapshot struct {
 	RevertVerification int64
 	CacheHits          int64
 	DBHits             int64
+
+	// Per-endpoint cumulative wall time (nanoseconds). Mean latency
+	// is Nanos/count. Useful for spotting a slow endpoint that's
+	// dragging the sweep tail (vs a high-volume endpoint that just
+	// has a lot of cheap calls).
+	CommitDetailEagerNanos     int64
+	CommitDetailLazyEmptyNanos int64
+	CommitDetailLazySelfNanos  int64
+	CommitPRsNanos             int64
+	PRDetailNanos              int64
+	ReviewsNanos               int64
+	CheckRunsNanos             int64
+	PRCommitsNanos             int64
+	RevertVerificationNanos    int64
 	// PRRecovered counts commit→PR links repaired through the parse +
 	// canonical-verify fallback when GitHub's commit→PR reverse index
 	// returned empty. Excluded from Total() — the recovery rides on an
@@ -125,9 +142,21 @@ type APIStatsSnapshot struct {
 
 // Total is the sum of API-call fields (excludes cache/DB hits).
 func (s APIStatsSnapshot) Total() int64 {
-	return s.CommitDetailEager + s.CommitDetailLazy +
+	return s.CommitDetailEager +
+		s.CommitDetailLazyEmpty + s.CommitDetailLazySelf +
 		s.CommitPRs + s.PRDetail +
 		s.Reviews + s.CheckRuns + s.PRCommits + s.RevertVerification
+}
+
+// meanMs returns the mean latency in milliseconds for an endpoint
+// given its cumulative nanosecond budget and call count. Returns 0
+// when the endpoint hasn't fired (count == 0) so the field is
+// well-defined for log/JSON consumers.
+func meanMs(nanos, count int64) float64 {
+	if count <= 0 {
+		return 0
+	}
+	return float64(nanos) / float64(count) / 1e6
 }
 
 // APIStatsFn returns the enricher's current API-call stats. Optional; nil
@@ -292,7 +321,8 @@ func (p *Pipeline) runTelemetry(ctx context.Context, done <-chan struct{}) {
 					"elapsed", time.Duration(elapsedSec*float64(time.Second)).Round(time.Second),
 					"total_api", api.Total(),
 					"commit_detail_eager", api.CommitDetailEager,
-					"commit_detail_lazy", api.CommitDetailLazy,
+					"commit_detail_lazy_empty", api.CommitDetailLazyEmpty,
+					"commit_detail_lazy_self", api.CommitDetailLazySelf,
 					"commit_prs", api.CommitPRs,
 					"pr_detail", api.PRDetail,
 					"reviews", api.Reviews,
@@ -300,11 +330,24 @@ func (p *Pipeline) runTelemetry(ctx context.Context, done <-chan struct{}) {
 					"pr_commits", api.PRCommits,
 					"revert_verify", api.RevertVerification,
 					"pr_recovered", api.PRRecovered,
+					// Mean per-call latency (ms). Total/count rather
+					// than histograms — coarse but enough to surface
+					// a slow endpoint that's gating the sweep tail.
+					"avg_ms_commit_detail_eager", fmt.Sprintf("%.1f", meanMs(api.CommitDetailEagerNanos, api.CommitDetailEager)),
+					"avg_ms_commit_detail_lazy_empty", fmt.Sprintf("%.1f", meanMs(api.CommitDetailLazyEmptyNanos, api.CommitDetailLazyEmpty)),
+					"avg_ms_commit_detail_lazy_self", fmt.Sprintf("%.1f", meanMs(api.CommitDetailLazySelfNanos, api.CommitDetailLazySelf)),
+					"avg_ms_commit_prs", fmt.Sprintf("%.1f", meanMs(api.CommitPRsNanos, api.CommitPRs)),
+					"avg_ms_pr_detail", fmt.Sprintf("%.1f", meanMs(api.PRDetailNanos, api.PRDetail)),
+					"avg_ms_reviews", fmt.Sprintf("%.1f", meanMs(api.ReviewsNanos, api.Reviews)),
+					"avg_ms_check_runs", fmt.Sprintf("%.1f", meanMs(api.CheckRunsNanos, api.CheckRuns)),
+					"avg_ms_pr_commits", fmt.Sprintf("%.1f", meanMs(api.PRCommitsNanos, api.PRCommits)),
+					"avg_ms_revert_verify", fmt.Sprintf("%.1f", meanMs(api.RevertVerificationNanos, api.RevertVerification)),
 					"cache_hits", api.CacheHits,
 					"db_hits", api.DBHits,
 					"delta_total", api.Total()-lastAPI.Total(),
 					"delta_commit_detail_eager", api.CommitDetailEager-lastAPI.CommitDetailEager,
-					"delta_commit_detail_lazy", api.CommitDetailLazy-lastAPI.CommitDetailLazy,
+					"delta_commit_detail_lazy_empty", api.CommitDetailLazyEmpty-lastAPI.CommitDetailLazyEmpty,
+					"delta_commit_detail_lazy_self", api.CommitDetailLazySelf-lastAPI.CommitDetailLazySelf,
 					"delta_commit_prs", api.CommitPRs-lastAPI.CommitPRs,
 					"delta_pr_detail", api.PRDetail-lastAPI.PRDetail,
 					"delta_reviews", api.Reviews-lastAPI.Reviews,
@@ -377,7 +420,8 @@ type telemetryRecord struct {
 	// API endpoint breakdown (present only if apiStats is wired)
 	TotalAPI           *int64 `json:"total_api,omitempty"`
 	CommitDetailEager  *int64 `json:"commit_detail_eager,omitempty"`
-	CommitDetailLazy   *int64 `json:"commit_detail_lazy,omitempty"`
+	CommitDetailLazyEmpty *int64 `json:"commit_detail_lazy_empty,omitempty"`
+	CommitDetailLazySelf  *int64 `json:"commit_detail_lazy_self,omitempty"`
 	CommitPRs          *int64 `json:"commit_prs,omitempty"`
 	PRDetail           *int64 `json:"pr_detail,omitempty"`
 	Reviews            *int64 `json:"reviews,omitempty"`
@@ -425,7 +469,8 @@ func buildTelemetryRecord(now time.Time, elapsedSec, windowSec float64, final bo
 		tot := a.Total()
 		r.TotalAPI = &tot
 		r.CommitDetailEager = &a.CommitDetailEager
-		r.CommitDetailLazy = &a.CommitDetailLazy
+		r.CommitDetailLazyEmpty = &a.CommitDetailLazyEmpty
+		r.CommitDetailLazySelf = &a.CommitDetailLazySelf
 		r.CommitPRs = &a.CommitPRs
 		r.PRDetail = &a.PRDetail
 		r.Reviews = &a.Reviews
@@ -553,29 +598,58 @@ func (p *Pipeline) syncRepo(ctx context.Context, repo model.RepoInfo, orgCfg Org
 		branches = []string{repo.DefaultBranch}
 	}
 
-	var errs []error
-	for _, branch := range branches {
-		if err := p.syncRepoBranch(ctx, repo, branch, writer); err != nil {
-			if errors.Is(err, context.Canceled) && ctx.Err() != nil {
-				p.logger.Debug("sync branch aborted (cascade)", "org", repo.Org, "repo", repo.Name, "branch", branch)
-			} else {
-				p.logger.Error("sync branch failed", "org", repo.Org, "repo", repo.Name, "branch", branch, "error", err)
+	// Branches in audit_branches (typically master + main + release/* +
+	// HF_BF_*) are independent — each runs its own fetch / enrich /
+	// audit pipeline keyed on (org, repo, branch). Iterating serially
+	// turned multi-branch repos into the long-tail wall-time gate
+	// (sum of per-branch times instead of max). Fan out at the same
+	// p.config.Concurrency the outer pipeline uses; each branch's
+	// internal phase fan-outs (enrichConcurrency, auditFanoutLimit)
+	// remain unchanged.
+	branchEG, branchCtx := errgroup.WithContext(ctx)
+	branchEG.SetLimit(p.config.Concurrency)
+	var (
+		mu   sync.Mutex
+		errs []error
+	)
+	for _, b := range branches {
+		b := b
+		branchEG.Go(func() error {
+			if err := p.syncRepoBranch(branchCtx, repo, b, writer); err != nil {
+				if errors.Is(err, context.Canceled) && branchCtx.Err() != nil {
+					p.logger.Debug("sync branch aborted (cascade)", "org", repo.Org, "repo", repo.Name, "branch", b)
+				} else {
+					p.logger.Error("sync branch failed", "org", repo.Org, "repo", repo.Name, "branch", b, "error", err)
+				}
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
 			}
-			errs = append(errs, err)
-		}
+			return nil // never propagate; we collect into errs and Join below
+		})
 	}
+	_ = branchEG.Wait()
 	return errors.Join(errs...)
 }
 
 func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, branch string, writer *DBWriter) error {
 	p.logger.Info("sync repo branch start", "org", repo.Org, "repo", repo.Name, "branch", branch)
 
+	// Phase timestamps captured per-repo so the "sync repo branch
+	// done" line can attribute wall time to fetch / enrich / audit
+	// independently. The long-tail repos (voyager-android, sdui,
+	// etc.) have always been the bottleneck; without phase split
+	// it's impossible to tell whether their tail is API-bound on
+	// the audit phase or on enrichment.
+	branchStart := time.Now()
+	var fetchEnd, enrichEnd, auditEnd time.Time
+
 	prog := RepoProgress{
 		Org:       repo.Org,
 		Repo:      repo.Name,
 		Branch:    branch,
 		Phase:     PhaseFetchingCommits,
-		StartedAt: time.Now(),
+		StartedAt: branchStart,
 	}
 	p.reportProgress(prog)
 
@@ -596,6 +670,7 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 		p.reportProgress(prog)
 		return fmt.Errorf("listing commits: %w", err)
 	}
+	fetchEnd = time.Now()
 
 	prog.Commits = len(commits)
 	p.reportProgress(prog)
@@ -659,6 +734,7 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 		p.reportProgress(prog)
 		return fmt.Errorf("enriching commits: %w", err)
 	}
+	enrichEnd = time.Now()
 
 	prog.Enriched = len(allEnrichments)
 	prog.Phase = PhaseAuditing
@@ -706,6 +782,7 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 	if err := auditEG.Wait(); err != nil {
 		return fmt.Errorf("auditing commits: %w", err)
 	}
+	auditEnd = time.Now()
 
 	if err := writer.Write(ctx, func() error {
 		return p.store.UpsertAuditResults(ctx, auditResults)
@@ -745,6 +822,10 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 	doneAttrs := []any{
 		"org", repo.Org, "repo", repo.Name, "branch", branch,
 		"commits", len(commits), "audited", len(auditResults),
+		"fetch_ms", fetchEnd.Sub(branchStart).Milliseconds(),
+		"enrich_ms", enrichEnd.Sub(fetchEnd).Milliseconds(),
+		"audit_ms", auditEnd.Sub(enrichEnd).Milliseconds(),
+		"total_ms", auditEnd.Sub(branchStart).Milliseconds(),
 	}
 	if p.tokenStats != nil {
 		s := p.tokenStats()

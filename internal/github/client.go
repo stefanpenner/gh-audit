@@ -135,11 +135,7 @@ func (c *Client) ListCommits(ctx context.Context, org, repo, branch string, sinc
 				SHA:  rc.GetSHA(),
 				Href: rc.GetHTMLURL(),
 			}
-			if err := requireAuthor(org, repo, rc); err != nil {
-				return nil, err
-			}
-			commit.AuthorLogin = rc.GetAuthor().GetLogin()
-			commit.AuthorID = rc.GetAuthor().GetID()
+			c.resolveAuthor(&commit, rc)
 			if rc.GetCommitter() != nil {
 				commit.CommitterLogin = rc.GetCommitter().GetLogin()
 			}
@@ -188,11 +184,7 @@ func (c *Client) GetCommitDetail(ctx context.Context, org, repo, sha string) (*m
 		SHA:  rc.GetSHA(),
 		Href: rc.GetHTMLURL(),
 	}
-	if err := requireAuthor(org, repo, rc); err != nil {
-		return nil, err
-	}
-	commit.AuthorLogin = rc.GetAuthor().GetLogin()
-	commit.AuthorID = rc.GetAuthor().GetID()
+	c.resolveAuthor(commit, rc)
 	if rc.GetCommitter() != nil {
 		commit.CommitterLogin = rc.GetCommitter().GetLogin()
 	}
@@ -651,11 +643,7 @@ func (c *Client) ListPRCommits(ctx context.Context, org, repo string, prNumber i
 				Repo: repo,
 				SHA:  rc.GetSHA(),
 			}
-			if err := requireAuthor(org, repo, rc); err != nil {
-				return nil, err
-			}
-			commit.AuthorLogin = rc.GetAuthor().GetLogin()
-			commit.AuthorID = rc.GetAuthor().GetID()
+			c.resolveAuthor(&commit, rc)
 			if rc.GetCommitter() != nil {
 				commit.CommitterLogin = rc.GetCommitter().GetLogin()
 			}
@@ -745,52 +733,42 @@ func (c *Client) EnrichCommits(ctx context.Context, org, repo string, shas []str
 }
 
 
-// requireAuthor enforces gh-audit's strict id-only identity policy: every
-// commit ingested must carry a GitHub-resolved author. Returns a
-// detailed, actionable error when GitHub returns the commit with a null
-// author (which means the commit's git author email is not bound to
-// any verified GH account).
+// resolveAuthor populates AuthorLogin and AuthorID on the commit if
+// GitHub resolved the commit's git-author email to a verified GH user.
+// Otherwise it logs a one-line warning with the actionable fix-it text
+// and leaves AuthorID == 0 — the audit rules treat that as "non-exempt
+// contributor", which is the correct conservative read.
 //
-// Why this is strict:
+// Why not error out:
 //
-//   - Audit rule §1 (exempt author) and §5 (self-approval) match on
-//     numeric account ID for forgery resistance. A login can be
-//     renamed and reclaimed by a different account; the ID never
-//     transfers. Without an ID we cannot prove the commit was authored
-//     by the bot account the operator thinks it was.
-//   - Falling back to login or email would re-open the forgery surface
-//     this design eliminates: anyone can `git commit --author="X
-//     <svc-tg@linkedin.com>"` locally and push it through any path
-//     they have write access to.
+//   - The forgery-resistance contract lives in audit-time matching
+//     (audit.go::isExempt is strict id-only and refuses to match
+//     anything against a zero ID). Aborting sync at ingest doesn't
+//     add security; it just denies coverage.
+//   - Real developer commits routinely arrive with laptop-hostname
+//     emails (e.g. "user@user-mn4857.linkedin.biz") that aren't on
+//     the user's verified-emails list. These are not exempt anyway,
+//     so missing AuthorID is fine — they fall through to normal
+//     review rules.
 //
-// The error message tells the operator exactly what to do: either
-// register the commit author email on the corresponding GitHub
-// account (Settings → Emails → Add email), or verify that the right
-// bot account is authoring its commits with one of its verified
-// emails. If neither is feasible, the commit cannot be exempted and
-// must satisfy the normal review rules.
-func requireAuthor(org, repo string, rc *gogithub.RepositoryCommit) error {
+// The fix-it text in the warning helps operators surface and remediate
+// chronic null-author cases (typically a misconfigured bot whose
+// commits were intended to be exempted).
+func (c *Client) resolveAuthor(commit *model.Commit, rc *gogithub.RepositoryCommit) {
 	if rc.GetAuthor() != nil && rc.GetAuthor().GetID() != 0 {
-		return nil
-	}
-	sha := rc.GetSHA()
-	if len(sha) > 12 {
-		sha = sha[:12]
+		commit.AuthorLogin = rc.GetAuthor().GetLogin()
+		commit.AuthorID = rc.GetAuthor().GetID()
+		return
 	}
 	email := ""
 	if rc.GetCommit() != nil && rc.GetCommit().GetAuthor() != nil {
 		email = rc.GetCommit().GetAuthor().GetEmail()
 	}
-	return fmt.Errorf(
-		"commit %s/%s@%s has no GitHub-resolved author "+
-			"(git author email %q is not bound to any verified GitHub account); "+
-			"the audit's exempt-author and self-approval rules require a numeric "+
-			"account ID to remain forgery-resistant. To fix, add %q to the corresponding "+
-			"GitHub account's verified emails (https://github.com/settings/emails) and "+
-			"re-run sync; the binding takes effect for future commits and the next sync "+
-			"will resolve the author. If the email is intentionally unbound (e.g., a "+
-			"third-party bot), this commit cannot be exempted and will fall through to "+
-			"the standard review rules",
-		org, repo, sha, email, email,
+	c.logger.Warn("commit has no GitHub-resolved author",
+		"org", commit.Org,
+		"repo", commit.Repo,
+		"sha", commit.SHA,
+		"git_author_email", email,
+		"fix", "register the email on the matching GitHub account at https://github.com/settings/emails to enable id-based exempt-author matching; otherwise the commit will fall through to the standard review rules",
 	)
 }

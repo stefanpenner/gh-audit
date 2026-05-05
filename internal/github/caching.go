@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -26,15 +27,19 @@ type APIStats struct {
 	// (the getCommit defensive fallback when DB doesn't have the row
 	// pre-populated). On warm DBs this should be near zero.
 	CommitDetailEager atomic.Int64
-	// CommitDetailLazy is GET /commits/{sha} fetched during the audit
-	// phase via the statsFetcher closure — Architecture.md rule §2's
-	// empty-commit fallback and rule §5's PR-branch-author empty-stats
-	// disambiguation. Dominant on cold sweeps because PR-branch commits
-	// (from /pulls/{n}/commits) are returned without diff stats. Tracked
-	// separately so we can decide whether eager batched prefetching
-	// (which would convert these into Eager calls amortised across a
-	// repo) is worth implementing.
-	CommitDetailLazy   atomic.Int64
+	// CommitDetailLazyEmpty is GET /commits/{sha} fired by audit rule
+	// §2's empty-commit fallback when an otherwise non-compliant
+	// commit looks zero-stat locally and we need to confirm before
+	// firing the empty-commit waiver. Dominant when many commits
+	// land without additions/deletions populated (cold sweep).
+	CommitDetailLazyEmpty atomic.Int64
+	// CommitDetailLazySelf is GET /commits/{sha} fired by audit rule
+	// §5's PR-branch-author empty-stats disambiguation when a
+	// reviewer's PR-branch commits all look zero-stat locally and
+	// we need to know whether they actually contributed code. Lower
+	// volume than the §2 path; only fires when reviewer-as-author
+	// appears.
+	CommitDetailLazySelf  atomic.Int64
 	CommitPRs          atomic.Int64
 	PRDetail           atomic.Int64
 	Reviews            atomic.Int64
@@ -51,11 +56,29 @@ type APIStats struct {
 	// Not added to Total() — recovery rides on top of the existing
 	// PRDetail call, no extra endpoint cost.
 	PRRecovered atomic.Int64
+
+	// Duration counters per endpoint, expressed in nanoseconds.
+	// Total/count gives mean wall-time per call — coarse but
+	// enough to spot a slow endpoint dragging the sweep tail. We
+	// don't yet track p50/p99 (would need histograms); mean is
+	// the cheap-to-add first cut. Each counter accumulates across
+	// the whole pipeline run, so derive averages by dividing by
+	// the matching count counter at the same point in time.
+	CommitDetailEagerNanos      atomic.Int64
+	CommitDetailLazyEmptyNanos  atomic.Int64
+	CommitDetailLazySelfNanos   atomic.Int64
+	CommitPRsNanos              atomic.Int64
+	PRDetailNanos               atomic.Int64
+	ReviewsNanos                atomic.Int64
+	CheckRunsNanos              atomic.Int64
+	PRCommitsNanos              atomic.Int64
+	RevertVerificationNanos     atomic.Int64
 }
 
 // Total returns the total number of API requests made.
 func (s *APIStats) Total() int64 {
-	return s.CommitDetailEager.Load() + s.CommitDetailLazy.Load() +
+	return s.CommitDetailEager.Load() +
+		s.CommitDetailLazyEmpty.Load() + s.CommitDetailLazySelf.Load() +
 		s.CommitPRs.Load() + s.PRDetail.Load() +
 		s.Reviews.Load() + s.CheckRuns.Load() + s.PRCommits.Load() +
 		s.RevertVerification.Load()
@@ -154,6 +177,8 @@ func (ce *CachingEnricher) getCommit(ctx context.Context, org, repo, sha string)
 		}
 	}
 	ce.Stats.CommitDetailEager.Add(1)
+	start := time.Now()
+	defer func() { ce.Stats.CommitDetailEagerNanos.Add(time.Since(start).Nanoseconds()) }()
 	return ce.client.GetCommitDetail(ctx, org, repo, sha)
 }
 
@@ -198,7 +223,9 @@ func (ce *CachingEnricher) getPRsForCommit(ctx context.Context, org, repo, sha s
 	}
 
 	ce.Stats.CommitPRs.Add(1)
+	startCommitPRs := time.Now()
 	prs, err := ce.client.ListCommitPullRequests(ctx, org, repo, sha)
+	ce.Stats.CommitPRsNanos.Add(time.Since(startCommitPRs).Nanoseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -284,7 +311,9 @@ func (ce *CachingEnricher) getPR(ctx context.Context, org, repo string, number i
 	}
 
 	ce.Stats.PRDetail.Add(1)
+	startPRDetail := time.Now()
 	pr, err := ce.client.GetPullRequest(ctx, org, repo, number)
+	ce.Stats.PRDetailNanos.Add(time.Since(startPRDetail).Nanoseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +379,9 @@ func (ce *CachingEnricher) getReviews(ctx context.Context, org, repo string, prN
 	}
 
 	ce.Stats.Reviews.Add(1)
+	startReviews := time.Now()
 	reviews, err := ce.client.ListReviews(ctx, org, repo, prNumber)
+	ce.Stats.ReviewsNanos.Add(time.Since(startReviews).Nanoseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -390,7 +421,9 @@ func (ce *CachingEnricher) getCheckRuns(ctx context.Context, org, repo, ref stri
 	}
 
 	ce.Stats.CheckRuns.Add(1)
+	startCheckRuns := time.Now()
 	runs, err := ce.client.ListCheckRunsForRef(ctx, org, repo, ref)
+	ce.Stats.CheckRunsNanos.Add(time.Since(startCheckRuns).Nanoseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -427,7 +460,9 @@ func (ce *CachingEnricher) getPRCommits(ctx context.Context, org, repo string, p
 	}
 
 	ce.Stats.PRCommits.Add(1)
+	startPRCommits := time.Now()
 	commits, err := ce.client.ListPRCommits(ctx, org, repo, prNumber)
+	ce.Stats.PRCommitsNanos.Add(time.Since(startPRCommits).Nanoseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -603,7 +638,9 @@ func (ce *CachingEnricher) classifyRevertAndMerge(
 		}
 		ownFetched = true
 		ce.Stats.RevertVerification.Add(1)
+		startRevertVerify := time.Now()
 		ownFiles, ownFilesErr = ce.client.GetCommitFiles(ctx, org, repo, sha)
+		ce.Stats.RevertVerificationNanos.Add(time.Since(startRevertVerify).Nanoseconds())
 		return ownFiles, ownFilesErr
 	}
 
@@ -644,7 +681,9 @@ func (ce *CachingEnricher) classifyRevertAndMerge(
 			break
 		}
 		ce.Stats.RevertVerification.Add(1)
+		startRevertVerify2 := time.Now()
 		revertedFiles, err := ce.client.GetCommitFiles(ctx, org, repo, revertedSHA)
+		ce.Stats.RevertVerificationNanos.Add(time.Since(startRevertVerify2).Nanoseconds())
 		if err != nil {
 			result.RevertVerification = "message-only"
 			break
