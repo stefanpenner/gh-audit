@@ -151,7 +151,7 @@ func (d *DB) GetPRsForCommit(ctx context.Context, org, repo, sha string) ([]mode
 // GetCommitsForPR retrieves commits associated with a PR via commit_prs.
 func (d *DB) GetCommitsForPR(ctx context.Context, org, repo string, prNumber int) ([]model.Commit, error) {
 	rows, err := d.DB.QueryContext(ctx, `
-		SELECT c.org, c.repo, c.sha, c.author_login, c.author_email, c.committer_login,
+		SELECT c.org, c.repo, c.sha, c.author_login, c.author_id, c.author_email, c.committer_login,
 		       c.committed_at, c.message, c.parent_count, c.additions, c.deletions, c.is_verified, c.href
 		FROM commits c
 		INNER JOIN commit_prs cp ON c.org = cp.org AND c.repo = cp.repo AND c.sha = cp.sha
