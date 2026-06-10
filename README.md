@@ -59,6 +59,9 @@ gh-audit sync --org my-org
 # Specific date range
 gh-audit sync --repo my-org/my-repo --since 2026-01-01 --until 2026-04-01
 
+# Audit the repo's entire history (since the first commit)
+gh-audit sync --repo my-org/my-repo --since epoch
+
 # Generate a report
 gh-audit report --only-failures
 
