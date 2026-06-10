@@ -226,7 +226,7 @@ func newSyncCmd() *cobra.Command {
 
 	cmd.Flags().StringSliceVar(&orgs, "org", nil, "orgs to sync (overrides config)")
 	cmd.Flags().StringSliceVar(&repos, "repo", nil, "repos to sync (org/repo format)")
-	cmd.Flags().StringVar(&since, "since", "", "sync since date (ISO 8601)")
+	cmd.Flags().StringVar(&since, "since", "", "sync since date (ISO 8601), or 'epoch'/'all'/'beginning' for full history")
 	cmd.Flags().StringVar(&until, "until", "", "sync until date (ISO 8601)")
 	cmd.Flags().IntVar(&concurrency, "concurrency", 0, "max concurrent repo syncs (default from config)")
 	cmd.Flags().DurationVar(&orgReposCacheFreshness, "org-repos-cache", 0,
@@ -390,12 +390,14 @@ func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until stri
 	}
 
 	if since != "" {
-		if t, err := time.Parse(time.RFC3339, since); err == nil {
+		if t, ok := parseSinceKeyword(since); ok {
+			syncCfg.Since = t
+		} else if t, err := time.Parse(time.RFC3339, since); err == nil {
 			syncCfg.Since = t
 		} else if t, err := time.Parse("2006-01-02", since); err == nil {
 			syncCfg.Since = t
 		} else {
-			return nil, fmt.Errorf("invalid --since format: %s (use ISO 8601)", since)
+			return nil, fmt.Errorf("invalid --since format: %s (use ISO 8601, or 'epoch'/'all'/'beginning' for full history)", since)
 		}
 	}
 	if until != "" {
@@ -413,6 +415,25 @@ func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until stri
 	}
 
 	return syncCfg, nil
+}
+
+// epochSince is the sentinel "from the beginning of time" value used when
+// the user passes --since epoch/all/beginning. It must be non-zero so
+// determineSince honours it (a zero time.Time means "unset" and falls back
+// to the cursor or the 90-day lookback), yet early enough to predate GitHub
+// so the REST API returns the repo's full commit history.
+var epochSince = time.Unix(0, 0).UTC()
+
+// parseSinceKeyword maps the symbolic --since values that mean "full history"
+// to the epoch sentinel. Matching is case-insensitive. The second return
+// value reports whether s was a recognised keyword.
+func parseSinceKeyword(s string) (time.Time, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "epoch", "all", "beginning":
+		return epochSince, true
+	default:
+		return time.Time{}, false
+	}
 }
 
 func convertScopes(cfgScopes []config.OrgScope) []ghclient.OrgScope {

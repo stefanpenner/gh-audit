@@ -279,7 +279,9 @@ UpsertCommitBranches ──▶ commit_branches table
 ```
 
 The `since` date comes from (in priority order):
-1. `--since` CLI flag
+1. `--since` CLI flag (an ISO 8601 date, or `epoch`/`all`/`beginning` for
+   the repo's full history — these map to a 1970-01-01 sentinel that
+   predates GitHub, so the REST API returns every commit)
 2. Stored sync cursor for this org/repo/branch
 3. `initial_lookback_days` config (default 90)
 
