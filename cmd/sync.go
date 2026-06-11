@@ -77,6 +77,13 @@ func newSyncCmd() *cobra.Command {
 
 			client := ghclient.NewClient(pool, logger)
 			enricher := ghclient.NewCachingEnricher(client, dbConn)
+			// Lets the enricher supplement Checks-API results with legacy
+			// commit-status contexts when a required check is missing.
+			var requiredNames []string
+			for _, rc := range cfg.AuditRules.RequiredChecks {
+				requiredNames = append(requiredNames, rc.Name)
+			}
+			enricher.SetRequiredCheckNames(requiredNames)
 			pipeline := sync.NewPipeline(client, enricher, dbConn, syncCfg, logger)
 			pipeline.SetTokenStatsFn(func() sync.TokenStatsSnapshot {
 				s := pool.Snapshot()

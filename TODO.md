@@ -12,16 +12,6 @@ fetching it for PRs with DISMISSED rows (rare) would make the verdict
 exact. Needs: timeline client method, a reviews.dismissed_at column, and
 cutoff logic that restores post-merge-dismissed approvals.
 
-## Legacy commit-status contexts in §6
-
-`required_checks` only sees Checks-API runs. CI reporting via the legacy
-status API (`GET /commits/{ref}/status`, e.g. older Jenkins) is invisible —
-a required check named after a status context reads permanently `missing`.
-Fix shape: fetch combined status alongside check runs and merge contexts in
-as synthetic CheckRuns (status `completed`, conclusion mapped from
-success/failure/error/pending), ideally only when a configured required
-check was not found among check runs.
-
 ## Positional post-approval check in isApprovalRefreshable
 
 The §4 stale-approval carve-out classifies "post-approval commits" by

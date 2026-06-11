@@ -185,7 +185,7 @@ All approvals are self (or ReviewerID==0)?
 
 Configured checks (e.g. `Owner Approval`) must appear on the PR's head SHA with the expected conclusion. Missing or failed checks make the commit **non-compliant**. A check whose only runs are still queued/in-progress reports `missing` (it has not failed — it has not concluded).
 
-**Checks API only.** `required_checks` names are matched against Checks-API check runs (`GET /commits/{ref}/check-runs`). CI that reports through the legacy commit-status API (`/statuses`, e.g. older Jenkins setups) is not visible to §6 — a required check configured with a status-context name would read permanently `missing`. See TODO.md.
+**Legacy status contexts.** `required_checks` names are matched against Checks-API check runs first. When a configured name is absent from the check-run list, the enricher additionally fetches the combined commit status (`GET /commits/{ref}/status`) and merges each context in as a synthetic check run (success/failure/error → completed with that conclusion; pending → in-progress; ids negated so the two id spaces can't collide in `check_runs`). CI reporting through the legacy `/statuses` API (older Jenkins) therefore satisfies §6 like any other check, at zero extra API cost for all-Checks-API repos.
 
 The same check name can appear multiple times on one SHA (re-runs mint new check-run ids; the DB accumulates them across syncs). Only the **latest** same-named run counts — selected by `completed_at` with `check_run_id` as tiebreak — mirroring GitHub's "latest run wins" UI semantics.
 

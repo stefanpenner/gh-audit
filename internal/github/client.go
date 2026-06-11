@@ -815,6 +815,60 @@ func (c *Client) ListPRCommits(ctx context.Context, org, repo string, prNumber i
 	return all, nil
 }
 
+// ListStatusContexts fetches the legacy commit-status API's combined
+// status for ref and maps each context to a synthetic CheckRun, so §6's
+// required-check evaluation can see CI that reports through /statuses
+// (older Jenkins setups) instead of the Checks API.
+//
+// Mapping: success/failure/error -> status "completed" with the state as
+// the conclusion; pending -> "in_progress" with no conclusion (reads as
+// a not-yet-concluded run downstream). The combined endpoint already
+// returns only the LATEST status per context. CheckRunID is the status
+// event id NEGATED so the legacy-status id space can never collide with
+// real check-run ids in the check_runs table.
+func (c *Client) ListStatusContexts(ctx context.Context, org, repo, ref string) ([]model.CheckRun, error) {
+	var out []model.CheckRun
+	opts := &gogithub.ListOptions{PerPage: 100}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		gh, err := c.ghClient(ctx, org, repo)
+		if err != nil {
+			return nil, err
+		}
+		combined, resp, err := gh.Repositories.GetCombinedStatus(ctx, org, repo, ref, opts)
+		if err != nil {
+			return nil, fmt.Errorf("combined status for %s/%s@%s page %d: %w", org, repo, ref, opts.Page, err)
+		}
+		for _, st := range combined.Statuses {
+			run := model.CheckRun{
+				Org:        org,
+				Repo:       repo,
+				CommitSHA:  ref,
+				CheckRunID: -st.GetID(),
+				CheckName:  st.GetContext(),
+			}
+			switch st.GetState() {
+			case "pending":
+				run.Status = "in_progress"
+			default: // success, failure, error
+				run.Status = "completed"
+				run.Conclusion = st.GetState()
+			}
+			if st.UpdatedAt != nil {
+				run.CompletedAt = st.UpdatedAt.Time
+			}
+			out = append(out, run)
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return out, nil
+}
+
 // EnrichCommits fetches PRs, reviews, check runs, and PR branch commits for a batch of commits via REST.
 // Each commit triggers: GET commit, GET commit PRs, GET PR detail, GET reviews, GET check runs, GET PR commits.
 func (c *Client) EnrichCommits(ctx context.Context, org, repo string, shas []string) ([]model.EnrichmentResult, error) {

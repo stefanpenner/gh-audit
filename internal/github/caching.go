@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -129,6 +130,14 @@ type CachingEnricher struct {
 	dbCache EnrichmentCache
 	Stats   APIStats
 
+	// requiredCheckNames (lowercased) drives the legacy-status supplement:
+	// when a freshly-fetched check-run list is missing one of these names,
+	// the combined commit-status API is consulted and its contexts merged
+	// in as synthetic CheckRuns — CI that reports via /statuses (older
+	// Jenkins) is otherwise invisible to §6 and would read permanently
+	// "missing". Empty set disables the extra call entirely.
+	requiredCheckNames map[string]struct{}
+
 	mu             sync.Mutex
 	prCache        map[string]*model.PullRequest
 	reviewCache    map[string][]model.Review
@@ -142,14 +151,15 @@ type CachingEnricher struct {
 // it is consulted for previously-synced data before making API calls.
 func NewCachingEnricher(client *Client, dbCache EnrichmentCache) *CachingEnricher {
 	return &CachingEnricher{
-		client:         client,
-		dbCache:        dbCache,
-		prCache:        make(map[string]*model.PullRequest),
-		reviewCache:    make(map[string][]model.Review),
-		checkRunCache:  make(map[string][]model.CheckRun),
-		prCommitCache:  make(map[string][]model.Commit),
-		commitPRCache:  make(map[string][]model.PullRequest),
-		mergeCommitIdx: make(map[string][]int),
+		client:             client,
+		dbCache:            dbCache,
+		prCache:            make(map[string]*model.PullRequest),
+		reviewCache:        make(map[string][]model.Review),
+		checkRunCache:      make(map[string][]model.CheckRun),
+		prCommitCache:      make(map[string][]model.Commit),
+		commitPRCache:      make(map[string][]model.PullRequest),
+		mergeCommitIdx:     make(map[string][]int),
+		requiredCheckNames: make(map[string]struct{}),
 	}
 }
 
@@ -332,6 +342,35 @@ func (ce *CachingEnricher) getPR(ctx context.Context, org, repo string, number i
 	return pr, nil
 }
 
+// SetRequiredCheckNames declares the configured §6 required-check names.
+// Used to decide when the legacy commit-status supplement is worth an
+// extra API call; matching is case-insensitive, mirroring
+// evaluateRequiredChecks.
+func (ce *CachingEnricher) SetRequiredCheckNames(names []string) {
+	ce.requiredCheckNames = make(map[string]struct{}, len(names))
+	for _, n := range names {
+		ce.requiredCheckNames[strings.ToLower(n)] = struct{}{}
+	}
+}
+
+// missingRequiredCheck reports whether any configured required check name
+// is absent from runs.
+func (ce *CachingEnricher) missingRequiredCheck(runs []model.CheckRun) bool {
+	if len(ce.requiredCheckNames) == 0 {
+		return false
+	}
+	present := make(map[string]struct{}, len(runs))
+	for _, r := range runs {
+		present[strings.ToLower(r.CheckName)] = struct{}{}
+	}
+	for name := range ce.requiredCheckNames {
+		if _, ok := present[name]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
 // isPRMerged reports whether the PR was *previously synced* and is in
 // a merged state — the only situation where a zero-row reviews / check
 // runs / PR-branch-commits result from the DB is authoritative.
@@ -452,6 +491,23 @@ func (ce *CachingEnricher) getCheckRuns(ctx context.Context, org, repo, ref stri
 	ce.Stats.CheckRunsNanos.Add(time.Since(startCheckRuns).Nanoseconds())
 	if err != nil {
 		return nil, err
+	}
+
+	// Legacy-status supplement: only when a configured required check is
+	// absent from the Checks-API results — the common all-Checks-API case
+	// costs nothing extra. Counted under the CheckRuns stats (it is a
+	// check-source call). Synthetic rows flow into the enrichment result
+	// and persist to check_runs like any other run, so the merged-PR
+	// freeze covers them on later reads.
+	if ce.missingRequiredCheck(runs) {
+		ce.Stats.CheckRuns.Add(1)
+		startStatuses := time.Now()
+		statuses, serr := ce.client.ListStatusContexts(ctx, org, repo, ref)
+		ce.Stats.CheckRunsNanos.Add(time.Since(startStatuses).Nanoseconds())
+		if serr != nil {
+			return nil, serr
+		}
+		runs = append(runs, statuses...)
 	}
 
 	ce.mu.Lock()
