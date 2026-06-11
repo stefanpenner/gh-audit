@@ -107,7 +107,10 @@ Per-reviewer resolution: if the same reviewer submits multiple reviews on the fi
 
 **Post-merge cutoff.** Reviews submitted after `pr.merged_at` are excluded from compliance. A post-merge `DISMISSED` or `CHANGES_REQUESTED` instead sets `HasPostMergeConcern=true` so auditors can review the concern without the commit itself flipping state.
 
-**Dismissal ambiguity.** GitHub dismisses a review by mutating it in place: `state` flips to `DISMISSED` while `submitted_at`/`commit_id` keep their original submission values (the dismissal time lives only in issue-timeline events, which gh-audit does not fetch). A `DISMISSED` row submitted pre-merge is therefore ambiguous — the dismissal may predate the merge (the review never stood) or postdate it (the review WAS an approval at merge time). gh-audit fails closed (the row never counts as approval) and sets `HasPostMergeConcern` for final-commit dismissals so an auditor adjudicates instead of the verdict silently depending on sync timing. See TODO.md for the timeline-event resolution.
+**Dismissal resolution.** GitHub dismisses a review by mutating it in place: `state` flips to `DISMISSED` while `submitted_at`/`commit_id` keep their original submission values. The dismissal time and the review's state at that moment live only in issue-events (`review_dismissed`); when a fetched PR carries a `DISMISSED` review, the enricher resolves them (one extra `GET /issues/{n}/events`, only for PRs with dismissals) and persists `reviews.dismissed_at`/`dismissed_state`. §4 then rules exactly:
+- dismissal **after** merge → the review still held its original state at merge time; an `approved` original is restored for the point-in-time fold (the commit stays compliant) and the dismissal sets `HasPostMergeConcern`;
+- dismissal **before** merge → an unambiguous non-approval, nothing flagged;
+- dismissal time **unknown** (rows synced before this feature) → fail closed (never an approval) and `HasPostMergeConcern` so an auditor adjudicates.
 
 **Untrusted identities.** A review or PR attributed to an unresolved account (`id == 0`) or to GitHub's ghost user (`id == 10137`, substituted for every deleted account) is never trusted: it cannot count as an independent approval, nor prove self-approval — two different deleted people both surface as ghost.
 

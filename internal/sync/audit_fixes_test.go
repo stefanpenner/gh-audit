@@ -348,3 +348,61 @@ func TestExemptCommit_GhostAuthorFallsBackToVerifiedEmails(t *testing.T) {
 		"ghost id must not block the email fallback")
 	assert.False(t, isExemptCommit(model.GhostUserID, "other@corp.example", exempt))
 }
+
+// With the dismissal time resolved from timeline events, the §4 verdict
+// is exact instead of fail-closed: a post-merge dismissal restores the
+// approval the review WAS at merge time (point-in-time doctrine) and
+// flags the concern; a known pre-merge dismissal is an unambiguous
+// non-approval with nothing to flag.
+func TestDismissedReview_ResolvedTimesAreExact(t *testing.T) {
+	at := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	merged := at.Add(time.Hour)
+	commit := model.Commit{
+		Org: "o", Repo: "r", SHA: "squash", AuthorID: 1, AuthorLogin: "author",
+		Additions: 10, Deletions: 2, ParentCount: 1, CommittedAt: merged,
+	}
+	base := model.EnrichmentResult{
+		Commit: commit,
+		PRs: []model.PullRequest{{
+			Org: "o", Repo: "r", Number: 1, Merged: true, HeadSHA: "head",
+			AuthorID: 1, MergedAt: merged,
+		}},
+	}
+
+	t.Run("post-merge dismissal restores the merge-time approval", func(t *testing.T) {
+		e := base
+		e.Reviews = []model.Review{{
+			PRNumber: 1, ReviewID: 9, ReviewerID: 42, ReviewerLogin: "rev",
+			State: "DISMISSED", CommitID: "head", SubmittedAt: at,
+			DismissedAt: merged.Add(48 * time.Hour), DismissedState: "approved",
+		}}
+		result := EvaluateCommit(commit, e, nil, nil, nil)
+		assert.True(t, result.IsCompliant,
+			"the review WAS an approval at merge time; a later dismissal must not rewrite history")
+		assert.True(t, result.HasPostMergeConcern, "the dismissal itself is the post-merge concern")
+	})
+
+	t.Run("known pre-merge dismissal is quiet and non-compliant", func(t *testing.T) {
+		e := base
+		e.Reviews = []model.Review{{
+			PRNumber: 1, ReviewID: 9, ReviewerID: 42, ReviewerLogin: "rev",
+			State: "DISMISSED", CommitID: "head", SubmittedAt: at,
+			DismissedAt: at.Add(10 * time.Minute), DismissedState: "approved", // before merge
+		}}
+		result := EvaluateCommit(commit, e, nil, nil, nil)
+		assert.False(t, result.IsCompliant, "the approval was rescinded before the merge")
+		assert.False(t, result.HasPostMergeConcern, "a resolved pre-merge dismissal is not ambiguous")
+	})
+
+	t.Run("post-merge dismissal of CHANGES_REQUESTED does not mint an approval", func(t *testing.T) {
+		e := base
+		e.Reviews = []model.Review{{
+			PRNumber: 1, ReviewID: 9, ReviewerID: 42, ReviewerLogin: "rev",
+			State: "DISMISSED", CommitID: "head", SubmittedAt: at,
+			DismissedAt: merged.Add(time.Hour), DismissedState: "changes_requested",
+		}}
+		result := EvaluateCommit(commit, e, nil, nil, nil)
+		assert.False(t, result.IsCompliant,
+			"at merge time the reviewer was requesting changes — restoring that state is not an approval")
+	})
+}

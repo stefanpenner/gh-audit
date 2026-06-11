@@ -446,6 +446,34 @@ func (ce *CachingEnricher) getReviews(ctx context.Context, org, repo string, prN
 		return nil, err
 	}
 
+	// Dismissal resolution — only PRs that actually carry a DISMISSED
+	// review pay the extra issue-events call (rare). The timeline event
+	// supplies the dismissal time and original state, turning the
+	// fail-closed dismissal ambiguity in §4 into an exact verdict.
+	// Counted under the Reviews stats (it is review-source traffic).
+	hasDismissed := false
+	for _, r := range reviews {
+		if r.State == "DISMISSED" {
+			hasDismissed = true
+			break
+		}
+	}
+	if hasDismissed {
+		ce.Stats.Reviews.Add(1)
+		startDismissals := time.Now()
+		dismissals, derr := ce.client.ListReviewDismissals(ctx, org, repo, prNumber)
+		ce.Stats.ReviewsNanos.Add(time.Since(startDismissals).Nanoseconds())
+		if derr != nil {
+			return nil, derr
+		}
+		for i := range reviews {
+			if d, ok := dismissals[reviews[i].ReviewID]; ok {
+				reviews[i].DismissedAt = d.At
+				reviews[i].DismissedState = d.OriginalState
+			}
+		}
+	}
+
 	ce.mu.Lock()
 	ce.reviewCache[key] = reviews
 	ce.mu.Unlock()

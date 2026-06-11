@@ -95,6 +95,8 @@ const (
 		state          TEXT,
 		commit_id      TEXT,
 		submitted_at   TIMESTAMP,
+		dismissed_at    TIMESTAMP,
+		dismissed_state TEXT,
 		href           TEXT,
 		fetched_at     TIMESTAMP DEFAULT current_timestamp,
 		PRIMARY KEY (org, repo, pr_number, review_id)
@@ -199,6 +201,8 @@ var addColumnMigrations = []string{
 	`ALTER TABLE sync_cursors ADD COLUMN last_sha TEXT`,
 	`ALTER TABLE commits ADD COLUMN files_changed INTEGER`,
 	`ALTER TABLE commits ADD COLUMN detail_fetched_at TIMESTAMP`,
+	`ALTER TABLE reviews ADD COLUMN dismissed_at TIMESTAMP`,
+	`ALTER TABLE reviews ADD COLUMN dismissed_state TEXT`,
 }
 
 // allTables is the ordered list of DDL statements to run during migration.

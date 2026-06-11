@@ -545,6 +545,24 @@ func latestReviewStatesOnFinal(reviews []model.Review, pr model.PullRequest) (ma
 			}
 			continue
 		}
+		// Dismissal resolution: when the timeline supplied the dismissal
+		// time and it postdates the merge, the review still held its
+		// ORIGINAL state at merge time — restore it for the point-in-time
+		// fold and flag the dismissal as the post-merge concern it is.
+		// A dismissal known to predate the merge stays DISMISSED with no
+		// flag (nothing ambiguous about it).
+		if review.State == "DISMISSED" && !pr.MergedAt.IsZero() &&
+			!review.DismissedAt.IsZero() && review.DismissedAt.After(pr.MergedAt) {
+			switch strings.ToLower(review.DismissedState) {
+			case "approved":
+				review.State = "APPROVED"
+			case "changes_requested":
+				review.State = "CHANGES_REQUESTED"
+			case "commented":
+				review.State = "COMMENTED"
+			}
+			postMergeConcern = true
+		}
 		key := reviewerKey(review)
 		existing, exists := latest[key]
 		if !exists {
@@ -571,22 +589,21 @@ func latestReviewStatesOnFinal(reviews []model.Review, pr model.PullRequest) (ma
 		}
 		latest[key] = review
 	}
-	// GitHub dismisses a review by MUTATING it in place: state flips to
-	// DISMISSED while submitted_at/commit_id keep their original
-	// submission values (the dismissal time lives only in timeline events
-	// we don't fetch). A DISMISSED entry that SURVIVES as a reviewer's
-	// final pre-merge state is therefore ambiguous — the dismissal may
+	// Residual ambiguity: a surviving DISMISSED entry whose dismissal
+	// time is UNKNOWN (rows synced before dismissal resolution existed,
+	// or the timeline event was unavailable). GitHub mutates dismissed
+	// reviews in place, so without the timeline fact the dismissal may
 	// predate the merge (the review never stood) or postdate it (it WAS
-	// an approval at merge time and the point-in-time doctrine says it
-	// should count). Fail closed — DISMISSED never counts as approval —
-	// but surface the ambiguity so an auditor decides instead of the
-	// verdict silently depending on sync timing. Superseded dismissals
+	// an approval at merge time). Fail closed — DISMISSED never counts
+	// as approval — but surface the ambiguity so an auditor decides.
+	// Known dismissal times never reach here flagged: post-merge ones
+	// were restored to their original state above, and known pre-merge
+	// dismissals are unambiguous non-approvals. Superseded dismissals
 	// (reviewer re-approved afterwards) are moot and stay quiet, and an
 	// unmerged PR has no merge for the dismissal to be ambiguous against.
-	// See TODO.md for the timeline-event resolution.
 	if !pr.MergedAt.IsZero() {
 		for _, r := range latest {
-			if r.State == "DISMISSED" {
+			if r.State == "DISMISSED" && r.DismissedAt.IsZero() {
 				postMergeConcern = true
 				break
 			}

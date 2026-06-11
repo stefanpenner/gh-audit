@@ -348,7 +348,9 @@ func loadRepoEnrichmentBundle(ctx context.Context, dbConn *db.DB, org, repo stri
 	rvRows, err := dbConn.DB.QueryContext(ctx, `
 		SELECT org, repo, pr_number, review_id, reviewer_login,
 		       COALESCE(reviewer_id, 0),
-		       COALESCE(state::TEXT, ''), commit_id, submitted_at, href
+		       COALESCE(state::TEXT, ''), commit_id, submitted_at,
+		       COALESCE(dismissed_at, TIMESTAMP '0001-01-01 00:00:00'),
+		       COALESCE(dismissed_state, ''), href
 		FROM reviews WHERE org = ? AND repo = ?
 		ORDER BY pr_number, submitted_at`, org, repo)
 	if err != nil {
@@ -357,7 +359,8 @@ func loadRepoEnrichmentBundle(ctx context.Context, dbConn *db.DB, org, repo stri
 	for rvRows.Next() {
 		var r model.Review
 		if err := rvRows.Scan(&r.Org, &r.Repo, &r.PRNumber, &r.ReviewID, &r.ReviewerLogin,
-			&r.ReviewerID, &r.State, &r.CommitID, &r.SubmittedAt, &r.Href); err != nil {
+			&r.ReviewerID, &r.State, &r.CommitID, &r.SubmittedAt,
+			&r.DismissedAt, &r.DismissedState, &r.Href); err != nil {
 			rvRows.Close()
 			return nil, fmt.Errorf("scan review: %w", err)
 		}

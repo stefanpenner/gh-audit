@@ -213,3 +213,30 @@ func TestUpsertPullRequests_PreservesMergedBy(t *testing.T) {
 	assert.Equal(t, "merger", got.MergedByLogin, "detail-only field must survive list-shape re-ingestion")
 	assert.Equal(t, int64(99), got.MergedByID)
 }
+
+func TestReviewDismissalFactsRoundTrip(t *testing.T) {
+	db := mustOpenMemory(t)
+	ctx := context.Background()
+
+	dismissedAt := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	reviews := []model.Review{
+		{Org: "o", Repo: "r", PRNumber: 1, ReviewID: 900, ReviewerID: 42,
+			State: "DISMISSED", CommitID: "head", SubmittedAt: dismissedAt.Add(-48 * time.Hour),
+			DismissedAt: dismissedAt, DismissedState: "approved"},
+		{Org: "o", Repo: "r", PRNumber: 1, ReviewID: 901, ReviewerID: 43,
+			State: "APPROVED", CommitID: "head", SubmittedAt: dismissedAt},
+	}
+	require.NoError(t, db.UpsertReviews(ctx, reviews))
+
+	got, err := db.GetReviewsForPR(ctx, "o", "r", 1)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	byID := map[int64]model.Review{}
+	for _, r := range got {
+		byID[r.ReviewID] = r
+	}
+	assert.Equal(t, dismissedAt, byID[900].DismissedAt.UTC())
+	assert.Equal(t, "approved", byID[900].DismissedState)
+	assert.True(t, byID[901].DismissedAt.IsZero(), "never-dismissed review reads back zero")
+	assert.Empty(t, byID[901].DismissedState)
+}

@@ -50,7 +50,7 @@ func (d *DB) UpsertPullRequests(ctx context.Context, prs []model.PullRequest) er
 
 var reviewColumns = []string{
 	"org", "repo", "pr_number", "review_id", "reviewer_login", "reviewer_id",
-	"state", "commit_id", "submitted_at", "href",
+	"state", "commit_id", "submitted_at", "dismissed_at", "dismissed_state", "href",
 }
 
 // UpsertReviews batch-inserts reviews using the DuckDB Appender API with a
@@ -66,9 +66,14 @@ func (d *DB) UpsertReviews(ctx context.Context, reviews []model.Review) error {
 		if r.State == "PENDING" {
 			continue
 		}
+		var dismissedAt driver.Value
+		if !r.DismissedAt.IsZero() {
+			dismissedAt = r.DismissedAt
+		}
 		rows = append(rows, []driver.Value{
 			r.Org, r.Repo, r.PRNumber, r.ReviewID, r.ReviewerLogin, r.ReviewerID,
-			nullIfEmpty(r.State), r.CommitID, r.SubmittedAt, r.Href,
+			nullIfEmpty(r.State), r.CommitID, r.SubmittedAt,
+			dismissedAt, nullIfEmptyStr(r.DismissedState), r.Href,
 		})
 	}
 	if len(rows) == 0 {
@@ -218,7 +223,8 @@ func (d *DB) GetCommitsForPR(ctx context.Context, org, repo string, prNumber int
 func (d *DB) GetReviewsForPR(ctx context.Context, org, repo string, prNumber int) ([]model.Review, error) {
 	rows, err := d.DB.QueryContext(ctx, `
 		SELECT org, repo, pr_number, review_id, reviewer_login, COALESCE(reviewer_id, 0),
-		       COALESCE(state::TEXT, ''), commit_id, submitted_at, href
+		       COALESCE(state::TEXT, ''), commit_id, submitted_at,
+		       COALESCE(dismissed_at, TIMESTAMP '0001-01-01 00:00:00'), COALESCE(dismissed_state, ''), href
 		FROM reviews
 		WHERE org = ? AND repo = ? AND pr_number = ?
 		ORDER BY submitted_at`, org, repo, prNumber)
@@ -231,7 +237,7 @@ func (d *DB) GetReviewsForPR(ctx context.Context, org, repo string, prNumber int
 	for rows.Next() {
 		var r model.Review
 		if err := rows.Scan(&r.Org, &r.Repo, &r.PRNumber, &r.ReviewID, &r.ReviewerLogin, &r.ReviewerID,
-			&r.State, &r.CommitID, &r.SubmittedAt, &r.Href); err != nil {
+			&r.State, &r.CommitID, &r.SubmittedAt, &r.DismissedAt, &r.DismissedState, &r.Href); err != nil {
 			return nil, fmt.Errorf("scan review: %w", err)
 		}
 		result = append(result, r)

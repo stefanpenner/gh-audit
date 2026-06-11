@@ -186,7 +186,26 @@ type Review struct {
 	State         string // APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED
 	CommitID      string
 	SubmittedAt   time.Time
-	Href          string
+	// DismissedAt / DismissedState resolve the in-place mutation GitHub
+	// performs on dismissal (State flips to DISMISSED while SubmittedAt
+	// keeps the original submission time): the issue-timeline
+	// `review_dismissed` event supplies WHEN the dismissal happened and
+	// what the review's state was at that moment ("approved",
+	// "changes_requested", "commented"). Zero/empty when the review was
+	// never dismissed or the event wasn't resolved (legacy rows) — the
+	// audit then fails closed and surfaces the ambiguity.
+	DismissedAt    time.Time
+	DismissedState string
+	Href           string
+}
+
+// A ReviewDismissal is the timeline fact about one dismissed review:
+// when it was dismissed and the state it held until then.
+//
+//	GET /issues/{n}/events (review_dismissed) ──→ ReviewDismissal ──→ Review.DismissedAt/-State
+type ReviewDismissal struct {
+	At            time.Time
+	OriginalState string // approved, changes_requested, commented
 }
 
 // A CheckRun is a GitHub Actions or third-party CI check result,
@@ -225,14 +244,14 @@ type AuditResult struct {
 	PRCount          int
 	HasFinalApproval bool
 	HasStaleApproval bool // approval exists but on a pre-force-push commit
-	// HasPostMergeConcern is true when a reviewer submitted a
-	// CHANGES_REQUESTED or DISMISSED review after the PR merged, OR when a
-	// reviewer's final pre-merge state on the head SHA is DISMISSED —
-	// GitHub mutates dismissed reviews in place (original submitted_at
-	// retained), so such a dismissal may have happened after the merge and
-	// the ambiguity is surfaced for an auditor to adjudicate.
-	// Informational — does not affect IsCompliant (compliance is evaluated
-	// point-in-time at merge).
+	// HasPostMergeConcern is true when a review event challenges the
+	// merge-time verdict after the fact: a CHANGES_REQUESTED or DISMISSED
+	// review submitted after the merge, a resolved post-merge dismissal of
+	// a merge-time review (the original state is restored for the verdict;
+	// the dismissal itself is the concern), or a surviving DISMISSED state
+	// whose dismissal time is unknown (legacy rows — ambiguous, surfaced
+	// for an auditor). Informational — does not affect IsCompliant
+	// (compliance is evaluated point-in-time at merge).
 	HasPostMergeConcern bool
 	// IsCleanRevert is true when the commit is a clean revert of a prior
 	// commit. For bot auto-reverts this is trusted by message pattern; for

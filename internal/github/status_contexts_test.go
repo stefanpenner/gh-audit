@@ -112,3 +112,24 @@ func TestGetCheckRuns_LegacyStatusSupplement(t *testing.T) {
 		assert.Zero(t, statusCalls.Load())
 	})
 }
+
+func TestListReviewDismissals_ParsesEvents(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]map[string]any{
+			{"id": 1, "event": "labeled", "created_at": "2026-06-01T09:00:00Z"},
+			{"id": 2, "event": "review_dismissed", "created_at": "2026-06-03T12:00:00Z",
+				"dismissed_review": map[string]any{"state": "approved", "review_id": 900}},
+			{"id": 3, "event": "review_dismissed", "created_at": "2026-06-04T08:00:00Z",
+				"dismissed_review": map[string]any{"state": "changes_requested", "review_id": 901}},
+		})
+	}))
+	defer srv.Close()
+
+	client := NewClient(mockTokenPool(t, srv.URL), testLogger())
+	got, err := client.ListReviewDismissals(context.Background(), "testorg", "repo", 7)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, "approved", got[900].OriginalState)
+	assert.Equal(t, 2026, got[900].At.Year())
+	assert.Equal(t, "changes_requested", got[901].OriginalState)
+}

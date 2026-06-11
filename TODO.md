@@ -1,17 +1,5 @@
 # TODO
 
-## Resolve review-dismissal time via timeline events
-
-GitHub mutates dismissed reviews in place (state → DISMISSED, original
-submitted_at/commit_id retained), so pre-merge-submitted DISMISSED rows are
-ambiguous: dismissed before merge (never stood) or after (was an approval
-at merge time — the point-in-time doctrine says it should count). Today we
-fail closed and flag `HasPostMergeConcern`. The `review_dismissed` issue
-timeline event carries the dismissal timestamp and the original state;
-fetching it for PRs with DISMISSED rows (rare) would make the verdict
-exact. Needs: timeline client method, a reviews.dismissed_at column, and
-cutoff logic that restores post-merge-dismissed approvals.
-
 ## Positional post-approval check in isApprovalRefreshable
 
 The §4 stale-approval carve-out classifies "post-approval commits" by

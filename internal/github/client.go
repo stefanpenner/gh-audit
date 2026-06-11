@@ -815,6 +815,44 @@ func (c *Client) ListPRCommits(ctx context.Context, org, repo string, prNumber i
 	return all, nil
 }
 
+// ListReviewDismissals resolves WHEN each dismissed review on a PR was
+// dismissed and what state it held until then, from the issue-events API
+// ("review_dismissed" events). GitHub mutates dismissed reviews in place —
+// the review row keeps its original submitted_at — so this event stream
+// is the only source of the dismissal time. Keyed by review id.
+func (c *Client) ListReviewDismissals(ctx context.Context, org, repo string, prNumber int) (map[int64]model.ReviewDismissal, error) {
+	out := make(map[int64]model.ReviewDismissal)
+	opts := &gogithub.ListOptions{PerPage: 100}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		gh, err := c.ghClient(ctx, org, repo)
+		if err != nil {
+			return nil, err
+		}
+		events, resp, err := gh.Issues.ListIssueEvents(ctx, org, repo, prNumber, opts)
+		if err != nil {
+			return nil, fmt.Errorf("listing issue events %s/%s#%d page %d: %w", org, repo, prNumber, opts.Page, err)
+		}
+		for _, ev := range events {
+			if ev.GetEvent() != "review_dismissed" || ev.GetDismissedReview() == nil {
+				continue
+			}
+			dr := ev.GetDismissedReview()
+			out[dr.GetReviewID()] = model.ReviewDismissal{
+				At:            ev.GetCreatedAt().Time,
+				OriginalState: dr.GetState(),
+			}
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return out, nil
+}
+
 // ListStatusContexts fetches the legacy commit-status API's combined
 // status for ref and maps each context to a synthetic CheckRun, so §6's
 // required-check evaluation can see CI that reports through /statuses
