@@ -341,16 +341,20 @@ func evaluateRevertCompliance(commit model.Commit, enrichment model.EnrichmentRe
 // and (b) the closest-to-compliant candidate tracked across PRs when no
 // PR is compliant (see betterVerdict).
 type prVerdict struct {
-	pr               *model.PullRequest
-	reasons          []string
-	approvers        []string
-	prBranchCommits  []model.Commit // PR-branch commits (for self-approval ID check)
-	approvalOnFinal  bool           // §4: non-self APPROVED on pr.HeadSHA
-	selfApproved     bool           // §5: any APPROVED whose reviewer is a code author
-	staleApproval    bool           // §4: non-self APPROVED on older SHA
-	postMergeConcern bool           // §4 cutoff: post-merge CHANGES_REQUESTED/DISMISSED
-	ownerApproval    string         // §6: "", "success", "failure", "missing"
-	ownerApprovalOK  bool           // §6: ownerApproval is "" or "success"
+	pr              *model.PullRequest
+	reasons         []string
+	approvers       []string
+	prBranchCommits []model.Commit // PR-branch commits (for self-approval ID check)
+	// latestOnFinal is the per-reviewer latest-state fold computed by
+	// evaluatePR — kept so finalizeNonCompliant can re-derive
+	// HasFinalApproval without folding the review list a second time.
+	latestOnFinal    map[string]model.Review
+	approvalOnFinal  bool   // §4: non-self APPROVED on pr.HeadSHA
+	selfApproved     bool   // §5: any APPROVED whose reviewer is a code author
+	staleApproval    bool   // §4: non-self APPROVED on older SHA
+	postMergeConcern bool   // §4 cutoff: post-merge CHANGES_REQUESTED/DISMISSED
+	ownerApproval    string // §6: "", "success", "failure", "missing"
+	ownerApprovalOK  bool   // §6: ownerApproval is "" or "success"
 }
 
 // evaluatePR scores a single PR against Architecture.md §§4–6 and returns
@@ -370,6 +374,7 @@ func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *mode
 
 	// Phase 1 — per-reviewer latest state on pr.HeadSHA with merge-time cutoff.
 	latestByReviewer, postMergeConcern := latestReviewStatesOnFinal(enrichment.Reviews, *pr)
+	v.latestOnFinal = latestByReviewer
 	v.postMergeConcern = postMergeConcern
 	for _, review := range latestByReviewer {
 		if review.State != "APPROVED" {
@@ -505,8 +510,7 @@ func finalizeNonCompliant(result model.AuditResult, commit model.Commit, enrichm
 		result.PRHref = best.pr.Href
 		result.ApproverLogins = best.approvers
 		result.OwnerApprovalCheck = best.ownerApproval
-		fallbackLatest, _ := latestReviewStatesOnFinal(enrichment.Reviews, *best.pr)
-		for _, review := range fallbackLatest {
+		for _, review := range best.latestOnFinal {
 			if review.State == "APPROVED" && model.TrustedID(review.ReviewerID) && !isSelfApproval(review, commit, *best.pr, best.prBranchCommits) {
 				result.HasFinalApproval = true
 				break

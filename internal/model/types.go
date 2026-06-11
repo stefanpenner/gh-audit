@@ -31,6 +31,13 @@ func ParseCoAuthors(message string) []CoAuthor {
 	seen := make(map[string]struct{}, len(matches))
 	for _, m := range matches {
 		email := strings.TrimSpace(m[2])
+		// A trailer like `Co-authored-by: x < >` regex-matches with a
+		// blank address. Empty emails are useless for attribution and
+		// would collide in the co_authors primary key (org, repo, sha,
+		// email) — drop them.
+		if email == "" {
+			continue
+		}
 		key := strings.ToLower(email)
 		if _, dup := seen[key]; dup {
 			continue
