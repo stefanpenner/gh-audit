@@ -38,6 +38,7 @@ const (
 		committed_at     TIMESTAMP,
 		message          TEXT,
 		parent_count     INTEGER,
+		parent_shas      TEXT,
 		additions        INTEGER,
 		deletions        INTEGER,
 		files_changed    INTEGER,
@@ -203,6 +204,7 @@ var addColumnMigrations = []string{
 	`ALTER TABLE commits ADD COLUMN detail_fetched_at TIMESTAMP`,
 	`ALTER TABLE reviews ADD COLUMN dismissed_at TIMESTAMP`,
 	`ALTER TABLE reviews ADD COLUMN dismissed_state TEXT`,
+	`ALTER TABLE commits ADD COLUMN parent_shas TEXT`,
 }
 
 // allTables is the ordered list of DDL statements to run during migration.

@@ -410,7 +410,7 @@ func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *mode
 			// human-authored bytes the reviewer didn't see — the
 			// approval's intent still covers the merged content.
 			// Promote the review to approvalOnFinal so §4 doesn't fire.
-			if isApprovalRefreshable(review, enrichment.PRBranchCommits[pr.Number], pr.MergeCommitSHA, exemptAuthors) {
+			if isApprovalRefreshable(review, enrichment.PRBranchCommits[pr.Number], pr.HeadSHA, pr.MergeCommitSHA, exemptAuthors) {
 				v.approvalOnFinal = true
 				v.approvers = append(v.approvers, review.ReviewerLogin)
 				continue
@@ -838,35 +838,29 @@ func filterNonEmptyContributors(org, repo string, commits []model.Commit, fetchS
 // isApprovalRefreshable implements the §4 stale-approval carve-out
 // for post-approval commits produced exclusively by exempt-list
 // accounts (typically CI bots performing branch-sync merges, but the
-// rule is more general). Returns true iff every PR-branch commit
-// committed strictly after the approval is authored by an account in
-// the exempt list.
+// rule is more general). Returns true iff every PR-branch commit that
+// landed AFTER the approved snapshot is authored by an account in the
+// exempt list.
 //
-// The trust boundary is the same isExemptCommit matching §1 uses:
-// the numeric AuthorID when present (set by GitHub from the commit's
-// git-author email's verified account binding — a local actor cannot
-// forge it), falling back to the operator-curated verified_emails
-// list when the ID is unresolved. The exempt list is the curated set
-// of accounts the operator has already vetted as not requiring human
-// review (§1); commits by those accounts after an approval don't
-// invalidate the approval's coverage.
+// "After the approved snapshot" is decided POSITIONALLY when parent
+// data is available: the first-parent walk from the PR's final head
+// down to the approval's CommitID is exactly the set of commits the
+// reviewer never saw. Graph ancestry cannot be forged by backdating —
+// a commit between the approved SHA and the head is on that walk no
+// matter what its timestamps claim. The walk fails closed: if the
+// approved CommitID is not reachable (force-push rewrote history, or
+// the walk leaves the known commit set), no promotion happens.
 //
-// One non-exempt commit between approval and merge means real
+// Rows synced before parent SHAs were persisted carry no parent data;
+// for those the check degrades to the historical committer-timestamp
+// comparison, which a backdated GIT_COMMITTER_DATE can evade — one
+// online re-sync upgrades the rows and closes the hole.
+//
+// The trust boundary is the exempt-author match (id, or curated
+// verified_emails for unbound service accounts — see isExemptCommit).
+// One non-exempt commit in the post-approval set means real
 // human-authored code shipped that the reviewer never saw — the
-// original §4 stale flag is the right verdict.
-//
-// An empty post-approval set returns false — the caller only invokes
-// this on an old-SHA review, so a post-approval set should always be
-// non-empty in practice; treating "no post-approval commits" as
-// non-refreshable is the safe default.
-//
-// KNOWN LIMITATION: "committed strictly after the approval" compares
-// CommittedAt, a client-settable timestamp. A backdated human commit
-// pushed after the approval escapes the post-approval set entirely, so
-// an exempt bot commit alongside it can still promote the approval. A
-// positional check (any non-exempt commit anywhere after the approved
-// CommitID in the branch's commit graph) would close this, but the
-// commit parent graph isn't persisted today. See TODO.md.
+// original §4 stale verdict stands.
 //
 // `mergeCommitSHA` is the PR's `merge_commit_sha`. The PR-branch list is
 // built from `commit_prs ⨝ commits`, which links the squash-merge
@@ -875,10 +869,27 @@ func filterNonEmptyContributors(org, repo string, commits []model.Commit, fetchS
 // We skip that SHA before applying the exempt check; otherwise a
 // human-authored squash-merge commit (the normal case for a
 // human-authored PR) would always void the carve-out.
-func isApprovalRefreshable(approval model.Review, prBranchCommits []model.Commit, mergeCommitSHA string, exemptAuthors []model.ExemptAuthor) bool {
+func isApprovalRefreshable(approval model.Review, prBranchCommits []model.Commit, headSHA, mergeCommitSHA string, exemptAuthors []model.ExemptAuthor) bool {
 	if len(prBranchCommits) == 0 {
 		return false
 	}
+
+	if post, ok := postApprovalByGraph(approval.CommitID, headSHA, prBranchCommits); ok {
+		if len(post) == 0 {
+			return false // approved snapshot IS the head — nothing to refresh
+		}
+		for _, c := range post {
+			if mergeCommitSHA != "" && c.SHA == mergeCommitSHA {
+				continue
+			}
+			if !isExemptCommit(c.AuthorID, c.AuthorEmail, exemptAuthors) {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Temporal fallback for rows without parent data (pre-upgrade syncs).
 	postApprovalCount := 0
 	for _, c := range prBranchCommits {
 		if mergeCommitSHA != "" && c.SHA == mergeCommitSHA {
@@ -893,6 +904,42 @@ func isApprovalRefreshable(approval model.Review, prBranchCommits []model.Commit
 		}
 	}
 	return postApprovalCount > 0
+}
+
+// postApprovalByGraph walks first parents from headSHA down to
+// approvedSHA and returns the commits strictly between them (head
+// inclusive, approved snapshot exclusive). ok is false when the walk
+// cannot be performed — no parent data, head missing from the set, or
+// the approved SHA unreachable (force-push) — in which case the caller
+// must not trust a positional answer.
+func postApprovalByGraph(approvedSHA, headSHA string, prBranchCommits []model.Commit) (post []model.Commit, ok bool) {
+	if approvedSHA == "" || headSHA == "" {
+		return nil, false
+	}
+	bySHA := make(map[string]model.Commit, len(prBranchCommits))
+	haveParents := false
+	for _, c := range prBranchCommits {
+		bySHA[c.SHA] = c
+		if len(c.ParentSHAs) > 0 {
+			haveParents = true
+		}
+	}
+	if !haveParents {
+		return nil, false
+	}
+	cur := headSHA
+	for steps := 0; steps <= len(prBranchCommits); steps++ {
+		if cur == approvedSHA {
+			return post, true
+		}
+		c, found := bySHA[cur]
+		if !found || len(c.ParentSHAs) == 0 {
+			return nil, false // walked out of the known set — fail closed
+		}
+		post = append(post, c)
+		cur = c.ParentSHAs[0]
+	}
+	return nil, false // cycle guard tripped — malformed data, fail closed
 }
 
 // hasNonEmptyContribution reports whether any of an author's PR-branch

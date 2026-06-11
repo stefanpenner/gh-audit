@@ -406,3 +406,86 @@ func TestDismissedReview_ResolvedTimesAreExact(t *testing.T) {
 			"at merge time the reviewer was requesting changes — restoring that state is not an approval")
 	})
 }
+
+// The §4 stale-approval carve-out's "post-approval" set is decided by
+// GRAPH POSITION when parent data exists: the first-parent walk from the
+// PR head to the approved CommitID. Backdating GIT_COMMITTER_DATE moved a
+// commit out of the old temporal set; it cannot move out of the ancestry
+// path.
+func TestApprovalRefreshable_PositionalNotTemporal(t *testing.T) {
+	at := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	merged := at.Add(2 * time.Hour)
+	bot := []model.ExemptAuthor{{Login: "ci-bot", ID: 99}}
+
+	commit := model.Commit{
+		Org: "o", Repo: "r", SHA: "squash", AuthorID: 7, AuthorLogin: "dev",
+		Additions: 10, Deletions: 2, ParentCount: 1, CommittedAt: merged,
+	}
+	pr := model.PullRequest{
+		Org: "o", Repo: "r", Number: 1, Merged: true, HeadSHA: "head",
+		AuthorID: 7, MergedAt: merged,
+	}
+	staleApproval := model.Review{
+		PRNumber: 1, ReviewID: 9, ReviewerID: 42, ReviewerLogin: "rev",
+		State: "APPROVED", CommitID: "approved", SubmittedAt: at,
+	}
+	// Branch graph: base <- approved <- human(backdated) <- bot(head)
+	branch := func(humanCommittedAt time.Time) []model.Commit {
+		return []model.Commit{
+			{Org: "o", Repo: "r", SHA: "approved", AuthorID: 7, AuthorLogin: "dev",
+				CommittedAt: at.Add(-time.Hour), Additions: 5, ParentSHAs: []string{"base"}},
+			{Org: "o", Repo: "r", SHA: "human", AuthorID: 7, AuthorLogin: "dev",
+				CommittedAt: humanCommittedAt, Additions: 30, ParentSHAs: []string{"approved"}},
+			{Org: "o", Repo: "r", SHA: "head", AuthorID: 99, AuthorLogin: "ci-bot",
+				CommittedAt: at.Add(time.Hour), Additions: 1, ParentSHAs: []string{"human"}},
+		}
+	}
+	evaluate := func(branchCommits []model.Commit) model.AuditResult {
+		e := model.EnrichmentResult{
+			Commit:          commit,
+			PRs:             []model.PullRequest{pr},
+			Reviews:         []model.Review{staleApproval},
+			PRBranchCommits: map[int][]model.Commit{1: branchCommits},
+		}
+		return EvaluateCommit(commit, e, bot, nil, nil)
+	}
+
+	t.Run("backdated human commit cannot escape the walk", func(t *testing.T) {
+		// Committer date BEFORE the approval — the temporal check would
+		// exclude it from the post-approval set and grant the promotion.
+		result := evaluate(branch(at.Add(-30 * time.Minute)))
+		assert.False(t, result.IsCompliant,
+			"a human commit between the approved SHA and head voids the carve-out regardless of its timestamps")
+		assert.True(t, result.HasStaleApproval)
+	})
+
+	t.Run("bot-only post-approval commits still refresh", func(t *testing.T) {
+		commits := branch(at.Add(30 * time.Minute))
+		commits[1].AuthorID = 99 // the middle commit is the bot's too
+		commits[1].AuthorLogin = "ci-bot"
+		result := evaluate(commits)
+		assert.True(t, result.IsCompliant,
+			"exempt-only post-approval commits keep the approval's coverage")
+	})
+
+	t.Run("force-pushed history fails closed", func(t *testing.T) {
+		commits := branch(at.Add(30 * time.Minute))
+		commits[0].SHA = "rewritten" // approved SHA no longer in the chain
+		commits[1].ParentSHAs = []string{"rewritten"}
+		result := evaluate(commits)
+		assert.False(t, result.IsCompliant,
+			"an unreachable approved SHA means history was rewritten — no promotion")
+	})
+
+	t.Run("legacy rows without parents use the temporal fallback", func(t *testing.T) {
+		commits := branch(at.Add(30 * time.Minute))
+		for i := range commits {
+			commits[i].ParentSHAs = nil
+		}
+		commits[1].AuthorID = 99 // post-approval (by time) commits all exempt
+		commits[1].AuthorLogin = "ci-bot"
+		result := evaluate(commits)
+		assert.True(t, result.IsCompliant,
+			"pre-upgrade rows keep the historical temporal behaviour until re-synced")
+	})
+}

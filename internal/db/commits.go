@@ -13,7 +13,7 @@ import (
 
 var commitColumns = []string{
 	"org", "repo", "sha", "author_login", "author_id", "author_email", "committer_login",
-	"committed_at", "message", "parent_count", "additions", "deletions",
+	"committed_at", "message", "parent_count", "parent_shas", "additions", "deletions",
 	"files_changed", "detail_fetched_at", "is_verified", "href",
 }
 
@@ -29,7 +29,8 @@ func commitRow(c model.Commit) []driver.Value {
 	}
 	return []driver.Value{
 		c.Org, c.Repo, c.SHA, c.AuthorLogin, c.AuthorID, c.AuthorEmail, c.CommitterLogin,
-		c.CommittedAt, c.Message, c.ParentCount, c.Additions, c.Deletions,
+		c.CommittedAt, c.Message, c.ParentCount, strings.Join(c.ParentSHAs, ","),
+		c.Additions, c.Deletions,
 		filesChanged, detailFetchedAt, c.IsVerified, c.Href,
 	}
 }
@@ -37,8 +38,8 @@ func commitRow(c model.Commit) []driver.Value {
 // commitSelectColumns is the canonical SELECT list matching scanCommits'
 // scan order. detail_fetched_at surfaces as the StatsVerified boolean.
 const commitSelectColumns = `org, repo, sha, author_login, author_id, author_email, committer_login,
-	committed_at, message, parent_count, additions, deletions, COALESCE(files_changed, 0),
-	detail_fetched_at IS NOT NULL, is_verified, href`
+	committed_at, message, parent_count, COALESCE(parent_shas, ''), additions, deletions,
+	COALESCE(files_changed, 0), detail_fetched_at IS NOT NULL, is_verified, href`
 
 // preserveCommitDetailSQL guards lazily-fetched commit detail from being
 // clobbered by stat-less re-ingestion. List/compare endpoints never carry
@@ -112,7 +113,7 @@ func (d *DB) UpsertCommitBranches(ctx context.Context, org, repo string, shas []
 func (d *DB) GetUnauditedCommits(ctx context.Context, org, repo string, since, until time.Time) ([]model.Commit, error) {
 	q := `
 		SELECT c.org, c.repo, c.sha, c.author_login, c.author_id, c.author_email, c.committer_login,
-		       c.committed_at, c.message, c.parent_count, c.additions, c.deletions,
+		       c.committed_at, c.message, c.parent_count, COALESCE(c.parent_shas, ''), c.additions, c.deletions,
 		       COALESCE(c.files_changed, 0), c.detail_fetched_at IS NOT NULL, c.is_verified, c.href
 		FROM commits c
 		LEFT JOIN audit_results a ON c.org = a.org AND c.repo = a.repo AND c.sha = a.sha
@@ -344,12 +345,15 @@ func scanCommits(rows interface {
 	for rows.Next() {
 		var c model.Commit
 		var authorID sql.NullInt64
-		var authorLogin, authorEmail, committerLogin, message, href sql.NullString
+		var authorLogin, authorEmail, committerLogin, message, parentSHAs, href sql.NullString
 		var parentCount, additions, deletions, filesChanged sql.NullInt32
 		if err := rows.Scan(&c.Org, &c.Repo, &c.SHA, &authorLogin, &authorID, &authorEmail, &committerLogin,
-			&c.CommittedAt, &message, &parentCount, &additions, &deletions,
+			&c.CommittedAt, &message, &parentCount, &parentSHAs, &additions, &deletions,
 			&filesChanged, &c.StatsVerified, &c.IsVerified, &href); err != nil {
 			return nil, fmt.Errorf("scan commit: %w", err)
+		}
+		if parentSHAs.String != "" {
+			c.ParentSHAs = strings.Split(parentSHAs.String, ",")
 		}
 		c.AuthorLogin = authorLogin.String
 		c.AuthorEmail = authorEmail.String

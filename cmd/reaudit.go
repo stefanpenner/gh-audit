@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -395,7 +396,10 @@ func loadRepoEnrichmentBundle(ctx context.Context, dbConn *db.DB, org, repo stri
 		       c.org, c.repo, c.sha, COALESCE(c.author_login, ''), c.author_id,
 		       COALESCE(c.author_email, ''), COALESCE(c.committer_login, ''),
 		       c.committed_at, COALESCE(c.message, ''), COALESCE(c.parent_count, 0),
-		       COALESCE(c.additions, 0), COALESCE(c.deletions, 0), c.is_verified, COALESCE(c.href, '')
+		       COALESCE(c.parent_shas, ''),
+		       COALESCE(c.additions, 0), COALESCE(c.deletions, 0),
+		       COALESCE(c.files_changed, 0), c.detail_fetched_at IS NOT NULL,
+		       c.is_verified, COALESCE(c.href, '')
 		FROM commits c
 		INNER JOIN commit_prs cp ON c.org = cp.org AND c.repo = cp.repo AND c.sha = cp.sha
 		WHERE cp.org = ? AND cp.repo = ?`, org, repo)
@@ -407,14 +411,20 @@ func loadRepoEnrichmentBundle(ctx context.Context, dbConn *db.DB, org, repo stri
 		var prNumber int
 		var c model.Commit
 		var authorID sql.NullInt64
+		var parentSHAs string
 		if err := cbRows.Scan(&prNumber,
 			&c.Org, &c.Repo, &c.SHA, &c.AuthorLogin, &authorID, &c.AuthorEmail, &c.CommitterLogin,
-			&c.CommittedAt, &c.Message, &c.ParentCount, &c.Additions, &c.Deletions, &c.IsVerified, &c.Href); err != nil {
+			&c.CommittedAt, &c.Message, &c.ParentCount, &parentSHAs,
+			&c.Additions, &c.Deletions, &c.FilesChanged, &c.StatsVerified,
+			&c.IsVerified, &c.Href); err != nil {
 			cbRows.Close()
 			return nil, fmt.Errorf("scan branch commit: %w", err)
 		}
 		if authorID.Valid {
 			c.AuthorID = authorID.Int64
+		}
+		if parentSHAs != "" {
+			c.ParentSHAs = strings.Split(parentSHAs, ",")
 		}
 		b.commitsByPR[prNumber] = append(b.commitsByPR[prNumber], c)
 		// Track the most-recently-appended pointer per SHA so later

@@ -120,8 +120,14 @@ type Commit struct {
 	// NOT NULL). Distinguishes "verified zero" from "never fetched" so
 	// offline re-audits read the same facts the sync-time audit verified.
 	StatsVerified bool
-	Branch        string
-	Href          string
+	// ParentSHAs are the commit's parent hashes in order (first parent
+	// first). Load-bearing for §4's positional post-approval check: the
+	// first-parent walk from a PR's head down to an approval's CommitID
+	// defines "committed after the approval" by GRAPH ANCESTRY, which —
+	// unlike committer timestamps — cannot be backdated.
+	ParentSHAs []string
+	Branch     string
+	Href       string
 }
 
 // A FileDiff is a per-file change in a commit's diff, used for clean-revert

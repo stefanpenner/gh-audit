@@ -44,6 +44,7 @@ classDiagram
         Message string
         IsVerified bool
         ParentCount int
+        ParentSHAs []string
         Additions int
         Deletions int
         Branch string
@@ -85,7 +86,14 @@ classDiagram
         State string
         CommitID string
         SubmittedAt time.Time
+        DismissedAt time.Time
+        DismissedState string
         Href string
+    }
+
+    class ReviewDismissal {
+        At time.Time
+        OriginalState string
     }
 
     class CheckRun {

@@ -232,6 +232,11 @@ func (c *Client) convertRepoCommit(org, repo, branch string, rc *gogithub.Reposi
 		}
 	}
 	commit.ParentCount = len(rc.Parents)
+	for _, p := range rc.Parents {
+		if sha := p.GetSHA(); sha != "" {
+			commit.ParentSHAs = append(commit.ParentSHAs, sha)
+		}
+	}
 	commit.Branch = branch
 	commit.CoAuthors = model.ParseCoAuthors(commit.Message)
 	return commit

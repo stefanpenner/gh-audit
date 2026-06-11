@@ -145,6 +145,8 @@ The carve-out — implemented as `isApprovalRefreshable` in `internal/sync/audit
 
 The exempt-author ID is the unforgeable trust boundary. GitHub binds `AuthorID` to a verified email account; the exempt list contains the curated set of bot/service-account IDs the operator has already vetted as not requiring human review (the same list that drives §1). A local actor cannot make a commit appear to be authored by another account's verified ID without compromising that account. If §1 trusts these accounts to ship without human review, §4 trusts their post-approval commits not to invalidate the reviewer's approval coverage.
 
+**Positional, not temporal.** "After the approved snapshot" is the first-parent walk from the PR's final head down to the approval's `commit_id` (commit parent SHAs are persisted at ingestion). Graph ancestry cannot be forged by backdating `GIT_COMMITTER_DATE` — a commit between the approved SHA and the head is on that walk no matter what its timestamps claim. The walk fails closed: an unreachable approved SHA (force-push) means no promotion. Rows synced before parent persistence degrade to the historical committer-timestamp comparison until one online re-sync upgrades them.
+
 If any post-approval commit is by a non-exempt account, the original §4 stale-approval verdict stands. The carve-out never weakens compliance for cases where real human-authored code shipped after the approval.
 
 ### 5. No self-approval
