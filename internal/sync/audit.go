@@ -370,7 +370,7 @@ func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *mode
 		if review.State != "APPROVED" {
 			continue
 		}
-		if review.ReviewerID == 0 {
+		if !isTrustedID(review.ReviewerID) {
 			continue
 		}
 		if isSelfApproval(review, commit, *pr, v.prBranchCommits) {
@@ -387,7 +387,7 @@ func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *mode
 			if review.PRNumber != pr.Number || review.CommitID == pr.HeadSHA {
 				continue
 			}
-			if review.ReviewerID == 0 {
+			if !isTrustedID(review.ReviewerID) {
 				continue
 			}
 			if review.State != "APPROVED" || isSelfApproval(review, commit, *pr, v.prBranchCommits) {
@@ -502,7 +502,7 @@ func finalizeNonCompliant(result model.AuditResult, commit model.Commit, enrichm
 		result.OwnerApprovalCheck = best.ownerApproval
 		fallbackLatest, _ := latestReviewStatesOnFinal(enrichment.Reviews, *best.pr)
 		for _, review := range fallbackLatest {
-			if review.State == "APPROVED" && review.ReviewerID != 0 && !isSelfApproval(review, commit, *best.pr, best.prBranchCommits) {
+			if review.State == "APPROVED" && isTrustedID(review.ReviewerID) && !isSelfApproval(review, commit, *best.pr, best.prBranchCommits) {
 				result.HasFinalApproval = true
 				break
 			}
@@ -527,7 +527,7 @@ func latestReviewStatesOnFinal(reviews []model.Review, pr model.PullRequest) (ma
 	latest := make(map[string]model.Review)
 	postMergeConcern := false
 	for _, review := range reviews {
-		if review.PRNumber != pr.Number || review.CommitID != pr.HeadSHA || review.ReviewerID == 0 {
+		if review.PRNumber != pr.Number || review.CommitID != pr.HeadSHA || !isTrustedID(review.ReviewerID) {
 			continue
 		}
 		if !pr.MergedAt.IsZero() && review.SubmittedAt.After(pr.MergedAt) {
@@ -535,6 +535,20 @@ func latestReviewStatesOnFinal(reviews []model.Review, pr model.PullRequest) (ma
 				postMergeConcern = true
 			}
 			continue
+		}
+		// GitHub dismisses a review by MUTATING it in place: state flips
+		// to DISMISSED while submitted_at/commit_id keep their original
+		// submission values (the dismissal time lives only in timeline
+		// events we don't fetch). A DISMISSED row submitted pre-merge is
+		// therefore ambiguous — the dismissal may have happened before
+		// the merge (the review never stood) or after it (the review WAS
+		// an approval at merge time and the point-in-time doctrine says
+		// it should count). Fail closed — keep it in the map as a
+		// non-approval — but surface the ambiguity so an auditor decides
+		// instead of the verdict silently depending on sync timing. See
+		// TODO.md for the timeline-event resolution.
+		if review.State == "DISMISSED" && review.CommitID == pr.HeadSHA {
+			postMergeConcern = true
 		}
 		key := reviewerKey(review)
 		existing, exists := latest[key]
@@ -607,6 +621,14 @@ func evaluateRequiredChecks(checkRuns []model.CheckRun, headSHA string, required
 			allPassed = false
 			continue
 		}
+		// An empty conclusion means the run is still queued/in_progress —
+		// it hasn't failed, it just hasn't concluded. Count it as missing
+		// (non-pass) rather than failure so reports don't send auditors
+		// chasing a red build that doesn't exist.
+		if latest.Conclusion == "" {
+			allPassed = false
+			continue
+		}
 		if !strings.EqualFold(latest.Conclusion, rc.Conclusion) {
 			anyFailed = true
 			allPassed = false
@@ -644,7 +666,7 @@ func evaluateRequiredChecks(checkRuns []model.CheckRun, headSHA string, required
 // GitHub's merge button refuses to produce a CleanMerge under conflicts,
 // so no author-contributed bytes can ride along.
 func isSelfApproval(review model.Review, commit model.Commit, pr model.PullRequest, prBranchCommits []model.Commit) bool {
-	if review.ReviewerID == 0 {
+	if !isTrustedID(review.ReviewerID) {
 		return false
 	}
 
@@ -668,11 +690,24 @@ func isSelfApproval(review model.Review, commit model.Commit, pr model.PullReque
 	return false
 }
 
+// ghostUserID is GitHub's shared sentinel account ("ghost", id 10137)
+// substituted for deleted users on PR and review user fields. It is not a
+// real identity: two different deleted people both surface as 10137, and
+// an approval attributed to it is unverifiable.
+const ghostUserID = 10137
+
+// isTrustedID reports whether a numeric account ID is a usable identity:
+// non-zero (resolved) and not the shared ghost sentinel.
+func isTrustedID(id int64) bool {
+	return id != 0 && id != ghostUserID
+}
+
 // sameUser returns true if two GitHub identities refer to the same account.
-// ID-only: returns true only when both IDs are non-zero and equal. Returns
-// false when either ID is missing — no identity claim without immutable proof.
+// ID-only: returns true only when both IDs are trusted and equal. Returns
+// false when either ID is missing or the ghost sentinel — no identity claim
+// without immutable proof (ghost==ghost may be two different deleted users).
 func sameUser(id1, id2 int64) bool {
-	return id1 != 0 && id2 != 0 && id1 == id2
+	return isTrustedID(id1) && isTrustedID(id2) && id1 == id2
 }
 
 // ----- Pure utilities -----

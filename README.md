@@ -187,6 +187,8 @@ tokens:
       - org: my-org
 
 audit_rules:
+  # Names match Checks-API check runs only; CI reporting via the legacy
+  # commit-status API (older Jenkins) is not visible to this rule.
   required_checks:
     - name: "Owner Approval"
       conclusion: success

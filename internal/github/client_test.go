@@ -1014,3 +1014,42 @@ func TestGetBranchHead(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "tipsha123", head)
 }
+
+// /pulls/{n}/commits returns full commit objects; the audit's §1
+// verified_emails fallback and §4 refresh carve-out key on AuthorEmail of
+// PR-branch commits, and squash-merged PRs' branch commits exist ONLY via
+// this endpoint. A hand-rolled mapping that drops the email (and
+// co-authors / verification) silently disables those rules.
+func TestListPRCommits_PopulatesFullCommitShape(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]map[string]any{{
+			"sha":      "bc1",
+			"html_url": "https://github.com/testorg/repo/commit/bc1",
+			"commit": map[string]any{
+				"message": "feat: x\n\nCo-authored-by: Pair <pair@example.com>",
+				"author": map[string]any{
+					"email": "svc-account@corp.example",
+					"date":  "2026-06-01T10:00:00Z",
+				},
+				"committer":    map[string]any{"date": "2026-06-01T10:00:00Z"},
+				"verification": map[string]any{"verified": true},
+			},
+			"author":  map[string]any{"login": "svc", "id": 77},
+			"parents": []map[string]any{{"sha": "p1"}},
+		}})
+	}))
+	defer srv.Close()
+
+	client := NewClient(mockTokenPool(t, srv.URL), testLogger())
+	commits, err := client.ListPRCommits(context.Background(), "testorg", "repo", 5)
+	require.NoError(t, err)
+	require.Len(t, commits, 1)
+	c := commits[0]
+	assert.Equal(t, "svc-account@corp.example", c.AuthorEmail,
+		"§1 verified_emails fallback needs the git-header email")
+	assert.Equal(t, int64(77), c.AuthorID)
+	assert.True(t, c.IsVerified)
+	assert.Equal(t, "https://github.com/testorg/repo/commit/bc1", c.Href)
+	require.Len(t, c.CoAuthors, 1)
+	assert.Equal(t, "pair@example.com", c.CoAuthors[0].Email)
+}

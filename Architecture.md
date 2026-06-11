@@ -105,7 +105,11 @@ For each associated merged PR, gh-audit builds a per-reviewer state map on the P
 
 Per-reviewer resolution: if the same reviewer submits multiple reviews on the final commit, only the latest state-changing review wins. A `DISMISSED` or `CHANGES_REQUESTED` at 11:00 overrides an `APPROVED` at 10:00. A later plain `COMMENTED` review does **not** clobber an earlier `APPROVED` from the same reviewer — matching GitHub's UI, where commenting after approving leaves the approval intact.
 
-**Post-merge cutoff.** Reviews submitted after `pr.merged_at` are excluded from compliance. A post-merge `DISMISSED` or `CHANGES_REQUESTED` instead sets `HasPostMergeConcern=true` so auditors can review the concern on the dedicated XLSX sheet without the commit itself flipping state.
+**Post-merge cutoff.** Reviews submitted after `pr.merged_at` are excluded from compliance. A post-merge `DISMISSED` or `CHANGES_REQUESTED` instead sets `HasPostMergeConcern=true` so auditors can review the concern without the commit itself flipping state.
+
+**Dismissal ambiguity.** GitHub dismisses a review by mutating it in place: `state` flips to `DISMISSED` while `submitted_at`/`commit_id` keep their original submission values (the dismissal time lives only in issue-timeline events, which gh-audit does not fetch). A `DISMISSED` row submitted pre-merge is therefore ambiguous — the dismissal may predate the merge (the review never stood) or postdate it (the review WAS an approval at merge time). gh-audit fails closed (the row never counts as approval) and sets `HasPostMergeConcern` for final-commit dismissals so an auditor adjudicates instead of the verdict silently depending on sync timing. See TODO.md for the timeline-event resolution.
+
+**Untrusted identities.** A review or PR attributed to an unresolved account (`id == 0`) or to GitHub's ghost user (`id == 10137`, substituted for every deleted account) is never trusted: it cannot count as an independent approval, nor prove self-approval — two different deleted people both surface as ghost.
 
 ```
 GET /repos/{o}/{r}/pulls/{n}/reviews
@@ -179,7 +183,9 @@ All approvals are self (or ReviewerID==0)?
 
 ### 6. Required status checks
 
-Configured checks (e.g. `Owner Approval`) must appear on the PR's head SHA with the expected conclusion. Missing or failed checks make the commit **non-compliant**.
+Configured checks (e.g. `Owner Approval`) must appear on the PR's head SHA with the expected conclusion. Missing or failed checks make the commit **non-compliant**. A check whose only runs are still queued/in-progress reports `missing` (it has not failed — it has not concluded).
+
+**Checks API only.** `required_checks` names are matched against Checks-API check runs (`GET /commits/{ref}/check-runs`). CI that reports through the legacy commit-status API (`/statuses`, e.g. older Jenkins setups) is not visible to §6 — a required check configured with a status-context name would read permanently `missing`. See TODO.md.
 
 The same check name can appear multiple times on one SHA (re-runs mint new check-run ids; the DB accumulates them across syncs). Only the **latest** same-named run counts — selected by `completed_at` with `check_run_id` as tiebreak — mirroring GitHub's "latest run wins" UI semantics.
 

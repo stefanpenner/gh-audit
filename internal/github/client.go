@@ -798,23 +798,12 @@ func (c *Client) ListPRCommits(ctx context.Context, org, repo string, prNumber i
 		}
 
 		for _, rc := range commits {
-			commit := model.Commit{
-				Org:  org,
-				Repo: repo,
-				SHA:  rc.GetSHA(),
-			}
-			c.resolveAuthor(&commit, rc)
-			if rc.GetCommitter() != nil {
-				commit.CommitterLogin = rc.GetCommitter().GetLogin()
-			}
-			if rc.GetCommit() != nil {
-				commit.Message = rc.GetCommit().GetMessage()
-				if rc.GetCommit().GetCommitter() != nil {
-					commit.CommittedAt = rc.GetCommit().GetCommitter().GetDate().Time
-				}
-			}
-			commit.ParentCount = len(rc.Parents)
-			all = append(all, commit)
+			// Full conversion, same as every other ingestion path. A
+			// hand-rolled subset here once dropped AuthorEmail — and
+			// squash-merged PRs' branch commits exist ONLY via this
+			// endpoint, so §1's verified_emails fallback and §4's
+			// refresh carve-out silently lost their input.
+			all = append(all, c.convertRepoCommit(org, repo, "", rc))
 		}
 
 		if resp.NextPage == 0 {
@@ -853,6 +842,7 @@ func (c *Client) EnrichCommits(ctx context.Context, org, repo string, shas []str
 				return nil, fmt.Errorf("commit %s PR #%d detail: %w", sha[:12], pr.Number, err)
 			}
 			prs[j].MergedByLogin = fullPR.MergedByLogin
+			prs[j].MergedByID = fullPR.MergedByID
 			if fullPR.HeadSHA != "" {
 				prs[j].HeadSHA = fullPR.HeadSHA
 			}

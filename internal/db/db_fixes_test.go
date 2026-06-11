@@ -186,3 +186,30 @@ func TestUpsertCommits_PreservesVerifiedDetail(t *testing.T) {
 	assert.True(t, got[0].StatsVerified, "verified-zero must not collapse back to never-fetched")
 	assert.Zero(t, got[0].FilesChanged)
 }
+
+// LIST-shape PR responses (backfill's repo index) always omit merged_by; a
+// re-upsert from that shape must not wipe the identity a detail fetch
+// persisted earlier — the report's "self-merged" signal depends on it.
+func TestUpsertPullRequests_PreservesMergedBy(t *testing.T) {
+	db := mustOpenMemory(t)
+	ctx := context.Background()
+
+	rich := model.PullRequest{
+		Org: "o", Repo: "r", Number: 7, Merged: true, HeadSHA: "h",
+		AuthorLogin: "dev", AuthorID: 1,
+		MergedByLogin: "merger", MergedByID: 99,
+		MergedAt: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+	}
+	require.NoError(t, db.UpsertPullRequests(ctx, []model.PullRequest{rich}))
+
+	listShape := rich
+	listShape.MergedByLogin = ""
+	listShape.MergedByID = 0
+	require.NoError(t, db.UpsertPullRequests(ctx, []model.PullRequest{listShape}))
+
+	got, err := db.GetPullRequest(ctx, "o", "r", 7)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "merger", got.MergedByLogin, "detail-only field must survive list-shape re-ingestion")
+	assert.Equal(t, int64(99), got.MergedByID)
+}

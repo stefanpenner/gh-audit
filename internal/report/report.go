@@ -111,17 +111,22 @@ type DetailRow struct {
 	// OtherPRs lists PRs associated with the same commit other than the
 	// audited PRNumber. Empty for commits with a single PR, populated when
 	// PRCount > 1.
-	OtherPRs             []OtherPR `json:"other_prs,omitempty"`
-	MergedByLogin        string    `json:"merged_by_login"`
-	HasFinalApproval     bool      `json:"has_final_approval"`
-	ApproverLogins       string    `json:"approver_logins"`
-	OwnerApprovalCheck   string    `json:"owner_approval_check"`
-	IsCompliant          bool      `json:"is_compliant"`
-	Reasons              string    `json:"reasons"`
-	MergeStrategy        string    `json:"merge_strategy"`
-	PRCommitAuthorLogins string    `json:"pr_commit_author_logins"`
-	CommitHref           string    `json:"commit_href"`
-	BranchName           string    `json:"branch_name"`
+	OtherPRs []OtherPR `json:"other_prs,omitempty"`
+	// AuthorID / MergedByID are the immutable numeric account ids backing
+	// AuthorLogin / MergedByLogin. The self-merged signal compares ids
+	// when both are resolved — logins are mutable and forgery-prone.
+	AuthorID             int64  `json:"author_id"`
+	MergedByID           int64  `json:"merged_by_id"`
+	MergedByLogin        string `json:"merged_by_login"`
+	HasFinalApproval     bool   `json:"has_final_approval"`
+	ApproverLogins       string `json:"approver_logins"`
+	OwnerApprovalCheck   string `json:"owner_approval_check"`
+	IsCompliant          bool   `json:"is_compliant"`
+	Reasons              string `json:"reasons"`
+	MergeStrategy        string `json:"merge_strategy"`
+	PRCommitAuthorLogins string `json:"pr_commit_author_logins"`
+	CommitHref           string `json:"commit_href"`
+	BranchName           string `json:"branch_name"`
 	// Annotations is the comma-joined informational tags (automation
 	// markers, etc.). Non-compliance-bearing; reviewers filter by prefix
 	// like "automation:". See internal/sync/annotations.go.
@@ -339,6 +344,8 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			COALESCE(a.pr_count, 0),
 			COALESCE(a.pr_href, ''),
 			COALESCE(p.merged_by_login, ''),
+			COALESCE(c.author_id, 0),
+			COALESCE(p.merged_by_id, 0),
 			a.has_final_approval,
 			COALESCE(array_to_string(a.approver_logins, ', '), ''),
 			COALESCE(a.owner_approval_check::TEXT, ''),
@@ -411,6 +418,7 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			&d.IsCleanRevert, &d.RevertVerification, &d.RevertedSHA,
 			&d.IsCleanMerge, &d.MergeVerification,
 			&d.HasPR, &d.PRNumber, &d.PRCount, &d.PRHref, &d.MergedByLogin,
+			&d.AuthorID, &d.MergedByID,
 			&d.HasFinalApproval, &d.ApproverLogins,
 			&d.OwnerApprovalCheck, &d.IsCompliant, &d.Reasons, &d.MergeStrategy, &d.PRCommitAuthorLogins, &d.CommitHref, &d.BranchName,
 			&d.Annotations,

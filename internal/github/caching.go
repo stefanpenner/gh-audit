@@ -627,6 +627,7 @@ func (ce *CachingEnricher) enrichOneCommit(ctx context.Context, org, repo, sha s
 		e := enrichments[j]
 		if e.fullPR != nil {
 			prs[j].MergedByLogin = e.fullPR.MergedByLogin
+			prs[j].MergedByID = e.fullPR.MergedByID
 			if e.fullPR.HeadSHA != "" {
 				prs[j].HeadSHA = e.fullPR.HeadSHA
 			}

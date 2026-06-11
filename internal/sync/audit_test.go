@@ -398,6 +398,10 @@ func TestEvaluateCommit_Rule4_ApprovalOnFinal(t *testing.T) {
 			wantCompliant:  false,
 			wantHasPR:      true,
 			wantReasons:    []string{"no approval on final commit (PR #42)"},
+			// GitHub mutates dismissed reviews in place, so a pre-merge
+			// submitted_at cannot prove the dismissal predates the merge —
+			// the ambiguity is surfaced as a post-merge concern.
+			wantPostMergeConcern: true,
 		},
 		{
 			name:   "APPROVED then DISMISSED on final commit is non-compliant",
@@ -410,10 +414,11 @@ func TestEvaluateCommit_Rule4_ApprovalOnFinal(t *testing.T) {
 				},
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 			},
-			requiredChecks: f.requiredChecks,
-			wantCompliant:  false,
-			wantHasPR:      true,
-			wantReasons:    []string{"no approval on final commit (PR #42)"},
+			requiredChecks:       f.requiredChecks,
+			wantCompliant:        false,
+			wantHasPR:            true,
+			wantReasons:          []string{"no approval on final commit (PR #42)"},
+			wantPostMergeConcern: true, // dismissal time is unknowable — surfaced for review
 		},
 		{
 			name:   "APPROVED then COMMENTED on final commit is still compliant",

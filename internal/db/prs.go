@@ -15,6 +15,20 @@ var prColumns = []string{
 	"merge_commit_sha", "author_login", "author_id", "merged_by_login", "merged_by_id", "merged_at", "href",
 }
 
+// preservePRDetailSQL guards detail-only PR fields from being clobbered by
+// list-shape re-ingestion: LIST responses (/pulls?state=closed, used by
+// backfill's repo index) always omit merged_by, so a re-upsert from that
+// shape would wipe the merged_by identity a detail fetch persisted earlier.
+// Runs against the staging table before the merge.
+const preservePRDetailSQL = `
+	UPDATE staging_pull_requests s
+	SET merged_by_login = p.merged_by_login,
+	    merged_by_id    = p.merged_by_id
+	FROM pull_requests p
+	WHERE s.org = p.org AND s.repo = p.repo AND s.number = p.number
+	  AND (s.merged_by_login IS NULL OR s.merged_by_login = '')
+	  AND COALESCE(p.merged_by_login, '') <> ''`
+
 // UpsertPullRequests batch-inserts pull requests using the DuckDB Appender API
 // with a staging table for upsert semantics.
 func (d *DB) UpsertPullRequests(ctx context.Context, prs []model.PullRequest) error {
@@ -31,7 +45,7 @@ func (d *DB) UpsertPullRequests(ctx context.Context, prs []model.PullRequest) er
 		}
 	}
 
-	return d.bulkUpsert(ctx, "pull_requests", prColumns, []string{"org", "repo", "number"}, rows)
+	return d.bulkUpsert(ctx, "pull_requests", prColumns, []string{"org", "repo", "number"}, rows, preservePRDetailSQL)
 }
 
 var reviewColumns = []string{

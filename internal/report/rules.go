@@ -174,6 +174,17 @@ func (o RuleOutcomes) RequiresAction() bool {
 	return o.R7Verdict == OutcomeFail
 }
 
+// isSelfMerged reports whether the commit's author also clicked merge.
+// Prefers the immutable numeric ids (logins are mutable and reclaimable);
+// falls back to login equality only when either id is unresolved, matching
+// the data available on rows synced before merged_by_id was persisted.
+func isSelfMerged(d DetailRow) bool {
+	if d.AuthorID != 0 && d.MergedByID != 0 {
+		return d.AuthorID == d.MergedByID
+	}
+	return d.AuthorLogin != "" && d.MergedByLogin != "" && d.AuthorLogin == d.MergedByLogin
+}
+
 // SynthesizeContext returns a compact, human-readable string of secondary
 // signals about a commit — the "fact pattern" the auditor needs to decide
 // what action to take, beyond the single primary failing rule that
@@ -193,7 +204,7 @@ func (o RuleOutcomes) RequiresAction() bool {
 //   - bot                   — author is a bot account
 func SynthesizeContext(d DetailRow) string {
 	var parts []string
-	if d.AuthorLogin != "" && d.MergedByLogin != "" && d.AuthorLogin == d.MergedByLogin {
+	if isSelfMerged(d) {
 		parts = append(parts, "self-merged")
 	}
 	if d.MergeStrategy != "" && d.MergeStrategy != "unknown" {

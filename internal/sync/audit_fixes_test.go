@@ -232,3 +232,79 @@ func TestOfflineReaudit_UsesVerifiedDetail(t *testing.T) {
 			"offline re-audit must honour sync-verified emptiness instead of flapping to non-compliant")
 	})
 }
+
+// GitHub mutates a dismissed review IN PLACE: state flips to DISMISSED
+// while submitted_at/commit_id keep their original submission values (the
+// dismissal time lives only in timeline events we don't fetch). A
+// DISMISSED row submitted pre-merge is therefore ambiguous — the
+// dismissal could have happened before OR after merge. Fail closed (no
+// approval) but surface the ambiguity as a post-merge concern so an
+// auditor reviews it instead of the verdict silently flipping.
+func TestDismissedReview_PreMergeSubmittedIsSurfacedNotSilent(t *testing.T) {
+	at := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	merged := at.Add(time.Hour)
+	commit := model.Commit{
+		Org: "o", Repo: "r", SHA: "squash", AuthorID: 1, AuthorLogin: "author",
+		Additions: 10, Deletions: 2, ParentCount: 1, CommittedAt: merged,
+	}
+	enrichment := model.EnrichmentResult{
+		Commit: commit,
+		PRs: []model.PullRequest{{
+			Org: "o", Repo: "r", Number: 1, Merged: true, HeadSHA: "head",
+			AuthorID: 1, MergedAt: merged,
+		}},
+		Reviews: []model.Review{{
+			PRNumber: 1, ReviewID: 9, ReviewerID: 42, ReviewerLogin: "rev",
+			State: "DISMISSED", CommitID: "head", SubmittedAt: at, // pre-merge timestamp
+		}},
+	}
+
+	result := EvaluateCommit(commit, enrichment, nil, nil, nil)
+
+	assert.False(t, result.IsCompliant, "an ambiguous dismissed review must not count as approval")
+	assert.True(t, result.HasPostMergeConcern,
+		"the dismissal may have happened post-merge; auditors must see it")
+}
+
+// Deleted GitHub accounts surface as the ghost user (id 10137) on PR and
+// review user fields — a shared sentinel, not a real identity. It must be
+// distrusted exactly like an unresolved (zero) ID: a ghost approval can't
+// satisfy §4, and two different deleted people must not compare as the
+// same user.
+func TestGhostUser_IsNeverTrusted(t *testing.T) {
+	at := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	merged := at.Add(time.Hour)
+	commit := model.Commit{
+		Org: "o", Repo: "r", SHA: "squash", AuthorID: ghostUserID, AuthorLogin: "ghost",
+		Additions: 10, Deletions: 2, ParentCount: 1, CommittedAt: merged,
+	}
+	enrichment := model.EnrichmentResult{
+		Commit: commit,
+		PRs: []model.PullRequest{{
+			Org: "o", Repo: "r", Number: 1, Merged: true, HeadSHA: "head",
+			AuthorID: ghostUserID, MergedAt: merged,
+		}},
+		Reviews: []model.Review{{
+			PRNumber: 1, ReviewID: 9, ReviewerID: ghostUserID, ReviewerLogin: "ghost",
+			State: "APPROVED", CommitID: "head", SubmittedAt: at,
+		}},
+	}
+
+	result := EvaluateCommit(commit, enrichment, nil, nil, nil)
+	assert.False(t, result.IsCompliant,
+		"an approval attributed to the ghost user is unverifiable and must not pass §4")
+	assert.False(t, result.IsSelfApproved,
+		"ghost==ghost is two unknown identities, not a proven self-approval")
+}
+
+// A required check whose only runs are queued/in_progress hasn't FAILED —
+// it just hasn't concluded. Reporting "failure" sent auditors chasing a
+// nonexistent red build; "missing" is the accurate pending label (the
+// commit stays non-compliant either way).
+func TestRequiredChecks_QueuedOnlyIsMissingNotFailure(t *testing.T) {
+	required := []RequiredCheck{{Name: "Owner Approval", Conclusion: "success"}}
+	runs := []model.CheckRun{
+		{CommitSHA: "head", CheckName: "Owner Approval", Status: "in_progress", CheckRunID: 1},
+	}
+	assert.Equal(t, "missing", evaluateRequiredChecks(runs, "head", required))
+}
