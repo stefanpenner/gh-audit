@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -30,8 +31,11 @@ func newAnnotateCommitsCmd() *cobra.Command {
 		Use:   "annotate-commits",
 		Short: "Populate audit_results.annotations from commit messages for every row (no API calls)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg := loadConfigOrDefault(cfgFile)
-			dbConn, err := db.Open(resolveDBPath(cfg))
+			cfg, err := loadConfigOrDefault(cfgFile, cmd.Flag("config").Changed)
+			if err != nil {
+				return err
+			}
+			dbConn, err := db.Open(resolveDBPath(cfg, cmd.Flag("db").Changed))
 			if err != nil {
 				return fmt.Errorf("opening database: %w", err)
 			}
@@ -47,7 +51,7 @@ func newAnnotateCommitsCmd() *cobra.Command {
 func runAnnotateCommits(ctx context.Context, dbConn *db.DB, logger *slog.Logger, repoFilter []string, dryRun bool) error {
 	args := []any{}
 	sqlText := `
-SELECT a.org, a.repo, a.sha, c.message
+SELECT a.org, a.repo, a.sha, c.message, a.annotations
 FROM audit_results a
 JOIN commits c ON c.org = a.org AND c.repo = a.repo AND c.sha = a.sha
 `
@@ -67,15 +71,24 @@ JOIN commits c ON c.org = a.org AND c.repo = a.repo AND c.sha = a.sha
 	if err != nil {
 		return fmt.Errorf("annotate-commits query: %w", err)
 	}
-	type row struct{ org, repo, sha, message string }
+	type row struct {
+		org, repo, sha, message string
+		existing                []string
+	}
 	var all []row
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.org, &r.repo, &r.sha, &r.message); err != nil {
+		var existing any
+		if err := rows.Scan(&r.org, &r.repo, &r.sha, &r.message, &existing); err != nil {
 			rows.Close()
 			return err
 		}
+		r.existing = scanList(existing)
 		all = append(all, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("annotate-commits row iteration: %w", err)
 	}
 	rows.Close()
 	logger.Info("annotate-commits candidates", "count", len(all))
@@ -86,12 +99,14 @@ JOIN commits c ON c.org = a.org AND c.repo = a.repo AND c.sha = a.sha
 		tags := syncer.ComputeAnnotations(model.Commit{Org: r.org, Repo: r.repo, SHA: r.sha, Message: r.message}, model.EnrichmentResult{})
 		if len(tags) == 0 {
 			empty++
-			if !dryRun {
-				// Clear any prior annotations for this row — keeps the column
-				// consistent with the current detector output.
-				if _, err := dbConn.DB.ExecContext(ctx,
-					"UPDATE audit_results SET annotations = NULL WHERE org = ? AND repo = ? AND sha = ?",
-					r.org, r.repo, r.sha); err != nil {
+			// Clear any prior annotations so the column stays consistent
+			// with the current detector output. A plain `UPDATE SET
+			// annotations = NULL` hits the same DuckDB UPDATE-on-LIST
+			// limitation described below, so the clear goes through the
+			// same delete+reinsert path. Rows already empty are skipped
+			// — this keeps repeat runs cheap and idempotent.
+			if !dryRun && len(r.existing) > 0 {
+				if err := writeAnnotationsForRow(ctx, dbConn, r.org, r.repo, r.sha, nil); err != nil {
 					logger.Warn("clear annotations failed", "sha", r.sha[:min(12, len(r.sha))], "error", err)
 				}
 			}
@@ -101,7 +116,7 @@ JOIN commits c ON c.org = a.org AND c.repo = a.repo AND c.sha = a.sha
 		for _, t := range tags {
 			tagHistogram[t]++
 		}
-		if dryRun {
+		if dryRun || slices.Equal(tags, r.existing) {
 			continue
 		}
 		// DuckDB's UPDATE on a row with LIST columns internally does
@@ -184,9 +199,6 @@ WHERE org = ? AND repo = ? AND sha = ?`, org, repo, sha)
 	r.Annotations = tags
 	r.AuditedAt = time.Now()
 
-	if err := dbConn.DeleteAuditResultsBySHA(ctx, org, repo, sha); err != nil {
-		return fmt.Errorf("delete: %w", err)
-	}
 	if err := dbConn.UpsertAuditResults(ctx, []model.AuditResult{r}); err != nil {
 		return fmt.Errorf("reinsert: %w", err)
 	}

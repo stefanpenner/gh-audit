@@ -1,11 +1,13 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -41,11 +43,11 @@ type ManagedToken struct {
 	rateRemaining      atomic.Int64
 	rateLimit          atomic.Int64
 	rateResetAt        atomic.Int64 // unix timestamp (primary quota reset)
+	headerMu           sync.Mutex   // serialises rate-limit header updates (see updateRateLimitHeaders)
 	abuseCooldownUntil atomic.Int64 // unix timestamp (set by secondary rate limit); Pick skips while > now
 	inFlight           atomic.Int64
 	scopes             []OrgScope
 	disabled           atomic.Bool
-	mu                 sync.Mutex
 }
 
 // OrgScope defines the org/repo scope a token is authorized for.
@@ -77,10 +79,15 @@ const defaultGlobalInFlightCap = 300
 // enrichPRFanout can geometrically blow past GitHub's ~480 concurrent ceiling)
 // from triggering secondary rate limits.
 type TokenPool struct {
-	tokens  []*ManagedToken
-	mu      sync.RWMutex
-	logger  *slog.Logger
+	tokens   []*ManagedToken
+	mu       sync.RWMutex
+	logger   *slog.Logger
 	inFlight chan struct{} // counting semaphore: size = global cap
+
+	// sleep is the wait primitive used for rate-limit backoff. nil means
+	// real time (sleepCtx). Tests inject an instant variant so retry paths
+	// run in microseconds instead of wall-clock seconds.
+	sleep func(ctx context.Context, d time.Duration) error
 
 	// Event counters — atomically updated, surfaced through Snapshot for
 	// telemetry. Let operators see "is this sweep slow because of primary
@@ -106,6 +113,28 @@ func NewTokenPoolWithCap(logger *slog.Logger, globalInFlightCap int) *TokenPool 
 		p.inFlight = make(chan struct{}, globalInFlightCap)
 	}
 	return p
+}
+
+// sleepCtx blocks for d or until ctx is cancelled, whichever comes first.
+// Returns ctx.Err() on cancellation, nil after a full sleep.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// sleepFor waits via the pool's injected sleep when present, real time
+// otherwise.
+func (p *TokenPool) sleepFor(ctx context.Context, d time.Duration) error {
+	if p != nil && p.sleep != nil {
+		return p.sleep(ctx, d)
+	}
+	return sleepCtx(ctx, d)
 }
 
 // acquireInFlight blocks until a concurrency slot is available, honouring
@@ -301,7 +330,11 @@ func (p *TokenPool) Pick(ctx context.Context, org, repo string) (*http.Client, e
 		// All tokens exhausted — wait until the earliest reset.
 		delay := time.Until(waitUntil)
 		if delay <= 0 {
-			// Reset time already passed; retry immediately.
+			// Reset time already passed; retry immediately — but never
+			// without honouring cancellation, or this loop can spin hot.
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("context cancelled while waiting for rate limit reset: %w", err)
+			}
 			continue
 		}
 
@@ -312,12 +345,8 @@ func (p *TokenPool) Pick(ctx context.Context, org, repo string) (*http.Client, e
 			"reset_at", waitUntil,
 		)
 
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, fmt.Errorf("context cancelled while waiting for rate limit reset: %w", ctx.Err())
-		case <-timer.C:
+		if err := p.sleepFor(ctx, delay); err != nil {
+			return nil, fmt.Errorf("context cancelled while waiting for rate limit reset: %w", err)
 		}
 	}
 }
@@ -334,8 +363,13 @@ func (p *TokenPool) tryPick(org, repo string) (*http.Client, time.Time, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
+	// bestScore starts at the minimum so ANY eligible token is pickable.
+	// Scores go negative whenever inFlight exceeds rateRemaining; a -1
+	// sentinel here used to make every such token unpickable, leaving
+	// best == nil with no earliestReset recorded and sending Pick into a
+	// 100%-CPU spin on its zero-delay retry path.
 	var best *ManagedToken
-	var bestScore int64 = -1
+	var bestScore int64 = math.MinInt64
 	var earliestReset time.Time
 	found := false
 
@@ -423,6 +457,20 @@ type rateLimitTransport struct {
 	token  *ManagedToken
 	pool   *TokenPool
 	logger *slog.Logger
+
+	// sleep overrides the backoff wait primitive. nil falls through to the
+	// pool's sleep (when set) and then to real time. Tests inject an
+	// instant variant.
+	sleep func(ctx context.Context, d time.Duration) error
+}
+
+// sleepFor waits via the transport's injected sleep, the pool's, or real
+// time — first one set wins.
+func (t *rateLimitTransport) sleepFor(ctx context.Context, d time.Duration) error {
+	if t.sleep != nil {
+		return t.sleep(ctx, d)
+	}
+	return t.pool.sleepFor(ctx, d)
 }
 
 // maxRateLimitReassigns bounds how many times RoundTrip will transparently
@@ -598,94 +646,53 @@ func (t *rateLimitTransport) doRoundTrip(req *http.Request) (*http.Response, err
 
 	switch resp.StatusCode {
 	case 403:
+		return t.classify403(req, resp, true)
+
+	case 429:
 		body, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if readErr != nil {
-			return nil, fmt.Errorf("reading 403 response body: %w", readErr)
+			return nil, fmt.Errorf("reading 429 response body: %w", readErr)
 		}
 		bodyStr := strings.ToLower(string(body))
 
-		// Secondary rate limit / abuse detection → exponential-backoff retry.
-		// GitHub's abuse detector sometimes masquerades as a permission error
-		// ("Resource not accessible by integration") under concentrated load,
-		// so we route those through the same retry path when the token's
-		// remaining primary budget is healthy (i.e. not a real 403 from
-		// quota exhaustion). Real permission gaps surface after retries
-		// are exhausted, taking ~minutes per request; acceptable because
-		// a truly broken repo will hit the same wall repeatedly and can
-		// be diagnosed quickly.
+		// GitHub serves secondary rate limits / abuse blocks as 429 as well
+		// as 403. Route them through the cooldown path so the outer
+		// RoundTrip re-picks a healthy token instead of hammering the
+		// poisoned one with an in-place retry.
 		if strings.Contains(bodyStr, "abuse") || strings.Contains(bodyStr, "secondary rate limit") {
 			return t.markSecondaryRateLimit(resp.Header.Get("Retry-After"), string(body))
 		}
-		if strings.Contains(bodyStr, "resource not accessible by integration") &&
-			t.token.rateRemaining.Load() > rateLimitThreshold {
-			t.logger.Warn("403 resource-not-accessible under healthy budget; retrying as transient abuse",
-				"token_id", t.token.ID,
-				"url", req.URL.String(),
-				"remaining", t.token.rateRemaining.Load(),
-			)
-			return t.markSecondaryRateLimit(resp.Header.Get("Retry-After"), string(body))
-		}
 
-		// Primary rate limit — GitHub's per-token 5000/hr quota exhausted.
-		// The body says `API rate limit exceeded for installation ID <id>`.
-		// The x-ratelimit-reset header we just processed tells us when the
-		// budget refills; return a classified error so the caller (Pick
-		// users) can observe the failure instead of a silent retry that
-		// blocks for minutes.
-		if strings.Contains(bodyStr, "api rate limit exceeded") {
-			if t.pool != nil {
-				t.pool.primaryRateLimitEvents.Add(1)
-			}
-			resetAt := time.Unix(t.token.rateResetAt.Load(), 0)
-			return nil, &PrimaryRateLimitError{
-				TokenID: t.token.ID,
-				ResetAt: resetAt,
-				Message: string(body),
-			}
-		}
-
-		// Basic one-shot retry for other 403s. Covers transient permission
-		// hiccups (e.g. token rotation) without slowing down hard failures.
-		timer := time.NewTimer(2 * time.Second)
-		select {
-		case <-req.Context().Done():
-			timer.Stop()
-			return nil, req.Context().Err()
-		case <-timer.C:
+		// Plain 429: sleep and retry once.
+		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+		if err := t.sleepFor(req.Context(), retryAfter); err != nil {
+			return nil, err
 		}
 		retry, retryErr := t.base.RoundTrip(req)
 		if retryErr != nil {
 			return nil, retryErr
 		}
 		t.updateRateLimitHeaders(retry)
-		return retry, nil
-
-	case 429:
-		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
-		resp.Body.Close()
-
-		// Sleep and retry once.
-		timer := time.NewTimer(retryAfter)
-		select {
-		case <-req.Context().Done():
-			timer.Stop()
-			return nil, req.Context().Err()
-		case <-timer.C:
+		switch retry.StatusCode {
+		case 429:
+			// Still throttled after the one-shot retry — treat as a
+			// secondary rate limit so the token cools down and the request
+			// migrates to another token rather than surfacing a raw 429.
+			rbody, _ := io.ReadAll(retry.Body)
+			retry.Body.Close()
+			return t.markSecondaryRateLimit(retry.Header.Get("Retry-After"), string(rbody))
+		case 403:
+			return t.classify403(req, retry, false)
 		}
-
-		return t.base.RoundTrip(req)
+		return retry, nil
 
 	case 500, 502, 503, 504:
 		resp.Body.Close()
 		for attempt := 1; attempt <= 3; attempt++ {
 			delay := time.Duration(attempt) * 2 * time.Second
-			timer := time.NewTimer(delay)
-			select {
-			case <-req.Context().Done():
-				timer.Stop()
-				return nil, req.Context().Err()
-			case <-timer.C:
+			if err := t.sleepFor(req.Context(), delay); err != nil {
+				return nil, err
 			}
 			retry, retryErr := t.base.RoundTrip(req)
 			if retryErr != nil {
@@ -705,22 +712,151 @@ func (t *rateLimitTransport) doRoundTrip(req *http.Request) (*http.Response, err
 	return resp, nil
 }
 
-// updateRateLimitHeaders reads GitHub rate limit headers and updates the token state.
+// classify403 routes a 403 response through abuse / primary-rate-limit
+// classification:
+//
+//   - Secondary rate limit / abuse detection → markSecondaryRateLimit so the
+//     token cools down and the outer RoundTrip re-picks. GitHub's abuse
+//     detector sometimes masquerades as a permission error ("Resource not
+//     accessible by integration") under concentrated load, so those are
+//     routed the same way when the token's remaining primary budget is
+//     healthy (i.e. not a real 403 from quota exhaustion).
+//   - Primary quota exhaustion → PrimaryRateLimitError.
+//   - Anything else, when allowRetry is true → one 2-second-backoff retry,
+//     whose response is fed back through this same classification with
+//     allowRetry=false (bounding recursion at one level) so an abuse 403 on
+//     the retry cannot bypass the cooldown machinery.
+//   - Anything else, when allowRetry is false → the 403 response itself,
+//     with its body restored so callers can read the error payload.
+func (t *rateLimitTransport) classify403(req *http.Request, resp *http.Response, allowRetry bool) (*http.Response, error) {
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("reading 403 response body: %w", readErr)
+	}
+	bodyStr := strings.ToLower(string(body))
+
+	if strings.Contains(bodyStr, "abuse") || strings.Contains(bodyStr, "secondary rate limit") {
+		return t.markSecondaryRateLimit(resp.Header.Get("Retry-After"), string(body))
+	}
+	if strings.Contains(bodyStr, "resource not accessible by integration") &&
+		t.token.rateRemaining.Load() > rateLimitThreshold {
+		t.logger.Warn("403 resource-not-accessible under healthy budget; retrying as transient abuse",
+			"token_id", t.token.ID,
+			"url", req.URL.String(),
+			"remaining", t.token.rateRemaining.Load(),
+		)
+		return t.markSecondaryRateLimit(resp.Header.Get("Retry-After"), string(body))
+	}
+
+	// Primary rate limit — GitHub's per-token 5000/hr quota exhausted.
+	// The body says `API rate limit exceeded for installation ID <id>`.
+	// The x-ratelimit-reset header we just processed tells us when the
+	// budget refills; return a classified error so the caller (Pick
+	// users) can observe the failure instead of a silent retry that
+	// blocks for minutes.
+	if strings.Contains(bodyStr, "api rate limit exceeded") {
+		if t.pool != nil {
+			t.pool.primaryRateLimitEvents.Add(1)
+		}
+		resetAt := time.Unix(t.token.rateResetAt.Load(), 0)
+		return nil, &PrimaryRateLimitError{
+			TokenID: t.token.ID,
+			ResetAt: resetAt,
+			Message: string(body),
+		}
+	}
+
+	if !allowRetry {
+		// Retry budget spent and still unclassifiable: surface the 403 with
+		// its body restored so callers can read the error payload.
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		return resp, nil
+	}
+
+	// Basic one-shot retry for other 403s. Covers transient permission
+	// hiccups (e.g. token rotation) without slowing down hard failures.
+	if err := t.sleepFor(req.Context(), 2*time.Second); err != nil {
+		return nil, err
+	}
+	retry, retryErr := t.base.RoundTrip(req)
+	if retryErr != nil {
+		return nil, retryErr
+	}
+	t.updateRateLimitHeaders(retry)
+	switch retry.StatusCode {
+	case 403:
+		return t.classify403(req, retry, false)
+	case 429:
+		// GitHub also serves secondary rate limits as 429; a throttle on
+		// the retry must cool the token down and re-pick, not surface as
+		// a raw response (mirrors the 429-path's handling of a follow-up
+		// 403).
+		retryAfter := retry.Header.Get("Retry-After")
+		body, _ := io.ReadAll(retry.Body)
+		retry.Body.Close()
+		return t.markSecondaryRateLimit(retryAfter, string(body))
+	}
+	return retry, nil
+}
+
+// updateRateLimitHeaders reads GitHub rate limit headers and updates the
+// token state.
+//
+// Responses can complete out of order, so the update is serialised under the
+// token's headerMu (keeping the remaining/resetAt pair coherent) with a
+// monotonic guard: within the same reset window `remaining` only ever
+// decreases, so an update carrying the same x-ratelimit-reset but a HIGHER
+// remaining is a late-arriving older response and is ignored — otherwise it
+// would resurrect an exhausted token. A response whose reset is older than
+// the stored window is ignored for the same reason; an advancing reset
+// (new window) is always accepted.
 func (t *rateLimitTransport) updateRateLimitHeaders(resp *http.Response) {
-	if v := resp.Header.Get("x-ratelimit-remaining"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			t.token.rateRemaining.Store(n)
+	parse := func(header string) (int64, bool) {
+		v := resp.Header.Get(header)
+		if v == "" {
+			return 0, false
 		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return n, true
 	}
-	if v := resp.Header.Get("x-ratelimit-limit"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			t.token.rateLimit.Store(n)
-		}
+	remaining, hasRemaining := parse("x-ratelimit-remaining")
+	limit, hasLimit := parse("x-ratelimit-limit")
+	reset, hasReset := parse("x-ratelimit-reset")
+
+	tok := t.token
+	tok.headerMu.Lock()
+	defer tok.headerMu.Unlock()
+
+	if hasLimit {
+		tok.rateLimit.Store(limit)
 	}
-	if v := resp.Header.Get("x-ratelimit-reset"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			t.token.rateResetAt.Store(n)
+	if !hasReset {
+		// No window to compare against — apply remaining as-is.
+		if hasRemaining {
+			tok.rateRemaining.Store(remaining)
 		}
+		return
+	}
+	cur := tok.rateResetAt.Load()
+	switch {
+	case reset > cur:
+		// New window — always accept.
+		tok.rateResetAt.Store(reset)
+		if hasRemaining {
+			tok.rateRemaining.Store(remaining)
+		}
+	case reset == cur:
+		// Same window: remaining only decreases; a higher value is an
+		// out-of-order older response.
+		if hasRemaining && remaining < tok.rateRemaining.Load() {
+			tok.rateRemaining.Store(remaining)
+		}
+	default:
+		// reset < cur: stale response from a previous window — ignore.
 	}
 }
 
@@ -731,9 +867,9 @@ func (t *rateLimitTransport) updateRateLimitHeaders(resp *http.Response) {
 // token immediately and let other pool members (or the hourly primary
 // reset) absorb traffic.
 const (
-	abuseCooldownBase       = 90 * time.Second
-	abuseCooldownEscalated  = 15 * time.Minute
-	abuseRepeatWindow       = 3 * time.Minute
+	abuseCooldownBase      = 90 * time.Second
+	abuseCooldownEscalated = 15 * time.Minute
+	abuseRepeatWindow      = 3 * time.Minute
 )
 
 // markSecondaryRateLimit records that GitHub's secondary rate limit / abuse
@@ -766,7 +902,9 @@ func (t *rateLimitTransport) markSecondaryRateLimit(retryAfterHeader, body strin
 	until := now.Add(cooldown).Unix()
 	// Never hold a cooldown past the token's hourly primary reset — at that
 	// point the whole budget refills and abuse state typically also clears.
-	if rr := t.token.rateResetAt.Load(); rr > 0 && rr < until {
+	// Only clamp to a FUTURE reset: a stale, already-passed rateResetAt
+	// would otherwise zero out the cooldown entirely.
+	if rr := t.token.rateResetAt.Load(); rr > now.Unix() && rr < until {
 		until = rr
 	}
 	for {
@@ -818,15 +956,22 @@ func (e *PrimaryRateLimitError) Error() string {
 		e.TokenID, e.ResetAt.Format(time.RFC3339))
 }
 
-// parseRetryAfter parses the Retry-After header value as seconds.
-// Returns 60s as default if parsing fails.
+// parseRetryAfter parses the Retry-After header value, accepting both
+// delta-seconds and HTTP-date forms (RFC 9110 allows either). A past
+// HTTP-date clamps to zero. Returns 60s as default if parsing fails.
 func parseRetryAfter(val string) time.Duration {
 	if val == "" {
 		return 60 * time.Second
 	}
-	secs, err := strconv.Atoi(val)
-	if err != nil {
-		return 60 * time.Second
+	if secs, err := strconv.Atoi(val); err == nil {
+		return time.Duration(secs) * time.Second
 	}
-	return time.Duration(secs) * time.Second
+	if at, err := http.ParseTime(val); err == nil {
+		d := time.Until(at)
+		if d < 0 {
+			return 0
+		}
+		return d
+	}
+	return 60 * time.Second
 }

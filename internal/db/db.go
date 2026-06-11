@@ -75,13 +75,19 @@ func (d *DB) migrate(ctx context.Context) error {
 		}
 	}
 
-	// Migrate check_runs enum columns to TEXT for forward-compatibility
-	// with new GitHub API values. Ignore errors if already TEXT.
-	for _, col := range []string{"status", "conclusion"} {
-		sql := fmt.Sprintf("ALTER TABLE check_runs ALTER COLUMN %s SET DATA TYPE TEXT", col)
+	// Migrate enum columns to TEXT for forward-compatibility with new
+	// GitHub API values (PENDING draft reviews, future check states).
+	// Ignore errors if already TEXT.
+	enumToText := []struct{ table, col string }{
+		{"check_runs", "status"},
+		{"check_runs", "conclusion"},
+		{"reviews", "state"},
+	}
+	for _, m := range enumToText {
+		sql := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DATA TYPE TEXT", m.table, m.col)
 		if _, err := d.DB.ExecContext(ctx, sql); err != nil {
 			if !strings.Contains(err.Error(), "same type") {
-				return fmt.Errorf("migrating check_runs.%s to TEXT: %w", col, err)
+				return fmt.Errorf("migrating %s.%s to TEXT: %w", m.table, m.col, err)
 			}
 		}
 	}

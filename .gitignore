@@ -1,2 +1,5 @@
 .claude/worktrees/
 gh-audit
+examples/audit.db
+examples/audit-report.xlsx
+examples/telemetry.jsonl

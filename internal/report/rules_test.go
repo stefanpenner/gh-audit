@@ -94,7 +94,8 @@ func TestDeriveRuleOutcomes(t *testing.T) {
 			},
 		},
 		{
-			name: "clean revert waiver flips verdict",
+			// Pipeline applied the R8 waiver and stored a compliant verdict.
+			name: "clean revert waiver applied by pipeline",
 			d: DetailRow{
 				HasPR: false, IsCleanRevert: true, IsCompliant: true,
 			},
@@ -104,6 +105,21 @@ func TestDeriveRuleOutcomes(t *testing.T) {
 				R4bStale: OutcomeNA, R4cPostMergeConcern: OutcomeNA,
 				R5SelfApproval: OutcomeNA, R6OwnerCheck: OutcomeNA,
 				R7Verdict: OutcomePass, R8RevertWaiver: OutcomeWaived,
+			},
+		},
+		{
+			// Pipeline detected a clean revert but did NOT waive — the report
+			// layer must surface the stored fail verdict, not override it.
+			name: "non-compliant clean revert keeps fail verdict",
+			d: DetailRow{
+				HasPR: false, IsCleanRevert: true, IsCompliant: false,
+			},
+			want: RuleOutcomes{
+				R1Exempt: OutcomeSkip, R2Empty: OutcomeSkip,
+				R3HasPR: OutcomeFail, R4FinalApproval: OutcomeNA,
+				R4bStale: OutcomeNA, R4cPostMergeConcern: OutcomeNA,
+				R5SelfApproval: OutcomeNA, R6OwnerCheck: OutcomeNA,
+				R7Verdict: OutcomeFail, R8RevertWaiver: OutcomeWaived,
 			},
 		},
 	}
@@ -124,7 +140,8 @@ func TestRequiresAction(t *testing.T) {
 		{"compliant", DetailRow{HasPR: true, HasFinalApproval: true, IsCompliant: true}, false},
 		{"exempt waives non-compliant", DetailRow{IsExemptAuthor: true, IsCompliant: true}, false},
 		{"empty waives non-compliant", DetailRow{IsEmptyCommit: true, IsCompliant: true}, false},
-		{"clean revert waives non-compliant", DetailRow{IsCleanRevert: true, IsCompliant: true}, false},
+		{"compliant clean revert needs no action", DetailRow{IsCleanRevert: true, IsCompliant: true}, false},
+		{"non-compliant clean revert stays on queue (no report-layer override)", DetailRow{IsCleanRevert: true, IsCompliant: false}, true},
 		{"no-PR fail triggers action", DetailRow{HasPR: false, IsCompliant: false}, true},
 		{"self-approved triggers action", DetailRow{HasPR: true, HasFinalApproval: true, IsSelfApproved: true, IsCompliant: false}, true},
 	}

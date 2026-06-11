@@ -97,7 +97,7 @@ func TestClassifyMerge(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := ClassifyMerge(tt.parentCount, tt.message, tt.committerLogin, tt.isVerified)
 			assert.Equal(t, tt.want, got)
-			assert.Equal(t, tt.wantVerif, mergeKindVerification(got))
+			assert.Equal(t, tt.wantVerif, MergeKindVerification(got))
 		})
 	}
 }

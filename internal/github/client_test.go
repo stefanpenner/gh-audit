@@ -175,7 +175,7 @@ func TestListCommits(t *testing.T) {
 									"date":  "2024-01-15T10:00:00Z",
 								},
 							},
-							"author": map[string]any{"login": "dev1", "id": 100001},
+							"author":  map[string]any{"login": "dev1", "id": 100001},
 							"parents": []map[string]any{},
 						},
 					}
@@ -192,7 +192,7 @@ func TestListCommits(t *testing.T) {
 									"date":  "2024-01-16T10:00:00Z",
 								},
 							},
-							"author": map[string]any{"login": "dev2", "id": 100002},
+							"author":  map[string]any{"login": "dev2", "id": 100002},
 							"parents": []map[string]any{},
 						},
 					}
@@ -286,7 +286,7 @@ func TestListCommitsUsesCommitterDate(t *testing.T) {
 						"date":  committerDate,
 					},
 				},
-				"author": map[string]any{"login": "developer", "id": 200001},
+				"author":  map[string]any{"login": "developer", "id": 200001},
 				"parents": []map[string]any{},
 			},
 		}
@@ -595,6 +595,7 @@ func TestRateLimitTransport_Retries5xx(t *testing.T) {
 	transport := &rateLimitTransport{
 		base:  &overrideURLTransport{base: http.DefaultTransport, baseURL: srv.URL},
 		token: token,
+		sleep: instantSleep,
 	}
 
 	client := &http.Client{Transport: transport}
@@ -620,6 +621,7 @@ func TestRateLimitTransport_5xxExhaustsRetries(t *testing.T) {
 	transport := &rateLimitTransport{
 		base:  &overrideURLTransport{base: http.DefaultTransport, baseURL: srv.URL},
 		token: token,
+		sleep: instantSleep,
 	}
 
 	client := &http.Client{Transport: transport}
@@ -804,4 +806,211 @@ func TestFindMergingPR(t *testing.T) {
 	})
 }
 
+func TestListCommits_EmptyRepo409ReturnsNoCommits(t *testing.T) {
+	// GitHub returns 409 Conflict for GET /commits on an empty repository.
+	// That is "zero commits", not a sync failure.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{"message": "Git Repository is empty."})
+	}))
+	defer srv.Close()
+
+	pool := mockTokenPool(t, srv.URL)
+	client := NewClient(pool, testLogger())
+
+	since := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	until := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
+	commits, err := client.ListCommits(context.Background(), "testorg", "empty-repo", "main", since, until)
+	require.NoError(t, err, "409 from an empty repository must not fail the sync")
+	assert.Empty(t, commits)
+}
+
+func TestListPRCommits_MultiPageKeepsInFlightBalanced(t *testing.T) {
+	// Each page must re-pick a client: picking once and reusing it across
+	// pages decrements the token's inFlight once per request but increments
+	// it only once, driving the anti-herding score permanently negative.
+	mkCommit := func(sha string) map[string]any {
+		return map[string]any{
+			"sha": sha,
+			"commit": map[string]any{
+				"message":   "c " + sha,
+				"author":    map[string]any{"email": "a@b.com", "date": "2024-01-15T10:00:00Z"},
+				"committer": map[string]any{"date": "2024-01-15T10:00:00Z"},
+			},
+			"author":  map[string]any{"login": "dev", "id": 1},
+			"parents": []map[string]any{},
+		}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		if page == "" || page == "1" {
+			w.Header().Set("Link", fmt.Sprintf(`<http://%s/repos/testorg/repo/pulls/5/commits?page=2>; rel="next"`, r.Host))
+			_ = json.NewEncoder(w).Encode([]map[string]any{mkCommit("sha1")})
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{mkCommit("sha2")})
+	}))
+	defer srv.Close()
+
+	pool := mockTokenPool(t, srv.URL)
+	client := NewClient(pool, testLogger())
+
+	commits, err := client.ListPRCommits(context.Background(), "testorg", "repo", 5)
+	require.NoError(t, err)
+	assert.Len(t, commits, 2)
+	assert.Equal(t, int64(0), pool.tokens[0].inFlight.Load(),
+		"inFlight must return to zero after a multi-page PR commit listing")
+}
+
+func TestGetCommitFiles_Paginates(t *testing.T) {
+	// GET /commits/{sha} caps files at 300 per page; truncated single-page
+	// reads can fabricate "diff-verified" clean reverts.
+	mkFile := func(name string) map[string]any {
+		return map[string]any{
+			"filename":  name,
+			"status":    "modified",
+			"additions": 1,
+			"deletions": 1,
+			"patch":     "@@ -1 +1 @@\n-old\n+new",
+		}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		commit := map[string]any{
+			"sha":     "abc123",
+			"commit":  map[string]any{"message": "big change"},
+			"parents": []map[string]any{{"sha": "p1"}},
+		}
+		if page == "" || page == "1" {
+			commit["files"] = []map[string]any{mkFile("a.go"), mkFile("b.go")}
+			w.Header().Set("Link", fmt.Sprintf(`<http://%s/repos/testorg/repo/commits/abc123?page=2>; rel="next"`, r.Host))
+		} else {
+			commit["files"] = []map[string]any{mkFile("c.go")}
+		}
+		_ = json.NewEncoder(w).Encode(commit)
+	}))
+	defer srv.Close()
+
+	pool := mockTokenPool(t, srv.URL)
+	client := NewClient(pool, testLogger())
+
+	files, err := client.GetCommitFiles(context.Background(), "testorg", "repo", "abc123")
+	require.NoError(t, err)
+	require.Len(t, files, 3, "files from every page must be returned")
+	assert.Equal(t, "a.go", files[0].Filename)
+	assert.Equal(t, "c.go", files[2].Filename)
+}
+
+func TestGetCommitFiles_TruncatedAt3000ReturnsSentinel(t *testing.T) {
+	// At GitHub's 3000-file ceiling the list is silently truncated; callers
+	// must classify the commit as unverifiable, never diff-verified.
+	files := make([]map[string]any, 3000)
+	for i := range files {
+		files[i] = map[string]any{
+			"filename": fmt.Sprintf("f%04d.go", i),
+			"status":   "modified",
+		}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"sha":     "abc123",
+			"commit":  map[string]any{"message": "huge change"},
+			"parents": []map[string]any{{"sha": "p1"}},
+			"files":   files,
+		})
+	}))
+	defer srv.Close()
+
+	pool := mockTokenPool(t, srv.URL)
+	client := NewClient(pool, testLogger())
+
+	_, err := client.GetCommitFiles(context.Background(), "testorg", "repo", "abc123")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrCommitFilesTruncated)
+}
+
 var _ = (*gogithub.Client)(nil)
+
+func TestCompareCommits_PaginatesAndMapsFields(t *testing.T) {
+	page := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page++
+		w.Header().Set("x-ratelimit-remaining", "4999")
+		commit := func(sha string) map[string]any {
+			return map[string]any{
+				"sha": sha,
+				"commit": map[string]any{
+					"message":   "msg " + sha,
+					"author":    map[string]any{"email": "a@b.com", "date": "2026-06-01T10:00:00Z"},
+					"committer": map[string]any{"date": "2020-01-01T00:00:00Z"}, // backdated
+				},
+				"author":  map[string]any{"login": "dev", "id": 1},
+				"parents": []map[string]any{{"sha": "p"}},
+			}
+		}
+		if page == 1 {
+			base := "http://" + r.Host + r.URL.Path
+			w.Header().Set("Link", fmt.Sprintf(`<%s?page=2>; rel="next", <%s?page=2>; rel="last"`, base, base))
+			json.NewEncoder(w).Encode(map[string]any{
+				"total_commits": 3,
+				"commits":       []map[string]any{commit("c1"), commit("c2")},
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"total_commits": 3,
+			"commits":       []map[string]any{commit("c3")},
+		})
+	}))
+	defer srv.Close()
+
+	client := NewClient(mockTokenPool(t, srv.URL), testLogger())
+	commits, err := client.CompareCommits(context.Background(), "testorg", "repo", "base", "head", "main")
+	require.NoError(t, err)
+	require.Len(t, commits, 3)
+	assert.Equal(t, "c1", commits[0].SHA)
+	assert.Equal(t, "c3", commits[2].SHA)
+	assert.Equal(t, "main", commits[0].Branch)
+	assert.Equal(t, 2020, commits[0].CommittedAt.Year(), "committer date mapped (backdated commits flow through)")
+	assert.Equal(t, int64(1), commits[0].AuthorID)
+}
+
+func TestCompareCommits_404IsCompareUnavailable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(404)
+		fmt.Fprint(w, `{"message": "Not Found"}`)
+	}))
+	defer srv.Close()
+
+	client := NewClient(mockTokenPool(t, srv.URL), testLogger())
+	_, err := client.CompareCommits(context.Background(), "testorg", "repo", "gone", "head", "main")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrCompareUnavailable)
+}
+
+func TestCompareCommits_OverCeilingIsCompareUnavailable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"total_commits": 9999, "commits": []any{}})
+	}))
+	defer srv.Close()
+
+	client := NewClient(mockTokenPool(t, srv.URL), testLogger())
+	_, err := client.CompareCommits(context.Background(), "testorg", "repo", "old", "head", "main")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrCompareUnavailable)
+}
+
+func TestGetBranchHead(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"name":   "main",
+			"commit": map[string]any{"sha": "tipsha123"},
+		})
+	}))
+	defer srv.Close()
+
+	client := NewClient(mockTokenPool(t, srv.URL), testLogger())
+	head, err := client.GetBranchHead(context.Background(), "testorg", "repo", "main")
+	require.NoError(t, err)
+	assert.Equal(t, "tipsha123", head)
+}

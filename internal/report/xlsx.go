@@ -26,12 +26,12 @@ const (
 // xlsxBuilder bundles the workbook and the shared styles so each per-sheet
 // builder doesn't re-create them.
 type xlsxBuilder struct {
-	f          *excelize.File
-	linkStyle  int
-	headerBlue int
-	headerRed  int
-	headerGrey int
-	boldStyle  int
+	f             *excelize.File
+	linkStyle     int
+	headerBlue    int
+	headerRed     int
+	headerGrey    int
+	boldStyle     int
 	outcomeStyles map[RuleOutcome]int
 }
 
@@ -192,7 +192,7 @@ func (b *xlsxBuilder) writeREADME(opts ReportOpts, summary []SummaryRow, details
 		{fmt.Sprintf("Commits audited:      %s", formatInt(stats.Commits)), body},
 		{fmt.Sprintf("  compliant:          %s  (%.2f%%)", formatInt(stats.Compliant), stats.CompliancePct), body},
 		{fmt.Sprintf("  non-compliant:      %s", formatInt(stats.NonCompliant)), body},
-		{fmt.Sprintf("  waived (R1/R2/R8):  %s", formatInt(stats.Waived)), body},
+		{fmt.Sprintf("  waived:             %s  (R1/R2/R8 + clean merges)", formatInt(stats.Waived)), body},
 		{fmt.Sprintf("Distinct PRs:         %s", formatInt(stats.PRs)), body},
 		{fmt.Sprintf("Distinct authors:     %s", formatInt(stats.Authors)), body},
 		{fmt.Sprintf("Action queue:         %s commit%s need attention", formatInt(stats.ActionQueue), pluralS(stats.ActionQueue)), body},
@@ -203,7 +203,7 @@ func (b *xlsxBuilder) writeREADME(opts ReportOpts, summary []SummaryRow, details
 		{"• By Rule — which rules trigger most across the scanned set.", body},
 		{"• By Author — per-author rollup to spot patterns.", body},
 		{"• Decision Matrix — every commit × every rule (pass/fail/skip/n-a/missing/waived). Autofilter on any rule column to drill in.", body},
-		{"• Waivers Log — commits auto-approved by R1/R2/R8 or classified as clean merges. Evidence of what the tool did NOT flag and why.", body},
+		{"• Waivers Log — compliant commits waived by R1/R2/R8 or tagged clean-merge/bot. Evidence of what the tool did NOT flag and why.", body},
 		{"• Multiple PRs — commits associated with more than one PR.", body},
 		{"", 0},
 		{"Rule legend", h2},
@@ -348,8 +348,10 @@ func (b *xlsxBuilder) writeActionQueue(details []DetailRow) error {
 		if ri, rj := severityRank(queue[i].severity), severityRank(queue[j].severity); ri != rj {
 			return ri > rj
 		}
-		if queue[i].d.Repo != queue[j].d.Repo {
-			return queue[i].d.Org+"/"+queue[i].d.Repo < queue[j].d.Org+"/"+queue[j].d.Repo
+		// Guard on the same org/repo key we compare — guarding on Repo alone
+		// breaks strict weak ordering when two orgs share a repo name.
+		if ki, kj := queue[i].d.Org+"/"+queue[i].d.Repo, queue[j].d.Org+"/"+queue[j].d.Repo; ki != kj {
+			return ki < kj
 		}
 		return queue[i].d.CommittedAt.After(queue[j].d.CommittedAt)
 	})
@@ -365,11 +367,11 @@ func (b *xlsxBuilder) writeActionQueue(details []DetailRow) error {
 		f.SetCellValue(sheet, cellName(3, row), d.Org+"/"+d.Repo)
 		b.writeSHACell(sheet, cellName(4, row), d.SHA, d.CommitHref)
 		b.writePRCell(sheet, cellName(5, row), d.PRNumber, d.PRHref)
-		f.SetCellValue(sheet, cellName(6, row), sanitizeCell(d.AuthorLogin))
-		f.SetCellValue(sheet, cellName(7, row), sanitizeCell(d.MergedByLogin))
+		f.SetCellValue(sheet, cellName(6, row), d.AuthorLogin)
+		f.SetCellValue(sheet, cellName(7, row), d.MergedByLogin)
 		f.SetCellValue(sheet, cellName(8, row), q.rule)
-		f.SetCellValue(sheet, cellName(9, row), sanitizeCell(q.action))
-		f.SetCellValue(sheet, cellName(10, row), sanitizeCell(q.context))
+		f.SetCellValue(sheet, cellName(9, row), q.action)
+		f.SetCellValue(sheet, cellName(10, row), q.context)
 		if !d.CommittedAt.IsZero() {
 			f.SetCellValue(sheet, cellName(11, row), d.CommittedAt.UTC().Format("2006-01-02"))
 			f.SetCellValue(sheet, cellName(12, row), int(now.Sub(d.CommittedAt).Hours()/24))
@@ -439,8 +441,10 @@ func (b *xlsxBuilder) writeSummary(summary []SummaryRow, opts ReportOpts) error 
 			f.SetCellValue(sheet, cellName(c+1, row), v)
 		}
 		pctCell := cellName(6, row)
+		// Green means "nothing failed here" — driven by the non-compliant
+		// count, never by a percentage that may have rounded up to 100.
 		switch {
-		case s.CompliancePct >= 100:
+		case s.NonCompliantCount == 0:
 			f.SetCellStyle(sheet, pctCell, pctCell, greenStyle)
 		case s.CompliancePct >= 90:
 			f.SetCellStyle(sheet, pctCell, pctCell, yellowStyle)
@@ -460,8 +464,12 @@ func (b *xlsxBuilder) writeSummary(summary []SummaryRow, opts ReportOpts) error 
 		}
 		colC, _ := excelize.ColumnNumberToName(3)
 		colD, _ := excelize.ColumnNumberToName(4)
+		colE, _ := excelize.ColumnNumberToName(5)
+		// Cap at 99.9 when any commit failed so the TOTAL row never rounds
+		// up to a false 100.0.
 		f.SetCellFormula(sheet, cellName(6, totalsRow),
-			fmt.Sprintf("IF(%s%d>0,ROUND(%s%d/%s%d*100,1),0)", colC, totalsRow, colD, totalsRow, colC, totalsRow))
+			fmt.Sprintf("IF(%[1]s%[4]d>0,IF(%[3]s%[4]d=0,ROUND(%[2]s%[4]d/%[1]s%[4]d*100,1),MIN(ROUND(%[2]s%[4]d/%[1]s%[4]d*100,1),99.9)),0)",
+				colC, colD, colE, totalsRow))
 		pctStyle, _ := f.NewStyle(&excelize.Style{
 			Font: &excelize.Font{Bold: true}, CustomNumFmt: &pctFmt,
 		})
@@ -484,14 +492,14 @@ func (b *xlsxBuilder) writeSummary(summary []SummaryRow, opts ReportOpts) error 
 // --- By Rule --------------------------------------------------------------
 
 type byRuleAgg struct {
-	rule          string
-	name          string
-	fires         int
-	compliantOut  int
-	nonCompOut    int
-	waived        int
-	repoCounts    map[string]int
-	authorCounts  map[string]int
+	rule         string
+	name         string
+	fires        int
+	compliantOut int
+	nonCompOut   int
+	waived       int
+	repoCounts   map[string]int
+	authorCounts map[string]int
 }
 
 func (b *xlsxBuilder) writeByRule(details []DetailRow) error {
@@ -502,16 +510,24 @@ func (b *xlsxBuilder) writeByRule(details []DetailRow) error {
 		id, name string
 		fires    func(DetailRow, RuleOutcomes) (fire, waived bool)
 	}{
-		{"R1 Exempt", "Exempt author waiver", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R1Exempt == OutcomeWaived, o.R1Exempt == OutcomeWaived }},
-		{"R2 Empty", "Empty-commit waiver", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R2Empty == OutcomeWaived, o.R2Empty == OutcomeWaived }},
+		{"R1 Exempt", "Exempt author waiver", func(_ DetailRow, o RuleOutcomes) (bool, bool) {
+			return o.R1Exempt == OutcomeWaived, o.R1Exempt == OutcomeWaived
+		}},
+		{"R2 Empty", "Empty-commit waiver", func(_ DetailRow, o RuleOutcomes) (bool, bool) {
+			return o.R2Empty == OutcomeWaived, o.R2Empty == OutcomeWaived
+		}},
 		{"R3 HasPR", "Missing associated PR", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R3HasPR == OutcomeFail, false }},
 		{"R4 FinalApproval", "No approval on final commit", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R4FinalApproval == OutcomeFail, false }},
 		{"R4b Stale", "Stale approval (pre-force-push)", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R4bStale == OutcomeFail, false }},
 		{"R4c PostMergeConcern", "Post-merge reviewer concern", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R4cPostMergeConcern == OutcomeFail, false }},
 		{"R5 SelfApproval", "Only approver is a code contributor", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R5SelfApproval == OutcomeFail, false }},
-		{"R6 OwnerCheck", "Required status check failing/missing", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R6OwnerCheck == OutcomeFail || o.R6OwnerCheck == OutcomeMissing, false }},
+		{"R6 OwnerCheck", "Required status check failing/missing", func(_ DetailRow, o RuleOutcomes) (bool, bool) {
+			return o.R6OwnerCheck == OutcomeFail || o.R6OwnerCheck == OutcomeMissing, false
+		}},
 		{"R7 Verdict", "Overall non-compliant verdict", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R7Verdict == OutcomeFail, false }},
-		{"R8 RevertWaiver", "Clean-revert waiver", func(_ DetailRow, o RuleOutcomes) (bool, bool) { return o.R8RevertWaiver == OutcomeWaived, o.R8RevertWaiver == OutcomeWaived }},
+		{"R8 RevertWaiver", "Clean-revert waiver", func(_ DetailRow, o RuleOutcomes) (bool, bool) {
+			return o.R8RevertWaiver == OutcomeWaived, o.R8RevertWaiver == OutcomeWaived
+		}},
 	}
 
 	aggs := make([]*byRuleAgg, len(rules))
@@ -589,7 +605,7 @@ func (b *xlsxBuilder) writeByAuthor(rows []ByAuthorRow) error {
 
 	for i, r := range rows {
 		row := i + 2
-		f.SetCellValue(sheet, cellName(1, row), sanitizeCell(r.Author))
+		f.SetCellValue(sheet, cellName(1, row), r.Author)
 		f.SetCellValue(sheet, cellName(2, row), r.Commits)
 		f.SetCellValue(sheet, cellName(3, row), r.NonCompliant)
 		f.SetCellValue(sheet, cellName(4, row), r.SelfApproved)
@@ -633,10 +649,10 @@ func (b *xlsxBuilder) writeDecisionMatrix(details []DetailRow) error {
 		b.writeSHACell(sheet, cellName(2, row), d.SHA, d.CommitHref)
 		b.writePRCell(sheet, cellName(3, row), d.PRNumber, d.PRHref)
 		f.SetCellValue(sheet, cellName(4, row), d.PRCount)
-		f.SetCellValue(sheet, cellName(5, row), sanitizeCell(d.AuthorLogin))
-		f.SetCellValue(sheet, cellName(6, row), sanitizeCell(d.MergedByLogin))
-		f.SetCellValue(sheet, cellName(7, row), d.CommittedAt.Format("2006-01-02 15:04"))
-		f.SetCellValue(sheet, cellName(8, row), sanitizeCell(d.BranchName))
+		f.SetCellValue(sheet, cellName(5, row), d.AuthorLogin)
+		f.SetCellValue(sheet, cellName(6, row), d.MergedByLogin)
+		f.SetCellValue(sheet, cellName(7, row), formatTimestamp(d.CommittedAt, "2006-01-02 15:04"))
+		f.SetCellValue(sheet, cellName(8, row), d.BranchName)
 		f.SetCellValue(sheet, cellName(9, row), d.MergeStrategy)
 
 		// Rule columns with conditional styling.
@@ -652,7 +668,7 @@ func (b *xlsxBuilder) writeDecisionMatrix(details []DetailRow) error {
 			}
 		}
 
-		f.SetCellValue(sheet, cellName(20, row), sanitizeCell(d.ApproverLogins))
+		f.SetCellValue(sheet, cellName(20, row), d.ApproverLogins)
 		if d.RevertedSHA != "" {
 			revShort := d.RevertedSHA
 			if len(revShort) > 8 {
@@ -665,10 +681,10 @@ func (b *xlsxBuilder) writeDecisionMatrix(details []DetailRow) error {
 		}
 		f.SetCellValue(sheet, cellName(22, row), d.RevertVerification)
 		f.SetCellValue(sheet, cellName(23, row), d.MergeVerification)
-		f.SetCellValue(sheet, cellName(24, row), sanitizeCell(d.Annotations))
-		f.SetCellValue(sheet, cellName(25, row), sanitizeCell(d.Reasons))
+		f.SetCellValue(sheet, cellName(24, row), d.Annotations)
+		f.SetCellValue(sheet, cellName(25, row), d.Reasons)
 		f.SetCellValue(sheet, cellName(26, row), string(sev))
-		f.SetCellValue(sheet, cellName(27, row), sanitizeCell(action))
+		f.SetCellValue(sheet, cellName(27, row), action)
 	}
 
 	lastCell := cellName(len(headers), max(len(details)+1, 1))
@@ -700,32 +716,42 @@ func (b *xlsxBuilder) writeWaiversLog(details []DetailRow) error {
 			f.SetCellValue(sheet, cellName(1, row), d.Org+"/"+d.Repo)
 			b.writeSHACell(sheet, cellName(2, row), d.SHA, d.CommitHref)
 			f.SetCellValue(sheet, cellName(3, row), kind)
-			f.SetCellValue(sheet, cellName(4, row), sanitizeCell(evidence))
-			f.SetCellValue(sheet, cellName(5, row), sanitizeCell(d.AuthorLogin))
-			f.SetCellValue(sheet, cellName(6, row), d.CommittedAt.Format("2006-01-02 15:04"))
+			f.SetCellValue(sheet, cellName(4, row), evidence)
+			f.SetCellValue(sheet, cellName(5, row), d.AuthorLogin)
+			f.SetCellValue(sheet, cellName(6, row), formatTimestamp(d.CommittedAt, "2006-01-02 15:04"))
 			b.writePRCell(sheet, cellName(7, row), d.PRNumber, d.PRHref)
-			f.SetCellValue(sheet, cellName(8, row), sanitizeCell(truncate(d.Message, 80)))
+			f.SetCellValue(sheet, cellName(8, row), truncate(d.Message, 80))
 			row++
 		}
 
-		if d.IsExemptAuthor {
+		// The exemption row appears only when the waiver was actually
+		// GRANTED (the stored verdict is the exemption itself). The flag
+		// alone also covers voided carve-outs that passed (or failed)
+		// normal review — neither is "something the tool didn't flag
+		// because of the exemption".
+		if d.IsExemptAuthor && d.IsCompliant && d.Reasons == "exempt: configured author" {
 			emit("exempt-author", "author "+d.AuthorLogin+" in exemptions config")
 		}
 		if d.IsEmptyCommit {
 			emit("empty-commit", "0 additions / 0 deletions")
 		}
-		if d.IsCleanRevert {
-			ev := "clean revert"
-			if d.RevertedSHA != "" {
-				ev = fmt.Sprintf("reverts %s (%s)", shortSHA(d.RevertedSHA), d.RevertVerification)
+		// Clean-revert / clean-merge / bot tags are informational: they only
+		// count as waivers ("evidence of what the tool did NOT flag") when
+		// the stored verdict is compliant.
+		if d.IsCompliant {
+			if d.IsCleanRevert {
+				ev := "clean revert"
+				if d.RevertedSHA != "" {
+					ev = fmt.Sprintf("reverts %s (%s)", shortSHA(d.RevertedSHA), d.RevertVerification)
+				}
+				emit("clean-revert", ev)
 			}
-			emit("clean-revert", ev)
-		}
-		if d.IsCleanMerge {
-			emit("clean-merge", "2-parent web-flow merge, verified signature")
-		}
-		if d.IsBot && !d.IsExemptAuthor {
-			emit("bot", "author login ends in [bot]")
+			if d.IsCleanMerge {
+				emit("clean-merge", "2-parent web-flow merge, verified signature")
+			}
+			if d.IsBot && !d.IsExemptAuthor {
+				emit("bot", "author login ends in [bot]")
+			}
 		}
 	}
 
@@ -749,13 +775,13 @@ func (b *xlsxBuilder) writeMultiplePRs(rows []MultiplePRRow) error {
 		r := i + 2
 		f.SetCellValue(sheet, cellName(1, r), m.Org+"/"+m.Repo)
 		b.writeSHACell(sheet, cellName(2, r), m.SHA, m.CommitHref)
-		f.SetCellValue(sheet, cellName(3, r), sanitizeCell(m.AuthorLogin))
-		f.SetCellValue(sheet, cellName(4, r), m.CommittedAt.Format("2006-01-02 15:04"))
+		f.SetCellValue(sheet, cellName(3, r), m.AuthorLogin)
+		f.SetCellValue(sheet, cellName(4, r), formatTimestamp(m.CommittedAt, "2006-01-02 15:04"))
 		f.SetCellValue(sheet, cellName(5, r), m.PRCount)
 		b.writePRCell(sheet, cellName(6, r), m.PRNumber, m.PRHref)
-		f.SetCellValue(sheet, cellName(7, r), sanitizeCell(truncate(m.PRTitle, 60)))
-		f.SetCellValue(sheet, cellName(8, r), sanitizeCell(m.PRAuthorLogin))
-		f.SetCellValue(sheet, cellName(9, r), sanitizeCell(m.PRMergedBy))
+		f.SetCellValue(sheet, cellName(7, r), truncate(m.PRTitle, 60))
+		f.SetCellValue(sheet, cellName(8, r), m.PRAuthorLogin)
+		f.SetCellValue(sheet, cellName(9, r), m.PRMergedBy)
 		f.SetCellValue(sheet, cellName(10, r), boolToYesNo(m.IsAuditedPR))
 	}
 
@@ -833,15 +859,10 @@ func boolToYesNo(b bool) string {
 }
 
 // escapeFormulaURL escapes double quotes in a URL for use inside HYPERLINK formulas.
+//
+// Cell values written via SetCellValue need no formula-injection escaping:
+// excelize stores strings as string cells, which spreadsheet apps never
+// evaluate. CSV output, by contrast, goes through sanitizeCSVField.
 func escapeFormulaURL(url string) string {
 	return strings.ReplaceAll(url, `"`, `""`)
-}
-
-// sanitizeCell prevents formula injection by prefixing dangerous values with
-// a single quote, which forces Excel to treat the cell as text.
-func sanitizeCell(s string) string {
-	if len(s) > 0 && (s[0] == '=' || s[0] == '+' || s[0] == '-' || s[0] == '@') {
-		return "'" + s
-	}
-	return s
 }

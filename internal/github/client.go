@@ -2,8 +2,10 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
@@ -12,7 +14,6 @@ import (
 
 	"github.com/stefanpenner/gh-audit/internal/model"
 )
-
 
 // Client wraps the GitHub REST API with token-pool-aware authentication.
 type Client struct {
@@ -181,36 +182,18 @@ func (c *Client) ListCommits(ctx context.Context, org, repo, branch string, sinc
 
 		commits, resp, err := gh.Repositories.ListCommits(ctx, org, repo, opts)
 		if err != nil {
+			// GitHub answers GET /commits on an empty repository with
+			// 409 Conflict ("Git Repository is empty."). That is zero
+			// commits, not a sync failure.
+			var ghErr *gogithub.ErrorResponse
+			if errors.As(err, &ghErr) && ghErr.Response != nil && ghErr.Response.StatusCode == http.StatusConflict {
+				return nil, nil
+			}
 			return nil, fmt.Errorf("listing commits for %s/%s page %d: %w", org, repo, opts.Page, err)
 		}
 
 		for _, rc := range commits {
-			commit := model.Commit{
-				Org:  org,
-				Repo: repo,
-				SHA:  rc.GetSHA(),
-				Href: rc.GetHTMLURL(),
-			}
-			c.resolveAuthor(&commit, rc)
-			if rc.GetCommitter() != nil {
-				commit.CommitterLogin = rc.GetCommitter().GetLogin()
-			}
-			if rc.GetCommit() != nil {
-				commit.Message = rc.GetCommit().GetMessage()
-				if rc.GetCommit().GetAuthor() != nil {
-					commit.AuthorEmail = rc.GetCommit().GetAuthor().GetEmail()
-				}
-				if rc.GetCommit().GetCommitter() != nil {
-					commit.CommittedAt = rc.GetCommit().GetCommitter().GetDate().Time
-				}
-				if rc.GetCommit().GetVerification() != nil {
-					commit.IsVerified = rc.GetCommit().GetVerification().GetVerified()
-				}
-			}
-			commit.ParentCount = len(rc.Parents)
-			commit.Branch = branch
-			commit.CoAuthors = model.ParseCoAuthors(commit.Message)
-			allCommits = append(allCommits, commit)
+			allCommits = append(allCommits, c.convertRepoCommit(org, repo, branch, rc))
 		}
 
 		if resp.NextPage == 0 {
@@ -222,25 +205,17 @@ func (c *Client) ListCommits(ctx context.Context, org, repo, branch string, sinc
 	return allCommits, nil
 }
 
-// GetCommitDetail fetches a single commit with addition/deletion stats.
-func (c *Client) GetCommitDetail(ctx context.Context, org, repo, sha string) (*model.Commit, error) {
-	gh, err := c.ghClient(ctx, org, repo)
-	if err != nil {
-		return nil, err
-	}
-
-	rc, _, err := gh.Repositories.GetCommit(ctx, org, repo, sha, nil)
-	if err != nil {
-		return nil, fmt.Errorf("getting commit detail %s/%s@%s: %w", org, repo, sha, err)
-	}
-
-	commit := &model.Commit{
+// convertRepoCommit maps a go-github RepositoryCommit (from the list,
+// compare, or detail endpoints) into the internal model. Shared so every
+// ingestion path produces identically-shaped rows.
+func (c *Client) convertRepoCommit(org, repo, branch string, rc *gogithub.RepositoryCommit) model.Commit {
+	commit := model.Commit{
 		Org:  org,
 		Repo: repo,
 		SHA:  rc.GetSHA(),
 		Href: rc.GetHTMLURL(),
 	}
-	c.resolveAuthor(commit, rc)
+	c.resolveAuthor(&commit, rc)
 	if rc.GetCommitter() != nil {
 		commit.CommitterLogin = rc.GetCommitter().GetLogin()
 	}
@@ -257,7 +232,94 @@ func (c *Client) GetCommitDetail(ctx context.Context, org, repo, sha string) (*m
 		}
 	}
 	commit.ParentCount = len(rc.Parents)
+	commit.Branch = branch
 	commit.CoAuthors = model.ParseCoAuthors(commit.Message)
+	return commit
+}
+
+// GetBranchHead returns the branch's current tip SHA.
+func (c *Client) GetBranchHead(ctx context.Context, org, repo, branch string) (string, error) {
+	gh, err := c.ghClient(ctx, org, repo)
+	if err != nil {
+		return "", err
+	}
+	b, _, err := gh.Repositories.GetBranch(ctx, org, repo, branch, 0)
+	if err != nil {
+		return "", fmt.Errorf("getting branch head %s/%s@%s: %w", org, repo, branch, err)
+	}
+	sha := b.GetCommit().GetSHA()
+	if sha == "" {
+		return "", fmt.Errorf("branch %s/%s@%s has no tip commit", org, repo, branch)
+	}
+	return sha, nil
+}
+
+// ErrCompareUnavailable signals that base...head comparison cannot serve an
+// incremental fetch: the base SHA is gone (force-push / history rewrite,
+// HTTP 404) or the range exceeds the compare API's commit ceiling. Callers
+// fall back to the date-window commit listing.
+var ErrCompareUnavailable = errors.New("compare unavailable for incremental fetch")
+
+// compareCommitsCeiling is GitHub's documented maximum for the commits list
+// of a compare response. Ranges beyond it must use the list endpoint.
+const compareCommitsCeiling = 250
+
+// CompareCommits returns the commits reachable from head but not from base
+// — the graph difference, computed by GitHub's compare API. Unlike the
+// date-filtered list endpoint, the result is immune to committer-date
+// backdating, which makes it the trustworthy primitive for incremental
+// sync. The branch parameter only labels the returned commits.
+func (c *Client) CompareCommits(ctx context.Context, org, repo, base, head, branch string) ([]model.Commit, error) {
+	var all []model.Commit
+	opts := &gogithub.ListOptions{PerPage: 100}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		gh, err := c.ghClient(ctx, org, repo)
+		if err != nil {
+			return nil, err
+		}
+		comp, resp, err := gh.Repositories.CompareCommits(ctx, org, repo, base, head, opts)
+		if err != nil {
+			var ghErr *gogithub.ErrorResponse
+			if errors.As(err, &ghErr) && ghErr.Response != nil &&
+				(ghErr.Response.StatusCode == http.StatusNotFound || ghErr.Response.StatusCode == http.StatusUnprocessableEntity) {
+				return nil, fmt.Errorf("%w: %s/%s %s...%s: %v", ErrCompareUnavailable, org, repo, base, head, err)
+			}
+			return nil, fmt.Errorf("comparing %s/%s %s...%s page %d: %w", org, repo, base, head, opts.Page, err)
+		}
+		if comp.GetTotalCommits() > compareCommitsCeiling {
+			return nil, fmt.Errorf("%w: %s/%s %s...%s spans %d commits (> %d ceiling)",
+				ErrCompareUnavailable, org, repo, base, head, comp.GetTotalCommits(), compareCommitsCeiling)
+		}
+		for _, rc := range comp.Commits {
+			all = append(all, c.convertRepoCommit(org, repo, branch, rc))
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return all, nil
+}
+
+// GetCommitDetail fetches a single commit with addition/deletion stats.
+func (c *Client) GetCommitDetail(ctx context.Context, org, repo, sha string) (*model.Commit, error) {
+	gh, err := c.ghClient(ctx, org, repo)
+	if err != nil {
+		return nil, err
+	}
+
+	rc, _, err := gh.Repositories.GetCommit(ctx, org, repo, sha, nil)
+	if err != nil {
+		return nil, fmt.Errorf("getting commit detail %s/%s@%s: %w", org, repo, sha, err)
+	}
+
+	converted := c.convertRepoCommit(org, repo, "", rc)
+	commit := &converted
+	commit.FilesChanged = len(rc.Files)
+	commit.StatsVerified = true
 	if rc.GetStats() != nil {
 		commit.Additions = rc.GetStats().GetAdditions()
 		commit.Deletions = rc.GetStats().GetDeletions()
@@ -266,29 +328,60 @@ func (c *Client) GetCommitDetail(ctx context.Context, org, repo, sha string) (*m
 	return commit, nil
 }
 
-// GetCommitFiles fetches the per-file patch list for a commit. Used by
-// clean-revert verification to compare the revert's diff against the
-// diff of the commit it claims to revert.
+// commitFilesCeiling is GitHub's hard cap on the files list of
+// GET /commits/{sha}: at most 300 files per page and 3000 files total,
+// beyond which the list is silently truncated.
+const commitFilesCeiling = 3000
+
+// ErrCommitFilesTruncated signals that a commit touches at least
+// commitFilesCeiling files, so the returned list may be incomplete.
+// Callers doing diff verification must treat the commit as unverifiable
+// (e.g. revert_verification="message-only"), never as verified.
+var ErrCommitFilesTruncated = errors.New("commit file list truncated at GitHub's 3000-file ceiling")
+
+// GetCommitFiles fetches the per-file patch list for a commit, fully
+// paginated. Used by clean-revert verification to compare the revert's diff
+// against the diff of the commit it claims to revert.
+//
+// Returns ErrCommitFilesTruncated (alongside the partial list) when the
+// commit reaches GitHub's 3000-file ceiling — the list cannot be trusted
+// for verification beyond that point.
 func (c *Client) GetCommitFiles(ctx context.Context, org, repo, sha string) ([]model.FileDiff, error) {
-	gh, err := c.ghClient(ctx, org, repo)
-	if err != nil {
-		return nil, err
+	var files []model.FileDiff
+	opts := &gogithub.ListOptions{PerPage: 300}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		gh, err := c.ghClient(ctx, org, repo)
+		if err != nil {
+			return nil, err
+		}
+
+		rc, resp, err := gh.Repositories.GetCommit(ctx, org, repo, sha, opts)
+		if err != nil {
+			return nil, fmt.Errorf("getting commit files %s/%s@%s page %d: %w", org, repo, sha, opts.Page, err)
+		}
+
+		for _, f := range rc.Files {
+			files = append(files, model.FileDiff{
+				Filename:  f.GetFilename(),
+				Status:    f.GetStatus(),
+				Additions: f.GetAdditions(),
+				Deletions: f.GetDeletions(),
+				Patch:     f.GetPatch(),
+			})
+		}
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
 	}
 
-	rc, _, err := gh.Repositories.GetCommit(ctx, org, repo, sha, nil)
-	if err != nil {
-		return nil, fmt.Errorf("getting commit files %s/%s@%s: %w", org, repo, sha, err)
-	}
-
-	files := make([]model.FileDiff, 0, len(rc.Files))
-	for _, f := range rc.Files {
-		files = append(files, model.FileDiff{
-			Filename:  f.GetFilename(),
-			Status:    f.GetStatus(),
-			Additions: f.GetAdditions(),
-			Deletions: f.GetDeletions(),
-			Patch:     f.GetPatch(),
-		})
+	if len(files) >= commitFilesCeiling {
+		return files, ErrCommitFilesTruncated
 	}
 	return files, nil
 }
@@ -683,16 +776,20 @@ func (c *Client) GetPullRequest(ctx context.Context, org, repo string, number in
 // regular Commit objects. These are stored in the commits table alongside
 // default-branch commits, distinguished by commit_branches entries.
 func (c *Client) ListPRCommits(ctx context.Context, org, repo string, prNumber int) ([]model.Commit, error) {
-	gh, err := c.ghClient(ctx, org, repo)
-	if err != nil {
-		return nil, err
-	}
-
 	opts := &gogithub.ListOptions{PerPage: 100}
 	var all []model.Commit
 
 	for {
 		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		// Re-pick a client per page (matching ListCommits/ListReviews):
+		// Pick reserves one inFlight slot per request and the transport
+		// releases one per response, so reusing a single picked client
+		// across pages would drive the token's inFlight negative and
+		// corrupt Pick's anti-herding score.
+		gh, err := c.ghClient(ctx, org, repo)
+		if err != nil {
 			return nil, err
 		}
 		commits, resp, err := gh.PullRequests.ListCommits(ctx, org, repo, prNumber, opts)
@@ -795,7 +892,6 @@ func (c *Client) EnrichCommits(ctx context.Context, org, repo string, shas []str
 	return results, nil
 }
 
-
 // resolveAuthor populates AuthorLogin and AuthorID on the commit if
 // GitHub resolved the commit's git-author email to a verified GH user.
 // Otherwise it logs a one-line warning with the actionable fix-it text
@@ -805,9 +901,10 @@ func (c *Client) EnrichCommits(ctx context.Context, org, repo string, shas []str
 // Why not error out:
 //
 //   - The forgery-resistance contract lives in audit-time matching
-//     (audit.go::isExempt is strict id-only and refuses to match
-//     anything against a zero ID). Aborting sync at ingest doesn't
-//     add security; it just denies coverage.
+//     (audit.go::isExemptCommit matches on id when present; a zero ID
+//     only matches through the operator-curated verified_emails
+//     fallback). Aborting sync at ingest doesn't add security; it
+//     just denies coverage.
 //   - Real developer commits routinely arrive with laptop-hostname
 //     emails (e.g. "user@user-mn4857.linkedin.biz") that aren't on
 //     the user's verified-emails list. These are not exempt anyway,

@@ -29,8 +29,8 @@ const (
 )
 
 var (
-	autoRevertRe            = regexp.MustCompile(`^Automatic revert of ([0-9a-f]{40})\.\.([0-9a-f]{40})`)
-	manualRevertBodySHAre   = regexp.MustCompile(`This reverts commit ([0-9a-f]{40})`)
+	autoRevertRe          = regexp.MustCompile(`^Automatic revert of ([0-9a-f]{40})\.\.([0-9a-f]{40})`)
+	manualRevertBodySHAre = regexp.MustCompile(`This reverts commit ([0-9a-f]{40})`)
 	// revertBranchRe matches the branch-name convention GitHub's "Revert"
 	// button uses: `revert-<N>-<base-branch>`, where N is the number of the
 	// PR being reverted (NOT the number of the revert PR itself).
@@ -40,8 +40,9 @@ var (
 // ParseRevert inspects the commit message and returns the revert kind along
 // with, where applicable, the SHA of the commit being reverted.
 //
-// For AutoRevert the returned SHA is the "old" SHA (second) from the
-// "<new>..<old>" pair — that is, the commit whose state is being restored.
+// For AutoRevert the returned SHA is the FIRST SHA of the "<new>..<old>"
+// pair — the newly-landed commit being reverted (what RevertedSHA means
+// everywhere else and what diff verification would compare against).
 // For ManualRevert the SHA is extracted from the standard "This reverts
 // commit <sha>" trailer emitted by `git revert`. An empty SHA with kind ==
 // ManualRevert means the message looked like a revert but the body did not
@@ -162,7 +163,16 @@ func IsCleanRevertDiff(revertFiles, revertedFiles []model.FileDiff) bool {
 		if !ok {
 			return false
 		}
-		rAdd, rDel := extractDiffLines(rMap[name])
+		rPatch := rMap[name]
+		// GitHub omits the textual patch for binary files, very large
+		// diffs, and mode-only changes. An empty patch on either side is
+		// unverifiable content — two DIFFERENT binary blobs would compare
+		// as empty==empty and falsely "verify". Fail closed: the revert
+		// classifies message-only and goes through normal review rules.
+		if rPatch == "" || aPatch == "" {
+			return false
+		}
+		rAdd, rDel := extractDiffLines(rPatch)
 		aAdd, aDel := extractDiffLines(aPatch)
 		if !multisetEqual(rAdd, aDel) || !multisetEqual(rDel, aAdd) {
 			return false
@@ -172,15 +182,26 @@ func IsCleanRevertDiff(revertFiles, revertedFiles []model.FileDiff) bool {
 }
 
 // extractDiffLines splits a unified-diff patch into the content of lines that
-// were added vs. removed, ignoring file-header lines (`+++`, `---`) and
+// were added vs. removed, ignoring file-header lines (`+++ `, `--- `) and
 // hunk markers (`@@`). Returns the content without the leading `+` / `-`.
+//
+// File headers only ever appear BEFORE the first `@@` hunk marker, so they
+// are stripped only there. Within hunks, a line starting `+` is an addition
+// whose content is line[1:] even when the content itself begins with `+` or
+// `-` (e.g. an added `++x;` line serializes as `+++x;`); dropping those as
+// headers caused both false diff-mismatches and, symmetrically, false
+// diff-verified results.
 func extractDiffLines(patch string) (added, removed []string) {
+	seenHunk := false
 	for _, line := range strings.Split(patch, "\n") {
+		if strings.HasPrefix(line, "@@") {
+			seenHunk = true
+			continue
+		}
+		if !seenHunk && (strings.HasPrefix(line, "+++ ") || strings.HasPrefix(line, "--- ")) {
+			continue
+		}
 		switch {
-		case strings.HasPrefix(line, "+++"), strings.HasPrefix(line, "---"):
-			continue
-		case strings.HasPrefix(line, "@@"):
-			continue
 		case strings.HasPrefix(line, "+"):
 			added = append(added, line[1:])
 		case strings.HasPrefix(line, "-"):

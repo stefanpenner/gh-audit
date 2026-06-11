@@ -21,6 +21,8 @@ classDiagram
         Repo string
         Branch string
         LastDate time.Time
+        LastSHA string
+        UpdatedAt time.Time
     }
 
     class CoAuthor {
@@ -48,6 +50,14 @@ classDiagram
         Href string
     }
 
+    class FileDiff {
+        Filename string
+        Status string
+        Additions int
+        Deletions int
+        Patch string
+    }
+
     class PullRequest {
         Org string
         Repo string
@@ -55,6 +65,7 @@ classDiagram
         Title string
         Merged bool
         HeadSHA string
+        HeadBranch string
         MergeCommitSHA string
         AuthorLogin string
         AuthorID int64
@@ -93,31 +104,52 @@ classDiagram
         PRs []PullRequest
         Reviews []Review
         CheckRuns []CheckRun
+        PRBranchCommits map~int~[]Commit
+        IsCleanRevert bool
+        RevertVerification string
+        RevertedSHA string
+        IsCleanMerge bool
+        MergeVerification string
     }
 
     class AuditResult {
         Org string
         Repo string
         SHA string
-        IsCompliant bool
+        IsEmptyCommit bool
         IsBot bool
         IsExemptAuthor bool
-        IsEmptyCommit bool
-        IsSelfApproved bool
-        HasFinalApproval bool
-        HasStaleApproval bool
-        HasPostMergeConcern bool
         HasPR bool
         PRNumber int
         PRCount int
+        HasFinalApproval bool
+        HasStaleApproval bool
+        HasPostMergeConcern bool
         IsCleanRevert bool
         RevertVerification string
+        RevertedSHA string
         IsCleanMerge bool
         MergeVerification string
-        MergeStrategy string
+        IsSelfApproved bool
         ApproverLogins []string
+        OwnerApprovalCheck string
+        IsCompliant bool
         Reasons []string
+        MergeStrategy string
+        PRCommitAuthorLogins []string
+        CommitHref string
+        PRHref string
         Annotations []string
+        AuditedAt time.Time
+    }
+
+    class ExemptAuthor {
+        Login string
+        ID int64
+        Type string
+        Name string
+        Comment string
+        VerifiedEmails []string
     }
 
     RepoInfo "1" --o "*" Commit : contains
@@ -125,10 +157,12 @@ classDiagram
     Commit "*" --o "*" PullRequest : associated via
     PullRequest "1" --o "*" Review : has
     Commit "1" --o "*" CheckRun : has
+    Commit "1" --> "*" FileDiff : patches (transient)
     EnrichmentResult "1" --> "1" Commit : wraps
     EnrichmentResult "1" --> "*" PullRequest
     EnrichmentResult "1" --> "*" Review
     EnrichmentResult "1" --> "*" CheckRun
     Commit "1" --> "*" CoAuthor : has
     Commit "1" --> "1" AuditResult : produces
+    ExemptAuthor "*" ..> "*" AuditResult : consulted by audit
 ```

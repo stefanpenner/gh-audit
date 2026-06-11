@@ -67,8 +67,12 @@ type RuleOutcomes struct {
 func DeriveRuleOutcomes(d DetailRow) RuleOutcomes {
 	o := RuleOutcomes{}
 
-	// R1: exempt author → treated as waiver when the pipeline accepted it.
-	if d.IsExemptAuthor {
+	// R1: exempt author. IsExemptAuthor is a VISIBILITY flag — the pipeline
+	// sets it whenever the commit author matched the exempt list, including
+	// when the carve-out was VOIDED (bot squash containing non-exempt human
+	// commits) and the content was audited normally. The waiver only
+	// happened when the stored verdict IS the exemption.
+	if d.IsExemptAuthor && d.IsCompliant && d.Reasons == "exempt: configured author" {
 		o.R1Exempt = OutcomeWaived
 	} else {
 		o.R1Exempt = OutcomeSkip
@@ -81,11 +85,13 @@ func DeriveRuleOutcomes(d DetailRow) RuleOutcomes {
 		o.R2Empty = OutcomeSkip
 	}
 
-	// R3: associated PR. A non-empty, non-exempt commit without a PR fails.
+	// R3: associated PR. A non-empty, non-waived commit without a PR fails.
+	// Keys on the GRANTED R1 waiver, not the flag — a flag-only commit
+	// with no PR genuinely fails R3.
 	switch {
 	case d.HasPR:
 		o.R3HasPR = OutcomePass
-	case d.IsExemptAuthor || d.IsEmptyCommit:
+	case o.R1Exempt == OutcomeWaived || d.IsEmptyCommit:
 		o.R3HasPR = OutcomeNA
 	default:
 		o.R3HasPR = OutcomeFail
@@ -156,16 +162,16 @@ func DeriveRuleOutcomes(d DetailRow) RuleOutcomes {
 	return o
 }
 
-// RequiresAction reports whether a commit belongs on the Action Queue —
-// failing verdict without a waiver flip already applied.
+// RequiresAction reports whether a commit belongs on the Action Queue.
+//
+// The verdict is the only signal: every waiver the pipeline grants (R1
+// exempt, R2 empty, R8 clean revert) is already folded into a compliant
+// verdict, so a stored fail means no waiver fired. Suppressing on the
+// flags instead used to silently drop real action items — most notably a
+// non-compliant bot squash carrying unreviewed human code, which has
+// IsExemptAuthor=true purely for visibility.
 func (o RuleOutcomes) RequiresAction() bool {
-	if o.R7Verdict != OutcomeFail {
-		return false
-	}
-	if o.R1Exempt == OutcomeWaived || o.R2Empty == OutcomeWaived || o.R8RevertWaiver == OutcomeWaived {
-		return false
-	}
-	return true
+	return o.R7Verdict == OutcomeFail
 }
 
 // SynthesizeContext returns a compact, human-readable string of secondary

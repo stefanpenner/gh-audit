@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -62,10 +63,18 @@ func (w *DBWriter) Write(ctx context.Context, fn func() error) error {
 // Close drains pending writes and stops the writer goroutine.
 // All callers must have finished submitting writes before calling Close.
 // Times out after 30 seconds to prevent hanging on stuck DB writes.
-func (w *DBWriter) Close() {
+// Close drains queued writes and waits for the writer goroutine to exit.
+// The wait is bounded: a wedged write (e.g. a hung DB) must not hang
+// shutdown forever. On timeout the goroutine is ABANDONED while possibly
+// still executing — the caller typically closes the DB next, so the
+// abandoned write will fail; the error return exists so callers can log
+// the abandonment instead of shutting down silently.
+func (w *DBWriter) Close() error {
 	close(w.requests)
 	select {
 	case <-w.done:
+		return nil
 	case <-time.After(30 * time.Second):
+		return fmt.Errorf("db writer: timed out after 30s waiting for queued writes; a write may still be in flight")
 	}
 }

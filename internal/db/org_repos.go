@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"fmt"
 	"time"
@@ -50,19 +51,20 @@ func (d *DB) CacheOrgRepos(ctx context.Context, org string, repos []model.RepoIn
 // timestamp speaks for the whole org. Using min(fetched_at) is the
 // conservative read that survives partial-write scenarios.
 func (d *DB) GetCachedOrgRepos(ctx context.Context, org string, freshness time.Duration) ([]model.RepoInfo, bool, error) {
-	var minFetchedAt time.Time
+	// An empty cache makes MIN(fetched_at) NULL; scan through NullTime so
+	// the empty-cache miss is distinguishable from real DB errors (context
+	// cancellation, corruption), which must surface instead of silently
+	// degrading to a live fetch.
+	var minFetchedAt sql.NullTime
 	row := d.DB.QueryRowContext(ctx,
 		"SELECT MIN(fetched_at) FROM org_repos_cache WHERE org = ?", org)
 	if err := row.Scan(&minFetchedAt); err != nil {
-		// No rows scanning into time.Time on DuckDB returns a
-		// "converting NULL to time.Time is unsupported" error rather
-		// than sql.ErrNoRows; treat both as cache-miss.
+		return nil, false, fmt.Errorf("query org_repos_cache freshness for %s: %w", org, err)
+	}
+	if !minFetchedAt.Valid {
 		return nil, false, nil
 	}
-	if minFetchedAt.IsZero() {
-		return nil, false, nil
-	}
-	if time.Since(minFetchedAt) > freshness {
+	if time.Since(minFetchedAt.Time) > freshness {
 		return nil, false, nil
 	}
 

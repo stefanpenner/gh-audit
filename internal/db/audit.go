@@ -148,11 +148,11 @@ func (d *DB) DeleteAuditResults(ctx context.Context, org, repo string) error {
 // deleting, then copy them onto the new AuditResult so the classification
 // isn't clobbered.
 type RevertMergeClassification struct {
-	IsCleanRevert       bool
-	RevertVerification  string
-	RevertedSHA         string
-	IsCleanMerge        bool
-	MergeVerification   string
+	IsCleanRevert      bool
+	RevertVerification string
+	RevertedSHA        string
+	IsCleanMerge       bool
+	MergeVerification  string
 }
 
 // GetRevertMergeClassification returns the stored revert/merge classification

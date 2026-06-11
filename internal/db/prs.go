@@ -41,17 +41,24 @@ var reviewColumns = []string{
 
 // UpsertReviews batch-inserts reviews using the DuckDB Appender API with a
 // staging table for upsert semantics.
+//
+// PENDING reviews are skipped: GitHub returns them only for the calling
+// user's own un-submitted drafts. A draft is not an audit event, and
+// persisting it would let one stray row poison the whole batch on stricter
+// schemas.
 func (d *DB) UpsertReviews(ctx context.Context, reviews []model.Review) error {
-	if len(reviews) == 0 {
-		return nil
-	}
-
-	rows := make([][]driver.Value, len(reviews))
-	for i, r := range reviews {
-		rows[i] = []driver.Value{
+	rows := make([][]driver.Value, 0, len(reviews))
+	for _, r := range reviews {
+		if r.State == "PENDING" {
+			continue
+		}
+		rows = append(rows, []driver.Value{
 			r.Org, r.Repo, r.PRNumber, r.ReviewID, r.ReviewerLogin, r.ReviewerID,
 			nullIfEmpty(r.State), r.CommitID, r.SubmittedAt, r.Href,
-		}
+		})
+	}
+	if len(rows) == 0 {
+		return nil
 	}
 
 	return d.bulkUpsert(ctx, "reviews", reviewColumns, []string{"org", "repo", "pr_number", "review_id"}, rows)
@@ -81,6 +88,27 @@ func (d *DB) UpsertCheckRuns(ctx context.Context, checkRuns []model.CheckRun) er
 }
 
 var commitPRColumns = []string{"org", "repo", "sha", "pr_number"}
+
+// CommitPRLink is one (commit, PR) association row.
+type CommitPRLink struct {
+	SHA      string
+	PRNumber int
+}
+
+// UpsertCommitPRLinks batch-links many commits to their PRs in a single
+// staging-table merge. The per-row UpsertCommitPRs variant costs ~5 SQL
+// statements per call; enrichment batches used to issue hundreds of them
+// per batch, all serialized through the DBWriter.
+func (d *DB) UpsertCommitPRLinks(ctx context.Context, org, repo string, links []CommitPRLink) error {
+	if len(links) == 0 {
+		return nil
+	}
+	rows := make([][]driver.Value, len(links))
+	for i, l := range links {
+		rows[i] = []driver.Value{org, repo, l.SHA, l.PRNumber}
+	}
+	return d.bulkUpsert(ctx, "commit_prs", commitPRColumns, []string{"org", "repo", "sha", "pr_number"}, rows)
+}
 
 // UpsertCommitPRs links a commit to its associated PR numbers.
 func (d *DB) UpsertCommitPRs(ctx context.Context, org, repo, sha string, prNumbers []int) error {
@@ -152,7 +180,8 @@ func (d *DB) GetPRsForCommit(ctx context.Context, org, repo, sha string) ([]mode
 func (d *DB) GetCommitsForPR(ctx context.Context, org, repo string, prNumber int) ([]model.Commit, error) {
 	rows, err := d.DB.QueryContext(ctx, `
 		SELECT c.org, c.repo, c.sha, c.author_login, c.author_id, c.author_email, c.committer_login,
-		       c.committed_at, c.message, c.parent_count, c.additions, c.deletions, c.is_verified, c.href
+		       c.committed_at, c.message, c.parent_count, c.additions, c.deletions,
+		       COALESCE(c.files_changed, 0), c.detail_fetched_at IS NOT NULL, c.is_verified, c.href
 		FROM commits c
 		INNER JOIN commit_prs cp ON c.org = cp.org AND c.repo = cp.repo AND c.sha = cp.sha
 		WHERE cp.org = ? AND cp.repo = ? AND cp.pr_number = ?`, org, repo, prNumber)

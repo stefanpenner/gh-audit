@@ -221,3 +221,53 @@ func TestIsCleanRevertDiff(t *testing.T) {
 	dupA := []model.FileDiff{{Filename: "x.go", Patch: "@@\n-same\n"}}
 	assert.False(t, IsCleanRevertDiff(dupR, dupA), "expected mismatch on duplicate-line multiplicity")
 }
+
+func TestExtractDiffLines(t *testing.T) {
+	t.Run("headers only stripped before first hunk", func(t *testing.T) {
+		// Content lines starting "++"/"--" serialize as "+++…"/"---…" and
+		// must NOT be dropped as file headers inside hunks.
+		patch := "--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n ctx\n-old\n+new\n+++inc;\n---dec;\n"
+		add, del := extractDiffLines(patch)
+		assert.Equal(t, []string{"new", "++inc;"}, add)
+		assert.Equal(t, []string{"old", "--dec;"}, del)
+	})
+
+	t.Run("patch without hunk markers still yields lines", func(t *testing.T) {
+		add, del := extractDiffLines("+added\n-removed\n")
+		assert.Equal(t, []string{"added"}, add)
+		assert.Equal(t, []string{"removed"}, del)
+	})
+
+	t.Run("header-only patch yields nothing", func(t *testing.T) {
+		add, del := extractDiffLines("--- a/f\n+++ b/f\n")
+		assert.Empty(t, add)
+		assert.Empty(t, del)
+	})
+}
+
+func TestIsCleanRevertDiff_PlusPlusContentLines(t *testing.T) {
+	// A clean revert of a commit that added a line whose CONTENT starts
+	// with "++" (e.g. `++x;`). The added line serializes as "+++x;" and the
+	// revert's removal as "-++x;". Dropping the former as a file header
+	// produced a false diff-mismatch.
+	aPatch := "@@ -1,2 +1,3 @@\n line1\n+++x;\n line2\n"
+	rPatch := "@@ -1,3 +1,2 @@\n line1\n-++x;\n line2\n"
+
+	revert := []model.FileDiff{{Filename: "foo.c", Patch: rPatch}}
+	reverted := []model.FileDiff{{Filename: "foo.c", Patch: aPatch}}
+	assert.True(t, IsCleanRevertDiff(revert, reverted),
+		"clean revert containing ++-prefixed content lines must verify clean")
+}
+
+func TestIsCleanRevertDiff_HeaderLookalikeSmuggle(t *testing.T) {
+	// Asymmetric case: the revert removes what the original added but ALSO
+	// smuggles in `++evil;`, which serializes as "+++evil;". If that line
+	// is wrongly dropped as a file header the diff falsely verifies clean.
+	aPatch := "@@ -1,1 +1,2 @@\n line1\n+x\n"
+	rPatch := "@@ -1,2 +1,2 @@\n line1\n-x\n+++evil;\n"
+
+	revert := []model.FileDiff{{Filename: "foo.c", Patch: rPatch}}
+	reverted := []model.FileDiff{{Filename: "foo.c", Patch: aPatch}}
+	assert.False(t, IsCleanRevertDiff(revert, reverted),
+		"a revert that adds extra ++-prefixed content must NOT verify clean")
+}

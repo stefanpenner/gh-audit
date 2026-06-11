@@ -30,7 +30,9 @@ import (
 //	                            three finalizers (Compliant / RevertWaiver / NonCompliant)
 //	Leaf predicates           — latestReviewStatesOnFinal, evaluateRequiredChecks,
 //	                            isSelfApproval
-//	Pure utilities            — truncateSHA, hasNonExemptPRContributors, distinct*,
+//	Pure utilities            — truncateSHA, hasNonExemptPRContributors,
+//	                            filterNonEmptyContributors, isApprovalRefreshable,
+//	                            hasNonEmptyContribution, distinct*,
 //	                            classifyMergeStrategy
 
 // RequiredCheck describes a status check that must pass for compliance.
@@ -59,14 +61,21 @@ const (
 	// locally and we need GetCommitDetail to tell whether to drop
 	// them from the self-approval check.
 	StatsTriggerSelfApproval StatsTrigger = "self"
+	// StatsTriggerExemption is rule §1's PR-branch emptiness
+	// verification — fired when a non-exempt PR-branch commit looks
+	// zero-stat locally and the §1 carve-out needs GetCommitDetail to
+	// prove it truly shipped no code before granting the exemption.
+	StatsTriggerExemption StatsTrigger = "exempt"
 )
 
-// StatsFetcher resolves a commit's additions/deletions. Used by
-// EvaluateCommit for the §2 empty-commit fallback and the §5 PR-branch-
-// author empty-stats disambiguation. Implementations should check the
-// DB first and fall through to the REST API; returning any error
-// leaves the stats at whatever the caller passed in (typically zero).
-type StatsFetcher func(trigger StatsTrigger, org, repo, sha string) (additions, deletions int, err error)
+// StatsFetcher resolves a commit's additions/deletions and the number of
+// files it touches. Used by EvaluateCommit for the §2 empty-commit
+// fallback, the §1 PR-branch emptiness verification, and the §5
+// PR-branch-author empty-stats disambiguation. The file count is
+// load-bearing: pure renames and mode-only changes report 0/0 line stats
+// with a non-zero file count and are NOT empty. Implementations should
+// check the DB first and fall through to the REST API.
+type StatsFetcher func(trigger StatsTrigger, org, repo, sha string) (additions, deletions, filesChanged int, err error)
 
 // ----- Orchestration -----
 
@@ -93,7 +102,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	result := initAuditResult(commit, enrichment)
 
 	// §1 — Exempt author.
-	if applyExemptAuthorRule(&result, commit, enrichment, exemptAuthors) {
+	if applyExemptAuthorRule(&result, commit, enrichment, exemptAuthors, fetchStats) {
 		return result
 	}
 
@@ -103,6 +112,16 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 		// §2 — Empty commit (no-PR path).
 		if applyEmptyCommitFallback(&result, &commit, fetchStats) {
 			return result
+		}
+		// §8 — Clean-revert waiver. Applies to direct pushes too:
+		// Architecture.md runs §8 against any non-compliant primary
+		// verdict, and this path is one of them. Without this, a
+		// diff-verified clean revert pushed without a PR stored
+		// is_compliant=false alongside is_clean_revert=true — a state
+		// the report layer used to paper over by silently overriding
+		// the verdict.
+		if ok, reason := evaluateRevertCompliance(commit, enrichment); ok {
+			return finalizeRevertWaiver(result, commit, enrichment, prVerdict{}, reason)
 		}
 		result.IsCompliant = false
 		result.Reasons = []string{"no associated pull request"}
@@ -178,12 +197,12 @@ func initAuditResult(commit model.Commit, enrichment model.EnrichmentResult) mod
 // whose emails GitHub doesn't bind to an account (commit.AuthorID == 0) the
 // rule falls back to the operator-curated `verified_emails` list. See
 // isExemptCommit for the full rationale.
-func applyExemptAuthorRule(result *model.AuditResult, commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor) bool {
+func applyExemptAuthorRule(result *model.AuditResult, commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor, fetchStats StatsFetcher) bool {
 	if !isExemptCommit(commit.AuthorID, commit.AuthorEmail, exemptAuthors) {
 		return false
 	}
 	result.IsExemptAuthor = true
-	if hasNonExemptPRContributors(enrichment, exemptAuthors) {
+	if hasNonExemptPRContributors(commit.Org, commit.Repo, enrichment, exemptAuthors, fetchStats) {
 		return false
 	}
 	result.IsCompliant = true
@@ -236,20 +255,36 @@ func isExemptCommit(authorID int64, authorEmail string, exemptAuthors []model.Ex
 //
 // Stats are resolved lazily: if the commit already carries non-zero
 // additions/deletions the check short-circuits without IO; otherwise
-// fetchStats is called (DB-first, API-fallback). A nil fetchStats or a
-// fetch error leaves the caller's existing zero stats in place, which means
-// the commit IS marked empty — matching the legacy "stats default to zero →
-// treated as empty" semantics so this refactor is a strict subset.
+// fetchStats is called (DB-first, API-fallback).
+//
+// A fetch ERROR fails closed: the waiver does not fire and the commit keeps
+// its non-compliant verdict. The previous behaviour treated the unresolved
+// zero stats as "empty", which converted a transient API blip into a
+// permanent compliant "empty commit" row that no later run would revisit. A
+// false flag in the Action Queue is recoverable (re-audit); a silent false
+// waiver is not.
+//
+// A nil fetchStats (offline re-audit) keeps the legacy "stored zero stats →
+// empty" semantics: the DB's stats are the best information available, and
+// failing closed there would flood the queue for genuinely empty commits.
+// Rows whose detail WAS verified at sync time carry their file count, so
+// rename-only commits stay blocked offline too.
+//
+// "Empty" means zero LINES and zero FILES: pure renames and mode-only
+// changes report 0/0 line stats but touch files — content moved without
+// review is not a no-op.
 func applyEmptyCommitFallback(result *model.AuditResult, commit *model.Commit, fetchStats StatsFetcher) bool {
 	if commit.Additions != 0 || commit.Deletions != 0 {
 		return false
 	}
 	if fetchStats != nil {
-		if adds, dels, err := fetchStats(StatsTriggerEmptyCommit, commit.Org, commit.Repo, commit.SHA); err == nil {
-			commit.Additions, commit.Deletions = adds, dels
+		adds, dels, files, err := fetchStats(StatsTriggerEmptyCommit, commit.Org, commit.Repo, commit.SHA)
+		if err != nil {
+			return false
 		}
+		commit.Additions, commit.Deletions, commit.FilesChanged = adds, dels, files
 	}
-	if commit.Additions != 0 || commit.Deletions != 0 {
+	if commit.Additions != 0 || commit.Deletions != 0 || commit.FilesChanged != 0 {
 		return false
 	}
 	result.IsEmptyCommit = true
@@ -305,12 +340,12 @@ type prVerdict struct {
 	reasons          []string
 	approvers        []string
 	prBranchCommits  []model.Commit // PR-branch commits (for self-approval ID check)
-	approvalOnFinal  bool     // §4: non-self APPROVED on pr.HeadSHA
-	selfApproved     bool     // §5: any APPROVED whose reviewer is a code author
-	staleApproval    bool     // §4: non-self APPROVED on older SHA
-	postMergeConcern bool     // §4 cutoff: post-merge CHANGES_REQUESTED/DISMISSED
-	ownerApproval    string   // §6: "", "success", "failure", "missing"
-	ownerApprovalOK  bool     // §6: ownerApproval is "" or "success"
+	approvalOnFinal  bool           // §4: non-self APPROVED on pr.HeadSHA
+	selfApproved     bool           // §5: any APPROVED whose reviewer is a code author
+	staleApproval    bool           // §4: non-self APPROVED on older SHA
+	postMergeConcern bool           // §4 cutoff: post-merge CHANGES_REQUESTED/DISMISSED
+	ownerApproval    string         // §6: "", "success", "failure", "missing"
+	ownerApprovalOK  bool           // §6: ownerApproval is "" or "success"
 }
 
 // evaluatePR scores a single PR against Architecture.md §§4–6 and returns
@@ -510,10 +545,19 @@ func latestReviewStatesOnFinal(reviews []model.Review, pr model.PullRequest) (ma
 		if review.SubmittedAt.Before(existing.SubmittedAt) {
 			continue
 		}
-		if review.SubmittedAt.Equal(existing.SubmittedAt) && review.ReviewID <= existing.ReviewID {
+		// COMMENTED never displaces APPROVED for the same reviewer — and
+		// the rule must hold in BOTH arrival orders. GitHub timestamps
+		// have second precision, so an API-driven approve+comment pair
+		// lands at the same instant; deciding by ReviewID alone made the
+		// verdict depend on row order.
+		if review.State == "COMMENTED" && existing.State == "APPROVED" {
 			continue
 		}
-		if review.State == "COMMENTED" && existing.State == "APPROVED" {
+		if review.State == "APPROVED" && existing.State == "COMMENTED" {
+			latest[key] = review
+			continue
+		}
+		if review.SubmittedAt.Equal(existing.SubmittedAt) && review.ReviewID <= existing.ReviewID {
 			continue
 		}
 		latest[key] = review
@@ -532,6 +576,14 @@ func reviewerKey(r model.Review) string {
 // of required checks against the check runs for a given commit SHA.
 // Returns "success" if all pass, "failure" if any found but failed,
 // "missing" if not found.
+//
+// The same check name can appear multiple times on one SHA: re-runs mint
+// new check_run_ids, the DB accumulates them across syncs, and multiple
+// check suites can carry same-named runs. Only the LATEST run per
+// required check counts — selected by CompletedAt, with CheckRunID as a
+// deterministic tiebreak — mirroring GitHub's own "latest run wins" UI
+// semantics. Taking an arbitrary match made the verdict flip between
+// runs whenever a failed check had been re-run to success.
 func evaluateRequiredChecks(checkRuns []model.CheckRun, headSHA string, requiredChecks []RequiredCheck) string {
 	if len(requiredChecks) == 0 {
 		return ""
@@ -539,18 +591,24 @@ func evaluateRequiredChecks(checkRuns []model.CheckRun, headSHA string, required
 	allPassed := true
 	anyFailed := false
 	for _, rc := range requiredChecks {
-		found := false
-		for _, cr := range checkRuns {
-			if cr.CommitSHA == headSHA && strings.EqualFold(cr.CheckName, rc.Name) {
-				found = true
-				if !strings.EqualFold(cr.Conclusion, rc.Conclusion) {
-					anyFailed = true
-					allPassed = false
-				}
-				break
+		var latest *model.CheckRun
+		for i := range checkRuns {
+			cr := &checkRuns[i]
+			if cr.CommitSHA != headSHA || !strings.EqualFold(cr.CheckName, rc.Name) {
+				continue
+			}
+			if latest == nil ||
+				cr.CompletedAt.After(latest.CompletedAt) ||
+				(cr.CompletedAt.Equal(latest.CompletedAt) && cr.CheckRunID > latest.CheckRunID) {
+				latest = cr
 			}
 		}
-		if !found {
+		if latest == nil {
+			allPassed = false
+			continue
+		}
+		if !strings.EqualFold(latest.Conclusion, rc.Conclusion) {
+			anyFailed = true
 			allPassed = false
 		}
 	}
@@ -634,29 +692,47 @@ func truncateSHA(sha string) string {
 // applyExemptAuthorRule's matching: id when present, falling back to
 // `verified_emails` when AuthorID == 0.
 //
-// Empty commits (zero additions and zero deletions) are skipped — they
-// can't introduce any code into the squash merge, so their author's
-// exempt status is irrelevant to "did human code ship". This mirrors
-// the empty-commit exclusion in distinctPRCommitAuthors (Architecture.md
-// §5) and avoids voiding the §1 carve-out on GitHub stub commits or
-// "Empty commit to rerun check" markers.
+// A non-exempt author's commit is ignored only when it is VERIFIABLY
+// empty (zero additions and deletions confirmed via fetchStats): empty
+// commits can't introduce code into the squash, so their author's exempt
+// status is irrelevant to "did human code ship" — the "Empty commit to
+// rerun check" marker is the prototypical case. The verification step is
+// load-bearing: /pulls/{n}/commits omits diff stats entirely, so every
+// branch commit looks zero-stat locally. Skipping on the local zeros
+// alone would skip every commit and grant the §1 waiver to squashes
+// containing real human code. When stats can't be resolved (nil
+// fetchStats in offline re-audit, or a fetch error) the function fails
+// closed and treats the commit as a contribution.
 //
-// PR-branch commits come from /pulls/{n}/commits which (unlike
-// /repos/{o}/{r}/commits) does not go through requireAuthor — so an
-// AuthorID of 0 is normal. The verified_emails fallback lets the
+// PR-branch commits come from /pulls/{n}/commits; like every ingestion
+// path they go through resolveAuthor, which keeps the row and leaves
+// AuthorID == 0 when GitHub can't bind the git-author email to an
+// account — so a zero AuthorID is normal here. The verified_emails
+// fallback lets the
 // operator vet service accounts whose emails GitHub doesn't bind to a
 // verified account; without a match (or with no email at all) we fail
 // closed, treating the contributor as non-exempt.
-func hasNonExemptPRContributors(enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor) bool {
+func hasNonExemptPRContributors(org, repo string, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor, fetchStats StatsFetcher) bool {
 	if len(enrichment.PRBranchCommits) == 0 {
 		return false
 	}
 	for _, commits := range enrichment.PRBranchCommits {
 		for _, c := range commits {
-			if c.Additions == 0 && c.Deletions == 0 {
+			if isExemptCommit(c.AuthorID, c.AuthorEmail, exemptAuthors) {
 				continue
 			}
-			if !isExemptCommit(c.AuthorID, c.AuthorEmail, exemptAuthors) {
+			adds, dels, files := c.Additions, c.Deletions, c.FilesChanged
+			if adds == 0 && dels == 0 && !c.StatsVerified {
+				if fetchStats == nil {
+					return true // unverifiable emptiness — fail closed
+				}
+				a, d, f, err := fetchStats(StatsTriggerExemption, org, repo, c.SHA)
+				if err != nil {
+					return true // unverifiable emptiness — fail closed
+				}
+				adds, dels, files = a, d, f
+			}
+			if adds != 0 || dels != 0 || files != 0 {
 				return true
 			}
 		}
@@ -666,8 +742,9 @@ func hasNonExemptPRContributors(enrichment model.EnrichmentResult, exemptAuthors
 
 // filterNonEmptyContributors returns one representative commit per unique
 // author from a PR's branch commits, keeping only authors with non-empty
-// contributions. Used by isSelfApproval to compare reviewer identity
-// against PR branch contributors using both AuthorID and AuthorLogin.
+// contributions. The grouping key prefers AuthorID and falls back to a
+// lowercased login only for rows with no resolved ID; the downstream
+// comparison in isSelfApproval is strictly ID-only (sameUser).
 func filterNonEmptyContributors(org, repo string, commits []model.Commit, fetchStats StatsFetcher) []model.Commit {
 	type authorGroup struct {
 		representative model.Commit
@@ -709,12 +786,14 @@ func filterNonEmptyContributors(org, repo string, commits []model.Commit, fetchS
 // committed strictly after the approval is authored by an account in
 // the exempt list.
 //
-// The trust boundary is the exempt-author ID match. AuthorID is set
-// by GitHub from the commit's git-author email's verified account
-// binding — a local actor cannot forge it. The exempt list is the
-// curated set of accounts the operator has already vetted as not
-// requiring human review (§1); commits by those accounts after an
-// approval don't invalidate the approval's coverage.
+// The trust boundary is the same isExemptCommit matching §1 uses:
+// the numeric AuthorID when present (set by GitHub from the commit's
+// git-author email's verified account binding — a local actor cannot
+// forge it), falling back to the operator-curated verified_emails
+// list when the ID is unresolved. The exempt list is the curated set
+// of accounts the operator has already vetted as not requiring human
+// review (§1); commits by those accounts after an approval don't
+// invalidate the approval's coverage.
 //
 // One non-exempt commit between approval and merge means real
 // human-authored code shipped that the reviewer never saw — the
@@ -724,6 +803,14 @@ func filterNonEmptyContributors(org, repo string, commits []model.Commit, fetchS
 // this on an old-SHA review, so a post-approval set should always be
 // non-empty in practice; treating "no post-approval commits" as
 // non-refreshable is the safe default.
+//
+// KNOWN LIMITATION: "committed strictly after the approval" compares
+// CommittedAt, a client-settable timestamp. A backdated human commit
+// pushed after the approval escapes the post-approval set entirely, so
+// an exempt bot commit alongside it can still promote the approval. A
+// positional check (any non-exempt commit anywhere after the approved
+// CommitID in the branch's commit graph) would close this, but the
+// commit parent graph isn't persisted today. See TODO.md.
 //
 // `mergeCommitSHA` is the PR's `merge_commit_sha`. The PR-branch list is
 // built from `commit_prs ⨝ commits`, which links the squash-merge
@@ -752,42 +839,6 @@ func isApprovalRefreshable(approval model.Review, prBranchCommits []model.Commit
 	return postApprovalCount > 0
 }
 
-// distinctPRCommitAuthors returns unique author logins from a single PR's
-// branch commits (for the PRCommitAuthorLogins report column).
-//
-// Authors whose every contribution to this PR branch is an empty commit
-// (zero additions and zero deletions) are dropped. The reviewer pushing an
-// "Empty commit to rerun check" or similar admin commit is the prototypical
-// false positive: GitHub's /pulls/N/commits endpoint omits diff stats, so
-// every commit looks zero-stat at this point. fetchStats lazily resolves
-// the truth via GetCommitDetail (DB-cached), and is only invoked for an
-// author whose listed contributions all *appear* empty — the common case
-// where the author has any commit with non-zero stats short-circuits before
-// any API call. fetchStats may be nil; without it the conservative
-// pre-filter behaviour (treat the author as a contributor) is preserved.
-func distinctPRCommitAuthors(org, repo string, commits []model.Commit, fetchStats StatsFetcher) []string {
-	byAuthor := make(map[string][]model.Commit)
-	var order []string
-	for _, c := range commits {
-		if c.AuthorLogin == "" {
-			continue
-		}
-		lower := strings.ToLower(c.AuthorLogin)
-		if _, ok := byAuthor[lower]; !ok {
-			order = append(order, c.AuthorLogin)
-		}
-		byAuthor[lower] = append(byAuthor[lower], c)
-	}
-
-	var out []string
-	for _, login := range order {
-		if hasNonEmptyContribution(org, repo, byAuthor[strings.ToLower(login)], fetchStats) {
-			out = append(out, login)
-		}
-	}
-	return out
-}
-
 // hasNonEmptyContribution reports whether any of an author's PR-branch
 // commits modified at least one line. If every commit's local stats look
 // empty (typical: PR-branch commits returned by /pulls/N/commits never
@@ -797,7 +848,7 @@ func distinctPRCommitAuthors(org, repo string, commits []model.Commit, fetchStat
 // author who actually contributed.
 func hasNonEmptyContribution(org, repo string, commits []model.Commit, fetchStats StatsFetcher) bool {
 	for _, c := range commits {
-		if c.Additions > 0 || c.Deletions > 0 {
+		if c.Additions > 0 || c.Deletions > 0 || c.FilesChanged > 0 {
 			return true
 		}
 	}
@@ -805,11 +856,11 @@ func hasNonEmptyContribution(org, repo string, commits []model.Commit, fetchStat
 		return true
 	}
 	for _, c := range commits {
-		a, d, err := fetchStats(StatsTriggerSelfApproval, org, repo, c.SHA)
+		a, d, f, err := fetchStats(StatsTriggerSelfApproval, org, repo, c.SHA)
 		if err != nil {
 			return true
 		}
-		if a > 0 || d > 0 {
+		if a > 0 || d > 0 || f > 0 {
 			return true
 		}
 	}

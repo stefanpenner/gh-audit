@@ -24,5 +24,8 @@ sync:
 
 exemptions:
   authors:
-    - "dependabot[bot]"
-    - "github-actions[bot]"
+    # Matching is by immutable numeric account id (logins are display-only).
+    - login: "dependabot[bot]"
+      id: 49699333
+    - login: "github-actions[bot]"
+      id: 41898282

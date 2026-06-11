@@ -77,10 +77,12 @@ type SyncConfig struct {
 	InitialLookbackDays int `yaml:"initial_lookback_days"`
 	// OrgReposCacheFreshness caps how long a cached
 	// /orgs/{org}/repos enumeration is trusted before re-fetching.
-	// Empty / zero defaults to 24h. Set to "0s" or any negative
-	// value to disable the cache (always live-enumerate). Useful
-	// for full-org sweeps where the API enumeration was the silent
-	// 60-90s startup stall.
+	// Empty / zero defaults to 24h ("0s" in YAML is indistinguishable
+	// from unset). Set a NEGATIVE value (e.g. "-1s") to disable the
+	// cache and always live-enumerate; the --org-repos-cache flag
+	// accepts "0s" for the same purpose because the CLI can detect an
+	// explicitly-passed flag. Useful for full-org sweeps where the API
+	// enumeration was the silent 60-90s startup stall.
 	OrgReposCacheFreshness time.Duration `yaml:"org_repos_cache_freshness"`
 }
 
@@ -145,7 +147,26 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// expandHome resolves a leading "~/" (or bare "~") against the user's home
+// directory. YAML is exactly where users write "~/..." because shells
+// normally expand it for them; without this, `database: ~/x.db` creates a
+// literal directory named "~" in the cwd.
+func expandHome(p string) string {
+	if p != "~" && !strings.HasPrefix(p, "~/") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p
+	}
+	return filepath.Join(home, strings.TrimPrefix(p, "~"))
+}
+
 func (c *Config) applyDefaults() {
+	c.Database = expandHome(c.Database)
+	for i := range c.Tokens {
+		c.Tokens[i].PrivateKeyPath = expandHome(c.Tokens[i].PrivateKeyPath)
+	}
 	if c.Database == "" {
 		c.Database = DefaultDBPath()
 	}
@@ -174,16 +195,35 @@ func (c *Config) validate() error {
 	if len(c.Orgs) == 0 {
 		return fmt.Errorf("config: at least one org is required")
 	}
+	seenOrgs := make(map[string]bool, len(c.Orgs))
 	for i, org := range c.Orgs {
 		if strings.TrimSpace(org.Name) == "" {
 			return fmt.Errorf("config: org[%d] name must not be empty", i)
 		}
+		key := strings.ToLower(org.Name)
+		if seenOrgs[key] {
+			// A duplicated org runs two full concurrent sync passes per
+			// repo — doubled API spend, duplicated enrichment.
+			return fmt.Errorf("config: duplicate org %q", org.Name)
+		}
+		seenOrgs[key] = true
 	}
 
 	if len(c.Tokens) == 0 {
 		return fmt.Errorf("config: at least one token is required")
 	}
+	seenTokens := make(map[string]bool, len(c.Tokens))
 	for i, tok := range c.Tokens {
+		// The pool keys tokens by env (PATs) or app:installation; a
+		// duplicate makes one server-side budget look like two tokens.
+		id := tok.Env
+		if id == "" {
+			id = fmt.Sprintf("app:%d:%d", tok.AppID, tok.InstallationID)
+		}
+		if seenTokens[id] {
+			return fmt.Errorf("config: duplicate token %q", id)
+		}
+		seenTokens[id] = true
 		switch tok.Kind {
 		case "pat":
 			if tok.Env == "" {
@@ -205,6 +245,16 @@ func (c *Config) validate() error {
 
 		if len(tok.Scopes) == 0 {
 			return fmt.Errorf("config: token[%d] requires at least one scope", i)
+		}
+	}
+
+	// Exemption matching is id-or-verified-emails only (logins are
+	// display-only — mutable and forgery-prone). An entry with neither is
+	// silently inert: it never matches, and the operator believes the
+	// account is exempt while every one of its commits gets flagged.
+	for i, e := range c.Exemptions.Authors {
+		if e.ID == 0 && len(e.VerifiedEmails) == 0 {
+			return fmt.Errorf("config: exemptions.authors[%d] (%q) needs 'id' or 'verified_emails' — login alone never matches", i, e.Login)
 		}
 	}
 

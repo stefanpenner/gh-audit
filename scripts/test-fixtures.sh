@@ -39,6 +39,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 cat > "$TMPDIR/config.yaml" <<EOF
 database: $TMPDIR/audit.db
+orgs:
+  - name: ${FIXTURES_REPO%%/*}
+    repos: [${FIXTURES_REPO#*/}]
 tokens:
   - kind: pat
     env: GITHUB_TOKEN
@@ -58,6 +61,21 @@ echo "==> Syncing $FIXTURES_REPO"
     >"$TMPDIR/sync.log" 2>&1 || {
         echo "sync failed; tail of log:" >&2
         tail -n 40 "$TMPDIR/sync.log" >&2
+        exit 1
+    }
+
+# Re-evaluate everything from the DB before asserting. This validates the
+# offline bundle path (the one that once dropped reviewer_id and rejected
+# every approval) AND is required for cross-PR facts that only fully
+# materialize after the whole sync has landed — e.g. scenario 5.4's
+# pr_count=2, whose second commit→PR link is written during the second
+# PR's enrichment, after the commit itself was audited.
+echo "==> Re-evaluating commits from DB (bundle path)"
+"$TMPDIR/gh-audit" --config "$TMPDIR/config.yaml" re-evaluate-commits \
+    --db "$TMPDIR/audit.db" \
+    >"$TMPDIR/reaudit.log" 2>&1 || {
+        echo "re-evaluate-commits failed; tail of log:" >&2
+        tail -n 40 "$TMPDIR/reaudit.log" >&2
         exit 1
     }
 

@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stefanpenner/gh-audit/internal/db"
 	"github.com/stefanpenner/gh-audit/internal/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -20,6 +22,35 @@ type mockSource struct {
 	repos   map[string][]model.RepoInfo
 	commits map[string][]model.Commit
 	err     error
+
+	// Graph-path fixtures (org/repo/branch keys). When branchHeads has no
+	// entry, GetBranchHead errors so existing date-window tests are
+	// untouched (the pipeline falls back).
+	branchHeads    map[string]string         // key → tip SHA
+	compareCommits map[string][]model.Commit // "key base...head" → commits
+	compareErr     error
+
+	listCalls    atomic.Int32
+	compareCalls atomic.Int32
+}
+
+func (m *mockSource) GetBranchHead(_ context.Context, org, repo, branch string) (string, error) {
+	if head, ok := m.branchHeads[org+"/"+repo+"/"+branch]; ok {
+		return head, nil
+	}
+	return "", errors.New("mock: no branch head configured")
+}
+
+func (m *mockSource) CompareCommits(_ context.Context, org, repo, base, head, branch string) ([]model.Commit, error) {
+	m.compareCalls.Add(1)
+	if m.compareErr != nil {
+		return nil, m.compareErr
+	}
+	key := org + "/" + repo + "/" + branch + " " + base + "..." + head
+	if commits, ok := m.compareCommits[key]; ok {
+		return commits, nil
+	}
+	return nil, errors.New("mock: no compare result configured for " + key)
 }
 
 func (m *mockSource) ListOrgRepos(_ context.Context, org string) ([]model.RepoInfo, error) {
@@ -47,6 +78,7 @@ func (m *mockSource) GetRepo(_ context.Context, org, repo string) (model.RepoInf
 }
 
 func (m *mockSource) ListCommits(_ context.Context, org, repo, branch string, since, until time.Time) ([]model.Commit, error) {
+	m.listCalls.Add(1)
 	if m.err != nil {
 		return nil, m.err
 	}
@@ -101,6 +133,7 @@ type mockStore struct {
 	checkRuns      []model.CheckRun
 	auditResults   []model.AuditResult
 	unaudited      map[string][]model.Commit
+	commitPRs      map[string][]int
 	err            error
 }
 
@@ -109,6 +142,7 @@ func newMockStore() *mockStore {
 		cursors:        make(map[string]*model.SyncCursor),
 		commitBranches: make(map[string][]string),
 		unaudited:      make(map[string][]model.Commit),
+		commitPRs:      make(map[string][]int),
 	}
 }
 
@@ -138,6 +172,24 @@ func (m *mockStore) UpsertCommits(_ context.Context, commits []model.Commit) err
 	for _, c := range commits {
 		key := c.Org + "/" + c.Repo
 		m.unaudited[key] = append(m.unaudited[key], c)
+	}
+	return nil
+}
+
+func (m *mockStore) InsertCommitsIfAbsent(_ context.Context, commits []model.Commit) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	existing := make(map[string]bool, len(m.commits))
+	for _, c := range m.commits {
+		existing[c.Org+"/"+c.Repo+"/"+c.SHA] = true
+	}
+	for _, c := range commits {
+		key := c.Org + "/" + c.Repo + "/" + c.SHA
+		if existing[key] {
+			continue
+		}
+		existing[key] = true
+		m.commits = append(m.commits, c)
 	}
 	return nil
 }
@@ -178,6 +230,16 @@ func (m *mockStore) UpsertCheckRuns(_ context.Context, runs []model.CheckRun) er
 }
 
 func (m *mockStore) UpsertCommitPRs(_ context.Context, org, repo, sha string, prNumbers []int) error {
+	return nil
+}
+
+func (m *mockStore) UpsertCommitPRLinks(_ context.Context, org, repo string, links []db.CommitPRLink) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, l := range links {
+		key := org + "/" + repo + "/" + l.SHA
+		m.commitPRs[key] = append(m.commitPRs[key], l.PRNumber)
+	}
 	return nil
 }
 

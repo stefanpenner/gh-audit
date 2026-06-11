@@ -70,14 +70,15 @@ type Commit struct {
 	SHA         string
 	AuthorLogin string
 	// AuthorID is the immutable numeric GitHub account ID. Zero when
-	// the commit's email isn't bound to a verified GH user — but
-	// commit ingestion (internal/github/client.go::requireAuthor)
-	// refuses such commits with a fix-it message, so by the time a
-	// row reaches the audit it is guaranteed non-zero. The ID is the
-	// only forgery-resistant author identity GitHub exposes (logins
-	// can be renamed and reclaimed; numeric IDs are immutable per
-	// account and never reused), so it's the sole signal used by §1
-	// (exempt author) and §5 (self-approval) matching.
+	// the commit's email isn't bound to a verified GH user — commit
+	// ingestion (internal/github/client.go::resolveAuthor) logs a
+	// fix-it warning and keeps the row, so zero-ID rows do reach the
+	// audit. The ID is the only forgery-resistant author identity
+	// GitHub exposes (logins can be renamed and reclaimed; numeric
+	// IDs are immutable per account and never reused), so it's the
+	// preferred signal for §1 (exempt author) and the sole signal for
+	// §5 (self-approval) matching; §1 falls back to the operator-
+	// curated verified_emails list only when the ID is zero.
 	AuthorID       int64
 	AuthorEmail    string
 	CommitterLogin string
@@ -88,8 +89,18 @@ type Commit struct {
 	ParentCount    int
 	Additions      int
 	Deletions      int
-	Branch         string
-	Href           string
+	// FilesChanged is the number of files the commit touches, from the
+	// commit-detail endpoint. Load-bearing for the §2 empty-commit waiver:
+	// pure renames and mode-only changes report 0/0 line stats but a
+	// non-zero file count, and must not be waived as "empty".
+	FilesChanged int
+	// StatsVerified is true when Additions/Deletions/FilesChanged came
+	// from a real GET /commits/{sha} fetch (commits.detail_fetched_at IS
+	// NOT NULL). Distinguishes "verified zero" from "never fetched" so
+	// offline re-audits read the same facts the sync-time audit verified.
+	StatsVerified bool
+	Branch        string
+	Href          string
 }
 
 // A FileDiff is a per-file change in a commit's diff, used for clean-revert
@@ -182,17 +193,17 @@ type CheckRun struct {
 //	Review ──┘
 //	CheckRun ──┘
 type AuditResult struct {
-	Org                string
-	Repo               string
-	SHA                string
-	IsEmptyCommit      bool
-	IsBot              bool // author name ends with [bot] — informational only
-	IsExemptAuthor     bool // author is on the configured exemption list
-	HasPR              bool
-	PRNumber           int
-	PRCount            int
-	HasFinalApproval   bool
-	HasStaleApproval   bool // approval exists but on a pre-force-push commit
+	Org              string
+	Repo             string
+	SHA              string
+	IsEmptyCommit    bool
+	IsBot            bool // author name ends with [bot] — informational only
+	IsExemptAuthor   bool // author is on the configured exemption list
+	HasPR            bool
+	PRNumber         int
+	PRCount          int
+	HasFinalApproval bool
+	HasStaleApproval bool // approval exists but on a pre-force-push commit
 	// HasPostMergeConcern is true when a reviewer submitted a CHANGES_REQUESTED
 	// or DISMISSED review after the PR merged. Informational — does not affect
 	// IsCompliant (compliance is evaluated point-in-time at merge).
@@ -200,9 +211,9 @@ type AuditResult struct {
 	// IsCleanRevert is true when the commit is a clean revert of a prior
 	// commit. For bot auto-reverts this is trusted by message pattern; for
 	// manual reverts it is set only when RevertVerification == "diff-verified".
-	// Informational — does not affect IsCompliant (policy for clean reverts
-	// is not yet codified).
-	IsCleanRevert      bool
+	// Compliance-bearing: rule §8 (clean-revert waiver) flips an otherwise
+	// non-compliant verdict to compliant when this is true.
+	IsCleanRevert bool
 	// RevertVerification records how IsCleanRevert was determined.
 	// One of: "" / "none" (not a revert), "message-only" (bot auto-revert
 	// trusted by pattern, or manual revert whose referenced commit could not
@@ -212,35 +223,38 @@ type AuditResult struct {
 	RevertVerification string
 	// RevertedSHA is the SHA of the commit being reverted, extracted from
 	// the revert commit's message. Empty if not a revert.
-	RevertedSHA        string
-	// IsCleanMerge is true when the commit is a two-parent merge that
-	// introduced no new content beyond its parents — i.e., no conflict
-	// resolution or post-merge edit. Informational — does not affect
-	// IsCompliant (policy for clean merges is not yet codified).
-	IsCleanMerge      bool
+	RevertedSHA string
+	// IsCleanMerge is true when the commit is a two-parent merge produced
+	// by GitHub's merge button: `Merge pull request #…` message, committer
+	// web-flow, and a GitHub-verified signature (see github.ClassifyMerge).
+	// The button refuses to merge under conflicts, so such a commit carries
+	// no committer-authored code. Informational for compliance, but it
+	// exempts the commit-author check in rule §5 (self-approval).
+	IsCleanMerge bool
 	// MergeVerification records how the merge was classified.
-	// One of: "" / "none" (squash or single-parent), "clean" (2 parents,
-	// files[] empty — merge introduced no diff of its own), "dirty"
-	// (2 parents, merge commit has conflict-resolution or extra content),
-	// "octopus" (3+ parents, not auto-classified).
-	MergeVerification string
-	IsSelfApproved     bool // true if only approvals are from code contributors
-	ApproverLogins     []string
-	OwnerApprovalCheck string // success, failure, missing
-	IsCompliant        bool
-	Reasons            []string
-	MergeStrategy         string // initial, merge, squash, rebase, direct-push
-	PRCommitAuthorLogins  []string
-	CommitHref            string
-	PRHref             string
+	// One of: "" / "none" (squash or single-parent), "verified-merge-bot"
+	// (CleanMerge — 2 parents, merge-button message, web-flow committer,
+	// verified signature), "dirty" (2 parents, missing one of those
+	// signals — may carry conflict-resolution or edits), "octopus"
+	// (3+ parents, not auto-classified).
+	MergeVerification    string
+	IsSelfApproved       bool // true if only approvals are from code contributors
+	ApproverLogins       []string
+	OwnerApprovalCheck   string // success, failure, missing
+	IsCompliant          bool
+	Reasons              []string
+	MergeStrategy        string // initial, merge, squash, rebase, direct-push
+	PRCommitAuthorLogins []string
+	CommitHref           string
+	PRHref               string
 	// Annotations are informational tags attached by the audit's detector
 	// pass (see internal/sync/annotations.go). They describe structural
 	// patterns — automation/dep-bump markers, etc. — without affecting
 	// IsCompliant. Reviewers can filter by tag to triage automated or
 	// automation-adjacent PRs. Format is "<family>:<kv>" (e.g.
 	// "automation:depex") so the XLSX can filter by prefix.
-	Annotations          []string
-	AuditedAt          time.Time
+	Annotations []string
+	AuditedAt   time.Time
 }
 
 // A SyncCursor tracks incremental sync progress for a single
@@ -249,10 +263,18 @@ type AuditResult struct {
 //
 //	RepoInfo ──→ SyncCursor
 type SyncCursor struct {
-	Org       string
-	Repo      string
-	Branch    string
-	LastDate  time.Time
+	Org    string
+	Repo   string
+	Branch string
+	// LastDate is the newest committer date seen on the branch — the
+	// date-window resume point (with overlap) when LastSHA can't drive a
+	// graph-based compare.
+	LastDate time.Time
+	// LastSHA is the branch tip observed at the end of the last sync.
+	// When set, the next incremental sync prefers the compare API
+	// (last_sha...head), which is graph-based and immune to
+	// committer-date backdating. Empty on legacy cursors.
+	LastSHA   string
 	UpdatedAt time.Time
 }
 
@@ -307,13 +329,13 @@ type EnrichmentResult struct {
 //   - ID, when non-zero, is the canonical key. It's the immutable
 //     numeric GitHub account ID — never reused across deletions,
 //     never transferred by renames, not forgeable.
-//   - Login is the fallback for commits whose author.id couldn't be
-//     resolved (commit's git author email isn't bound to a verified
-//     GH user; service accounts often hit this). Forgery-prone:
-//     renames + 90-day cooldown can transfer the username to a
-//     different account.
-//   - Type and Name are display-only metadata captured at resolution
-//     time.
+//   - VerifiedEmails is the fallback for commits whose author.id
+//     couldn't be resolved (commit's git author email isn't bound to
+//     a verified GH user; service accounts often hit this). See the
+//     field comment below for the trust contract.
+//   - Login, Type, and Name are display-only metadata captured at
+//     resolution time. Login is never used for matching — renames +
+//     90-day cooldown can transfer a username to a different account.
 //   - Comment is a user-supplied annotation preserved through the
 //     YAML round-trip; useful for "was: <old-login>, renamed
 //     YYYY-MM" notes.

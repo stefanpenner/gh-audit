@@ -179,6 +179,80 @@ func TestRecoverPRFromMergeMessage_NoPRReference(t *testing.T) {
 	assert.Equal(t, int64(0), enricher.Stats.PRRecovered.Load())
 }
 
+// fakeEnrichmentCache overrides selected lookups on top of the no-op stub.
+type fakeEnrichmentCache struct {
+	stubEnrichmentCache
+	checkRuns []model.CheckRun
+	pr        *model.PullRequest
+}
+
+func (f fakeEnrichmentCache) GetCheckRunsForCommit(_ context.Context, _, _, _ string) ([]model.CheckRun, error) {
+	return f.checkRuns, nil
+}
+
+func (f fakeEnrichmentCache) GetPullRequest(_ context.Context, _, _ string, _ int) (*model.PullRequest, error) {
+	return f.pr, nil
+}
+
+// TestGetCheckRuns_RefreshesNonCompletedDBRows guards against freezing
+// check runs that were persisted mid-flight: a DB row with status
+// queued/in_progress is a snapshot, not a terminal result, so the
+// enricher must refetch from the API instead of trusting it forever.
+func TestGetCheckRuns_RefreshesNonCompletedDBRows(t *testing.T) {
+	var apiCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"total_count": 1,
+			"check_runs": []map[string]any{
+				{"id": 11, "name": "ci", "status": "completed", "conclusion": "success"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	cache := fakeEnrichmentCache{
+		checkRuns: []model.CheckRun{
+			{Org: "testorg", Repo: "testrepo", CommitSHA: "head1", CheckRunID: 11, CheckName: "ci", Status: "in_progress"},
+		},
+	}
+	enricher := NewCachingEnricher(NewClient(mockTokenPool(t, srv.URL), testLogger()), cache)
+
+	runs, err := enricher.getCheckRuns(context.Background(), "testorg", "testrepo", "head1", 7)
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	assert.Equal(t, "completed", runs[0].Status, "stale in-progress DB row must be refreshed from the API")
+	assert.Equal(t, "success", runs[0].Conclusion)
+	assert.Equal(t, int32(1), apiCalls.Load(), "API must be consulted when DB rows are non-terminal")
+}
+
+// TestGetCheckRuns_CompletedDBRowsAreAuthoritative confirms the freeze
+// still applies when every persisted run reached a terminal state.
+func TestGetCheckRuns_CompletedDBRowsAreAuthoritative(t *testing.T) {
+	var apiCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "check_runs": []any{}})
+	}))
+	defer srv.Close()
+
+	cache := fakeEnrichmentCache{
+		// The freeze requires the owning PR to be merged; completed rows
+		// for an open PR could still gain re-runs and must refetch.
+		pr: &model.PullRequest{Org: "testorg", Repo: "testrepo", Number: 7, Merged: true},
+		checkRuns: []model.CheckRun{
+			{Org: "testorg", Repo: "testrepo", CommitSHA: "head1", CheckRunID: 11, CheckName: "ci", Status: "completed", Conclusion: "success"},
+		},
+	}
+	enricher := NewCachingEnricher(NewClient(mockTokenPool(t, srv.URL), testLogger()), cache)
+
+	runs, err := enricher.getCheckRuns(context.Background(), "testorg", "testrepo", "head1", 7)
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	assert.Equal(t, "completed", runs[0].Status)
+	assert.Equal(t, int32(0), apiCalls.Load(), "fully-completed DB rows must not trigger an API call")
+}
+
 // atoiStr is a tiny helper that avoids dragging strconv into the test
 // file just for one constant. Used to render fakePRNumber inline.
 func atoiStr(n int) string {

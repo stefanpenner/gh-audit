@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -39,15 +40,15 @@ func newSyncCmd() *cobra.Command {
 		Use:   "sync",
 		Short: "Sync commits and enrichment data from GitHub",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg := loadConfigOrDefault(cfgFile)
-
-			dbConn, err := db.Open(resolveDBPath(cfg))
+			cfg, err := loadConfigOrDefault(cfgFile, cmd.Flag("config").Changed)
 			if err != nil {
-				return fmt.Errorf("opening database: %w", err)
+				return err
 			}
-			defer dbConn.Close()
 
 			syncCfg, err := buildSyncConfig(cfg, orgs, repos, since, until, concurrency)
+			if err != nil {
+				return err
+			}
 			if orgReposCacheFreshnessSet {
 				// Negative durations (and zero) explicitly disable
 				// the cache. The pipeline reads
@@ -56,13 +57,17 @@ func newSyncCmd() *cobra.Command {
 				// short-circuits to live fetch every time.
 				syncCfg.OrgReposCacheFreshness = orgReposCacheFreshness
 			}
-			if err != nil {
-				return err
-			}
 
 			if len(syncCfg.Orgs) == 0 {
 				return fmt.Errorf("no orgs to sync: use --org or --repo flags, or configure orgs in config file")
 			}
+
+			resolvedDBPath := resolveDBPath(cfg, cmd.Flag("db").Changed)
+			dbConn, err := db.Open(resolvedDBPath)
+			if err != nil {
+				return fmt.Errorf("opening database: %w", err)
+			}
+			defer dbConn.Close()
 
 			logger := slog.Default()
 			pool, err := buildTokenPool(cfg, logger)
@@ -88,57 +93,63 @@ func newSyncCmd() *cobra.Command {
 			})
 			pipeline.SetAPIStatsFn(func() sync.APIStatsSnapshot {
 				return sync.APIStatsSnapshot{
-					CommitDetailEager:     enricher.Stats.CommitDetailEager.Load(),
-					CommitDetailLazyEmpty: enricher.Stats.CommitDetailLazyEmpty.Load(),
-					CommitDetailLazySelf:  enricher.Stats.CommitDetailLazySelf.Load(),
-					CommitPRs:             enricher.Stats.CommitPRs.Load(),
-					PRDetail:           enricher.Stats.PRDetail.Load(),
-					Reviews:            enricher.Stats.Reviews.Load(),
-					CheckRuns:          enricher.Stats.CheckRuns.Load(),
-					PRCommits:          enricher.Stats.PRCommits.Load(),
-					RevertVerification:         enricher.Stats.RevertVerification.Load(),
-					PRRecovered:                enricher.Stats.PRRecovered.Load(),
-					CacheHits:                  enricher.Stats.CacheHits.Load(),
-					DBHits:                     enricher.Stats.DBHits.Load(),
-					CommitDetailEagerNanos:     enricher.Stats.CommitDetailEagerNanos.Load(),
-					CommitDetailLazyEmptyNanos: enricher.Stats.CommitDetailLazyEmptyNanos.Load(),
-					CommitDetailLazySelfNanos:  enricher.Stats.CommitDetailLazySelfNanos.Load(),
-					CommitPRsNanos:             enricher.Stats.CommitPRsNanos.Load(),
-					PRDetailNanos:              enricher.Stats.PRDetailNanos.Load(),
-					ReviewsNanos:               enricher.Stats.ReviewsNanos.Load(),
-					CheckRunsNanos:             enricher.Stats.CheckRunsNanos.Load(),
-					PRCommitsNanos:             enricher.Stats.PRCommitsNanos.Load(),
-					RevertVerificationNanos:    enricher.Stats.RevertVerificationNanos.Load(),
+					CommitDetailEager:           enricher.Stats.CommitDetailEager.Load(),
+					CommitDetailLazyEmpty:       enricher.Stats.CommitDetailLazyEmpty.Load(),
+					CommitDetailLazySelf:        enricher.Stats.CommitDetailLazySelf.Load(),
+					CommitDetailLazyExempt:      enricher.Stats.CommitDetailLazyExempt.Load(),
+					CommitPRs:                   enricher.Stats.CommitPRs.Load(),
+					PRDetail:                    enricher.Stats.PRDetail.Load(),
+					Reviews:                     enricher.Stats.Reviews.Load(),
+					CheckRuns:                   enricher.Stats.CheckRuns.Load(),
+					PRCommits:                   enricher.Stats.PRCommits.Load(),
+					RevertVerification:          enricher.Stats.RevertVerification.Load(),
+					PRRecovered:                 enricher.Stats.PRRecovered.Load(),
+					CacheHits:                   enricher.Stats.CacheHits.Load(),
+					DBHits:                      enricher.Stats.DBHits.Load(),
+					CommitDetailEagerNanos:      enricher.Stats.CommitDetailEagerNanos.Load(),
+					CommitDetailLazyEmptyNanos:  enricher.Stats.CommitDetailLazyEmptyNanos.Load(),
+					CommitDetailLazySelfNanos:   enricher.Stats.CommitDetailLazySelfNanos.Load(),
+					CommitDetailLazyExemptNanos: enricher.Stats.CommitDetailLazyExemptNanos.Load(),
+					CommitPRsNanos:              enricher.Stats.CommitPRsNanos.Load(),
+					PRDetailNanos:               enricher.Stats.PRDetailNanos.Load(),
+					ReviewsNanos:                enricher.Stats.ReviewsNanos.Load(),
+					CheckRunsNanos:              enricher.Stats.CheckRunsNanos.Load(),
+					PRCommitsNanos:              enricher.Stats.PRCommitsNanos.Load(),
+					RevertVerificationNanos:     enricher.Stats.RevertVerificationNanos.Load(),
 				}
 			})
 
-			// Lazy stats fetcher for the audit's empty-commit fallback. Reads
-			// the DB first (where the row may already carry additions/deletions
-			// from a prior sync) and only falls back to GetCommitDetail if both
-			// are still zero. The callback runs inside EvaluateCommit which has
-			// no ambient context; use the cobra command's context so the REST
-			// call honours SIGINT/SIGTERM.
+			// Lazy stats fetcher for the audit's empty-commit fallback and
+			// §1/§5 emptiness verification. Reads the DB first — a row whose
+			// detail was already fetched (StatsVerified, including verified
+			// ZERO stats) answers without an API call — then falls back to
+			// GetCommitDetail and persists the result via MarkCommitDetail
+			// so every later read and offline re-audit sees the same facts.
+			// The callback runs inside EvaluateCommit which has no ambient
+			// context; use the cobra command's context so the REST call
+			// honours SIGINT/SIGTERM.
 			ctxForFetcher := cmd.Context()
-			pipeline.SetStatsFetcher(func(trigger sync.StatsTrigger, org, repo, sha string) (int, int, error) {
+			pipeline.SetStatsFetcher(func(trigger sync.StatsTrigger, org, repo, sha string) (int, int, int, error) {
 				if commits, err := dbConn.GetCommitsBySHA(ctxForFetcher, org, repo, []string{sha}); err == nil {
 					for _, c := range commits {
-						if c.Additions != 0 || c.Deletions != 0 {
+						if c.StatsVerified || c.Additions != 0 || c.Deletions != 0 {
 							enricher.Stats.DBHits.Add(1)
-							return c.Additions, c.Deletions, nil
+							return c.Additions, c.Deletions, c.FilesChanged, nil
 						}
 					}
 				}
 				// Split the lazy commit_detail counter by audit-rule
 				// trigger. This is the empirical signal we use to decide
 				// whether eager batched additions/deletions prefetching
-				// during enrichment would pay off (high "empty" share),
-				// or whether the §5 self-approval lazy lookup dominates
-				// and warrants a different optimization.
+				// during enrichment would pay off, or which rule's lazy
+				// lookup dominates and warrants separate optimization.
 				switch trigger {
 				case sync.StatsTriggerEmptyCommit:
 					enricher.Stats.CommitDetailLazyEmpty.Add(1)
 				case sync.StatsTriggerSelfApproval:
 					enricher.Stats.CommitDetailLazySelf.Add(1)
+				case sync.StatsTriggerExemption:
+					enricher.Stats.CommitDetailLazyExempt.Add(1)
 				}
 				startLazy := time.Now()
 				detail, err := client.GetCommitDetail(ctxForFetcher, org, repo, sha)
@@ -148,14 +159,17 @@ func newSyncCmd() *cobra.Command {
 					enricher.Stats.CommitDetailLazyEmptyNanos.Add(dur)
 				case sync.StatsTriggerSelfApproval:
 					enricher.Stats.CommitDetailLazySelfNanos.Add(dur)
+				case sync.StatsTriggerExemption:
+					enricher.Stats.CommitDetailLazyExemptNanos.Add(dur)
 				}
 				if err != nil {
-					return 0, 0, err
+					return 0, 0, 0, err
 				}
 				// Persist so a re-audit (or a sibling enrichment on the same
-				// sha) short-circuits through the DB branch above.
-				_ = dbConn.UpdateCommitStats(ctxForFetcher, org, repo, sha, detail.Additions, detail.Deletions)
-				return detail.Additions, detail.Deletions, nil
+				// sha) short-circuits through the DB branch above — including
+				// verified-zero results, which are facts, not absences.
+				_ = dbConn.MarkCommitDetail(ctxForFetcher, org, repo, sha, detail.Additions, detail.Deletions, detail.FilesChanged)
+				return detail.Additions, detail.Deletions, detail.FilesChanged, nil
 			})
 
 			// Structured telemetry sink. Default path is `telemetry.jsonl`
@@ -164,7 +178,7 @@ func newSyncCmd() *cobra.Command {
 			// `read_json_auto`. Override with --telemetry-output.
 			telemetryPath := telemetryOutput
 			if telemetryPath == "" {
-				telemetryPath = filepath.Join(filepath.Dir(resolveDBPath(cfg)), "telemetry.jsonl")
+				telemetryPath = filepath.Join(filepath.Dir(resolvedDBPath), "telemetry.jsonl")
 			}
 			if telemetryPath != "-" && telemetryPath != "" {
 				tfile, ferr := os.OpenFile(telemetryPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
@@ -185,9 +199,14 @@ func newSyncCmd() *cobra.Command {
 			hup := make(chan os.Signal, 1)
 			signal.Notify(hup, syscall.SIGHUP)
 			defer signal.Stop(hup)
+			cfgExplicit := cmd.Flag("config").Changed
 			go func() {
 				for range hup {
-					reloaded := loadConfigOrDefault(cfgFile)
+					reloaded, rerr := loadConfigOrDefault(cfgFile, cfgExplicit)
+					if rerr != nil {
+						logger.Warn("SIGHUP: config reload failed; keeping existing pool", "error", rerr)
+						continue
+					}
 					added, err := addTokensFromConfig(pool, reloaded, logger)
 					if err != nil {
 						logger.Warn("SIGHUP: token reload partial failure", "error", err, "added", added)
@@ -213,6 +232,7 @@ func newSyncCmd() *cobra.Command {
 				"commit_detail_eager", s.CommitDetailEager.Load(),
 				"commit_detail_lazy_empty", s.CommitDetailLazyEmpty.Load(),
 				"commit_detail_lazy_self", s.CommitDetailLazySelf.Load(),
+				"commit_detail_lazy_exempt", s.CommitDetailLazyExempt.Load(),
 				"commit_prs", s.CommitPRs.Load(),
 				"pr_detail", s.PRDetail.Load(),
 				"reviews", s.Reviews.Load(),
@@ -243,13 +263,21 @@ func newSyncCmd() *cobra.Command {
 	return cmd
 }
 
-// loadConfigOrDefault loads config from file, or returns a usable default if the file doesn't exist.
-func loadConfigOrDefault(path string) *config.Config {
+// loadConfigOrDefault loads the config at path. A missing file is only
+// tolerated when the operator didn't explicitly point at one (explicit=false)
+// — then the built-in defaults apply. Parse and validation failures always
+// surface: silently auditing with default rules (no exemptions, no required
+// checks, possibly the wrong database) would produce wrong compliance
+// verdicts while exiting 0.
+func loadConfigOrDefault(path string, explicit bool) (*config.Config, error) {
 	cfg, err := config.Load(path)
 	if err == nil {
-		return cfg
+		return cfg, nil
 	}
-	return config.Default()
+	if errors.Is(err, os.ErrNotExist) && !explicit {
+		return config.Default(), nil
+	}
+	return nil, fmt.Errorf("loading config %s: %w", path, err)
 }
 
 // buildTokenPool creates a token pool from config tokens, falling back to auto-detected tokens.
@@ -264,7 +292,14 @@ func buildTokenPool(cfg *config.Config, logger *slog.Logger) (*ghclient.TokenPoo
 		return pool, nil
 	}
 
-	// Auto-detect: GH_TOKEN, GITHUB_TOKEN, then gh auth token
+	// Auto-detect: GH_TOKEN, GITHUB_TOKEN, then gh auth token. The
+	// fallback token carries no scope restrictions, so when the operator
+	// configured scoped tokens that all failed to load this is a silent
+	// privilege change — say so loudly.
+	if len(cfg.Tokens) > 0 {
+		logger.Warn("none of the configured tokens could be loaded; falling back to auto-detected credentials with no scope restrictions",
+			"configured_tokens", len(cfg.Tokens))
+	}
 	token := detectToken()
 	if token == "" {
 		return nil, fmt.Errorf("no token: set GH_TOKEN or GITHUB_TOKEN, run 'gh auth login', or configure tokens in config file")
@@ -279,18 +314,28 @@ func buildTokenPool(cfg *config.Config, logger *slog.Logger) (*ghclient.TokenPoo
 func addTokensFromConfig(pool *ghclient.TokenPool, cfg *config.Config, logger *slog.Logger) ([]string, error) {
 	var added []string
 	for _, tokCfg := range cfg.Tokens {
-		if pool.HasToken(tokCfg.Env) {
+		// App tokens may omit `env`; derive a stable unique pool ID from
+		// the app/installation pair so two env-less app tokens don't
+		// collide on "" and silently drop the second.
+		id := tokCfg.Env
+		if id == "" && tokCfg.Kind == "app" {
+			id = fmt.Sprintf("app:%d:%d", tokCfg.AppID, tokCfg.InstallationID)
+		}
+		if pool.HasToken(id) {
 			continue
 		}
 		switch tokCfg.Kind {
 		case "pat":
 			token := os.Getenv(tokCfg.Env)
 			if token == "" {
+				if logger != nil {
+					logger.Warn("configured token env var is unset; skipping token", "env", tokCfg.Env)
+				}
 				continue
 			}
 			scopes := convertScopes(tokCfg.Scopes)
-			pool.AddPATToken(tokCfg.Env, token, scopes)
-			added = append(added, tokCfg.Env)
+			pool.AddPATToken(id, token, scopes)
+			added = append(added, id)
 		case "app":
 			var keyBytes []byte
 			var err error
@@ -303,13 +348,13 @@ func addTokensFromConfig(pool *ghclient.TokenPool, cfg *config.Config, logger *s
 				keyBytes = []byte(os.Getenv(tokCfg.PrivateKeyEnv))
 			}
 			scopes := convertScopes(tokCfg.Scopes)
-			if err := pool.AddAppToken(tokCfg.Env, tokCfg.AppID, tokCfg.InstallationID, keyBytes, scopes); err != nil {
+			if err := pool.AddAppToken(id, tokCfg.AppID, tokCfg.InstallationID, keyBytes, scopes); err != nil {
 				if logger != nil {
-					logger.Warn("failed to add app token; skipping", "id", tokCfg.Env, "error", err)
+					logger.Warn("failed to add app token; skipping", "id", id, "error", err)
 				}
 				continue
 			}
-			added = append(added, tokCfg.Env)
+			added = append(added, id)
 		}
 	}
 	return added, nil
@@ -332,8 +377,11 @@ func detectToken() string {
 	return ""
 }
 
-func resolveDBPath(cfg *config.Config) string {
-	if dbPath != "" && dbPath != config.DefaultDBPath() {
+// resolveDBPath picks the database path: an explicitly-passed --db flag wins
+// (even when its value equals the default path), then the config file's
+// database:, then the flag's default value.
+func resolveDBPath(cfg *config.Config, dbFlagSet bool) string {
+	if dbFlagSet {
 		return dbPath
 	}
 	if cfg.Database != "" {
@@ -356,6 +404,10 @@ func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until stri
 			Name:       rc.Name,
 			Conclusion: rc.Conclusion,
 		})
+	}
+
+	if len(repos) > 0 && len(orgs) > 0 {
+		return nil, fmt.Errorf("--org cannot be combined with --repo: the --repo values already pin their orgs")
 	}
 
 	if len(repos) > 0 {
@@ -410,6 +462,11 @@ func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until stri
 		}
 	}
 
+	if !syncCfg.Since.IsZero() && !syncCfg.Until.IsZero() && syncCfg.Until.Before(syncCfg.Since) {
+		return nil, fmt.Errorf("--until (%s) must not be before --since (%s)",
+			syncCfg.Until.Format("2006-01-02"), syncCfg.Since.Format("2006-01-02"))
+	}
+
 	if concurrency > 0 {
 		syncCfg.Concurrency = concurrency
 	}
@@ -418,10 +475,11 @@ func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until stri
 }
 
 // epochSince is the sentinel "from the beginning of time" value used when
-// the user passes --since epoch/all/beginning. It must be non-zero so
-// determineSince honours it (a zero time.Time means "unset" and falls back
-// to the cursor or the 90-day lookback), yet early enough to predate GitHub
-// so the REST API returns the repo's full commit history.
+// the user passes --since epoch/all/beginning. It must be non-zero so the
+// pipeline's since resolution (sync.Pipeline.sinceFor) honours it (a zero
+// time.Time means "unset" and falls back to the cursor or the 90-day
+// lookback), yet early enough to predate GitHub so the REST API returns
+// the repo's full commit history.
 var epochSince = time.Unix(0, 0).UTC()
 
 // parseSinceKeyword maps the symbolic --since values that mean "full history"

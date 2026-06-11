@@ -2,11 +2,14 @@ package db
 
 // ENUM type DDL statements. DuckDB does not support CREATE TYPE IF NOT EXISTS,
 // so the migrate function ignores "already exists" errors for these.
+//
+// reviews.state was once a review_state ENUM but is now TEXT: GitHub returns
+// PENDING for the caller's own draft reviews and may add new states, and one
+// un-castable value hard-failed the whole batch (the same failure mode that
+// forced check_runs.status/conclusion to TEXT). The migrate function converts
+// legacy ENUM columns in place; app-level code validates the values it cares
+// about.
 const (
-	createReviewStateEnum = `CREATE TYPE review_state AS ENUM (
-		'APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED'
-	)`
-
 	createOwnerApprovalCheckEnum = `CREATE TYPE owner_approval_check AS ENUM (
 		'success', 'failure', 'missing'
 	)`
@@ -19,6 +22,7 @@ const (
 		repo       TEXT NOT NULL,
 		branch     TEXT NOT NULL DEFAULT '',
 		last_date  TIMESTAMP,
+		last_sha   TEXT,
 		updated_at TIMESTAMP,
 		PRIMARY KEY (org, repo, branch)
 	)`
@@ -36,6 +40,8 @@ const (
 		parent_count     INTEGER,
 		additions        INTEGER,
 		deletions        INTEGER,
+		files_changed    INTEGER,
+		detail_fetched_at TIMESTAMP,
 		is_verified      BOOLEAN DEFAULT false,
 		href             TEXT,
 		fetched_at       TIMESTAMP DEFAULT current_timestamp,
@@ -86,7 +92,7 @@ const (
 		review_id      BIGINT NOT NULL,
 		reviewer_login TEXT,
 		reviewer_id    BIGINT DEFAULT 0,
-		state          review_state,
+		state          TEXT,
 		commit_id      TEXT,
 		submitted_at   TIMESTAMP,
 		href           TEXT,
@@ -166,7 +172,6 @@ const (
 // enumTypes is the ordered list of CREATE TYPE statements to run during migration.
 // DuckDB lacks IF NOT EXISTS for types, so migrate ignores "already exists" errors.
 var enumTypes = []string{
-	createReviewStateEnum,
 	createOwnerApprovalCheckEnum,
 }
 
@@ -191,6 +196,9 @@ var addColumnMigrations = []string{
 	`ALTER TABLE reviews ADD COLUMN reviewer_id BIGINT DEFAULT 0`,
 	`ALTER TABLE pull_requests ADD COLUMN author_id BIGINT`,
 	`ALTER TABLE pull_requests ADD COLUMN merged_by_id BIGINT`,
+	`ALTER TABLE sync_cursors ADD COLUMN last_sha TEXT`,
+	`ALTER TABLE commits ADD COLUMN files_changed INTEGER`,
+	`ALTER TABLE commits ADD COLUMN detail_fetched_at TIMESTAMP`,
 }
 
 // allTables is the ordered list of DDL statements to run during migration.

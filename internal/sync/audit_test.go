@@ -139,9 +139,9 @@ func newAuditBaseline() auditBaseline {
 func TestEvaluateCommit_Rule1_ExemptAuthor(t *testing.T) {
 	cases := []evalCase{
 		{
-			name:          "exempt author is compliant",
-			commit:        model.Commit{Org: "myorg", Repo: "myrepo", SHA: "abc123", AuthorLogin: "dependabot[bot]", AuthorID: 49699333, Additions: 5, Deletions: 3},
-			enrichment:    model.EnrichmentResult{},
+			name:       "exempt author is compliant",
+			commit:     model.Commit{Org: "myorg", Repo: "myrepo", SHA: "abc123", AuthorLogin: "dependabot[bot]", AuthorID: 49699333, Additions: 5, Deletions: 3},
+			enrichment: model.EnrichmentResult{},
 			exemptAuthors: []model.ExemptAuthor{
 				{Login: "dependabot[bot]", ID: 49699333},
 				{Login: "renovate[bot]", ID: 2740337},
@@ -1788,12 +1788,12 @@ func TestSelfApproval_EmptyAdminCommitByReviewer(t *testing.T) {
 
 	t.Run("reviewer's only PR-branch commit is empty (fetchStats confirms 0,0) — compliant", func(t *testing.T) {
 		var calls int
-		fetchStats := func(_ StatsTrigger, _, _, sha string) (int, int, error) {
+		fetchStats := func(_ StatsTrigger, _, _, sha string) (int, int, int, error) {
 			calls++
 			if sha == "empty1" {
-				return 0, 0, nil
+				return 0, 0, 0, nil
 			}
-			return 100, 0, nil
+			return 100, 0, 0, nil
 		}
 		enrichment := model.EnrichmentResult{
 			Commit: commit, PRs: []model.PullRequest{pr},
@@ -1814,9 +1814,9 @@ func TestSelfApproval_EmptyAdminCommitByReviewer(t *testing.T) {
 	t.Run("reviewer authored both empty and real commits — self-approved", func(t *testing.T) {
 		// Short-circuits on the locally non-zero commit; never calls fetchStats.
 		called := false
-		fetchStats := func(_ StatsTrigger, _, _, _ string) (int, int, error) {
+		fetchStats := func(_ StatsTrigger, _, _, _ string) (int, int, int, error) {
 			called = true
-			return 0, 0, nil
+			return 0, 0, 0, nil
 		}
 		enrichment := model.EnrichmentResult{
 			Commit: commit, PRs: []model.PullRequest{pr},
@@ -1835,11 +1835,11 @@ func TestSelfApproval_EmptyAdminCommitByReviewer(t *testing.T) {
 	})
 
 	t.Run("reviewer's lone commit looks empty locally but fetchStats reveals real diff — self-approved", func(t *testing.T) {
-		fetchStats := func(_ StatsTrigger, _, _, sha string) (int, int, error) {
+		fetchStats := func(_ StatsTrigger, _, _, sha string) (int, int, int, error) {
 			if sha == "stats-hidden" {
-				return 42, 7, nil // /pulls/N/commits omitted stats; reality is non-empty
+				return 42, 7, 0, nil // /pulls/N/commits omitted stats; reality is non-empty
 			}
-			return 0, 0, nil
+			return 0, 0, 0, nil
 		}
 		enrichment := model.EnrichmentResult{
 			Commit: commit, PRs: []model.PullRequest{pr},
@@ -1856,8 +1856,8 @@ func TestSelfApproval_EmptyAdminCommitByReviewer(t *testing.T) {
 	})
 
 	t.Run("fetchStats returns error — fail-safe to self-approval", func(t *testing.T) {
-		fetchStats := func(_ StatsTrigger, _, _, _ string) (int, int, error) {
-			return 0, 0, errors.New("transient API failure")
+		fetchStats := func(_ StatsTrigger, _, _, _ string) (int, int, int, error) {
+			return 0, 0, 0, errors.New("transient API failure")
 		}
 		enrichment := model.EnrichmentResult{
 			Commit: commit, PRs: []model.PullRequest{pr},
@@ -1906,9 +1906,9 @@ func TestEvaluateCommit_LazyStatsFetcher(t *testing.T) {
 			},
 		}
 		called := false
-		result := EvaluateCommit(commit, enrichment, nil, nil, func(StatsTrigger, string, string, string) (int, int, error) {
+		result := EvaluateCommit(commit, enrichment, nil, nil, func(StatsTrigger, string, string, string) (int, int, int, error) {
 			called = true
-			return 1, 1, nil
+			return 1, 1, 0, nil
 		})
 		assert.True(t, result.IsCompliant)
 		assert.False(t, result.IsEmptyCommit, "approved PR should not be misclassified as empty")
@@ -1924,9 +1924,9 @@ func TestEvaluateCommit_LazyStatsFetcher(t *testing.T) {
 		enrichment := model.EnrichmentResult{}
 
 		calls := 0
-		result := EvaluateCommit(commit, enrichment, nil, nil, func(StatsTrigger, string, string, string) (int, int, error) {
+		result := EvaluateCommit(commit, enrichment, nil, nil, func(StatsTrigger, string, string, string) (int, int, int, error) {
 			calls++
-			return 42, 3, nil
+			return 42, 3, 0, nil
 		})
 		assert.Equal(t, 1, calls, "fetchStats should run exactly once on fallback")
 		assert.False(t, result.IsCompliant, "commit with real diff and no PR is non-compliant")
@@ -1935,9 +1935,9 @@ func TestEvaluateCommit_LazyStatsFetcher(t *testing.T) {
 
 		// Fetcher returns zero → empty-commit fallback fires.
 		calls = 0
-		result2 := EvaluateCommit(commit, enrichment, nil, nil, func(StatsTrigger, string, string, string) (int, int, error) {
+		result2 := EvaluateCommit(commit, enrichment, nil, nil, func(StatsTrigger, string, string, string) (int, int, int, error) {
 			calls++
-			return 0, 0, nil
+			return 0, 0, 0, nil
 		})
 		assert.Equal(t, 1, calls)
 		assert.True(t, result2.IsCompliant)
@@ -2104,8 +2104,8 @@ func TestEvaluateRevertCompliance(t *testing.T) {
 // ID collapse to one entry regardless of login string.
 func TestLatestReviewStatesOnFinal_IDDedup(t *testing.T) {
 	pr := model.PullRequest{
-		Number:  1,
-		HeadSHA: "head",
+		Number:   1,
+		HeadSHA:  "head",
 		MergedAt: time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC),
 	}
 	t1 := time.Date(2025, 5, 1, 10, 0, 0, 0, time.UTC)
@@ -2150,8 +2150,8 @@ func TestLatestReviewStatesOnFinal_IDDedup(t *testing.T) {
 // the outcome — an observable correctness hazard.
 func TestLatestReviewStatesOnFinal_SameTimestampTiebreak(t *testing.T) {
 	pr := model.PullRequest{
-		Number:  1,
-		HeadSHA: "head",
+		Number:   1,
+		HeadSHA:  "head",
 		MergedAt: time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC),
 	}
 	sameTime := time.Date(2025, 5, 1, 10, 0, 0, 0, time.UTC)

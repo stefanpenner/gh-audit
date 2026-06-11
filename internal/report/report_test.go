@@ -167,6 +167,7 @@ func insertCommit(t *testing.T, db *sql.DB, org, repo, sha, author string, commi
 
 type auditResultOpts struct {
 	isBot, isExempt, isEmpty, hasPR, hasApproval, isCompliant, isSelfApproved, hasStaleApproval bool
+	isCleanRevert, isCleanMerge                                                                 bool
 	prNumber, prCount                                                                           int
 	approvers                                                                                   []string
 	reasons                                                                                     []string
@@ -202,11 +203,12 @@ func insertAuditResultFull(t *testing.T, db *sql.DB, org, repo, sha string, opts
 		reasonExpr = fmt.Sprintf("list_value(%s)", strings.Join(quoted, ", "))
 	}
 
-	q := fmt.Sprintf(`INSERT INTO audit_results (org, repo, sha, is_empty_commit, is_bot, is_exempt_author, has_pr, pr_number, pr_count, has_final_approval, has_stale_approval, approver_logins, owner_approval_check, is_compliant, reasons, commit_href, pr_href, is_self_approved)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, %s, ?, ?, %s, ?, ?, ?)`, approverExpr, reasonExpr)
+	q := fmt.Sprintf(`INSERT INTO audit_results (org, repo, sha, is_empty_commit, is_bot, is_exempt_author, has_pr, pr_number, pr_count, has_final_approval, has_stale_approval, is_clean_revert, is_clean_merge, approver_logins, owner_approval_check, is_compliant, reasons, commit_href, pr_href, is_self_approved)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, %s, ?, ?, %s, ?, ?, ?)`, approverExpr, reasonExpr)
 
 	_, err := db.Exec(q,
 		org, repo, sha, opts.isEmpty, opts.isBot, opts.isExempt, opts.hasPR, opts.prNumber, opts.prCount, opts.hasApproval, opts.hasStaleApproval,
+		opts.isCleanRevert, opts.isCleanMerge,
 		"success", opts.isCompliant,
 		fmt.Sprintf("https://github.com/%s/%s/commit/%s", org, repo, sha),
 		fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, opts.prNumber),
@@ -864,23 +866,23 @@ func TestDetailRowBranchName(t *testing.T) {
 
 func TestGlobsToRegex(t *testing.T) {
 	cases := []struct {
-		name   string
-		globs  []string
-		want   string
-		should []string // branch names that must match
+		name      string
+		globs     []string
+		want      string
+		should    []string // branch names that must match
 		shouldNot []string // branch names that must not match
 	}{
 		{
-			name:  "default when empty",
-			globs: nil,
-			want:  "^(master|main)$",
+			name:      "default when empty",
+			globs:     nil,
+			want:      "^(master|main)$",
 			should:    []string{"master", "main"},
 			shouldNot: []string{"develop", "release/1.0"},
 		},
 		{
-			name:  "exact names only",
-			globs: []string{"master", "trunk"},
-			want:  "^(master|trunk)$",
+			name:      "exact names only",
+			globs:     []string{"master", "trunk"},
+			want:      "^(master|trunk)$",
 			should:    []string{"master", "trunk"},
 			shouldNot: []string{"main", "mastering"},
 		},
@@ -1019,4 +1021,226 @@ func TestGetDetailsFiltersPRBranchOnlyCommits(t *testing.T) {
 	assert.Equal(t, 1, summary[0].TotalCommits)
 	assert.Equal(t, 1, summary[0].CompliantCount)
 	assert.Equal(t, 0, summary[0].NonCompliantCount)
+}
+
+func TestSanitizeCSVField(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"normal text", "normal text"},
+		{"=cmd|'/c calc'", "'=cmd|'/c calc'"},
+		{"+cmd", "'+cmd"},
+		{"-cmd", "'-cmd"},
+		{"@SUM(A1)", "'@SUM(A1)"},
+		{"\t=cmd", "'\t=cmd"},
+		{"\r=cmd", "'\r=cmd"},
+		{"", ""},
+		{"123", "123"},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, sanitizeCSVField(tt.input), "sanitizeCSVField(%q)", tt.input)
+	}
+}
+
+// Free-text fields in the CSV are attacker-influenced (commit messages,
+// branch names, logins). They must be escaped so a cell starting with
+// =, +, -, @ (or tab/CR variants) can't execute when the CSV is opened in
+// Excel or LibreOffice.
+func TestFormatCSVSanitizesFormulaInjection(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	r := New(nil)
+
+	details := []DetailRow{{
+		Org: "org1", Repo: "repo1", SHA: "abc123",
+		AuthorLogin:          `=HYPERLINK("http://evil","x")`,
+		CommitterLogin:       "+committer",
+		MergedByLogin:        "-merger",
+		ApproverLogins:       "@approver",
+		Reasons:              "=2+5",
+		PRCommitAuthorLogins: "\t=cmd",
+		BranchName:           "-branch",
+		Message:              "=cmd|' /C calc'!A0",
+		CommittedAt:          now,
+	}}
+
+	var buf bytes.Buffer
+	require.NoError(t, r.FormatCSV(&buf, details))
+
+	records, err := csv.NewReader(&buf).ReadAll()
+	require.NoError(t, err, "parsing CSV")
+	require.Len(t, records, 2)
+	rec := records[1]
+
+	// Column order: see FormatCSV header.
+	assert.Equal(t, `'=HYPERLINK("http://evil","x")`, rec[5], "Author")
+	assert.Equal(t, "'+committer", rec[6], "Committer")
+	assert.Equal(t, "'-merger", rec[7], "Merged By")
+	assert.Equal(t, "'@approver", rec[8], "Approvers")
+	assert.Equal(t, "'=2+5", rec[13], "Reasons")
+	assert.Equal(t, "'\t=cmd", rec[15], "PR Commit Authors")
+	assert.Equal(t, "'-branch", rec[17], "Branch")
+	assert.Equal(t, "'=cmd|' /C calc'!A0", rec[18], "Message")
+}
+
+// Clean-merge and bot tags are informational. They only belong in
+// waived_count when the stored verdict is compliant — the tool actually
+// didn't flag the commit. Same for clean reverts: the report layer must not
+// override a non-compliant pipeline verdict, so a non-compliant clean revert
+// stays in the action queue and out of the waived count.
+func TestSummaryWaivedAndActionQueueRespectVerdict(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	insertCommit(t, db, "org1", "repo1", "merge-ok", "dev1", now, 10, 5)
+	insertCommit(t, db, "org1", "repo1", "merge-bad", "dev2", now, 10, 5)
+	insertCommit(t, db, "org1", "repo1", "revert-ok", "dev3", now, 10, 5)
+	insertCommit(t, db, "org1", "repo1", "revert-bad", "dev4", now, 10, 5)
+
+	// Compliant clean merge → waived.
+	insertAuditResultFull(t, db, "org1", "repo1", "merge-ok", auditResultOpts{hasPR: true, hasApproval: true, isCompliant: true, isCleanMerge: true, prNumber: 1, reasons: []string{"compliant"}})
+	// Non-compliant clean merge → NOT waived, in action queue.
+	insertAuditResultFull(t, db, "org1", "repo1", "merge-bad", auditResultOpts{isCleanMerge: true, reasons: []string{"no associated pull request"}})
+	// Compliant clean revert (pipeline applied R8) → waived.
+	insertAuditResultFull(t, db, "org1", "repo1", "revert-ok", auditResultOpts{isCompliant: true, isCleanRevert: true, reasons: []string{"clean revert"}})
+	// Non-compliant clean revert (pipeline did NOT apply R8) → NOT waived, in action queue.
+	insertAuditResultFull(t, db, "org1", "repo1", "revert-bad", auditResultOpts{isCleanRevert: true, reasons: []string{"no associated pull request"}})
+
+	r := New(db)
+	summary, err := r.GetSummary(context.Background(), ReportOpts{})
+	require.NoError(t, err, "GetSummary")
+	require.Len(t, summary, 1)
+	s := summary[0]
+
+	assert.Equal(t, 2, s.WaivedCount, "only compliant clean merge + compliant clean revert are waived")
+	assert.Equal(t, 2, s.ActionQueueCount, "non-compliant clean merge + non-compliant clean revert need action")
+}
+
+// NULL committed_at must scan as a zero time so report surfaces render a
+// blank instead of 1970-01-01 with ~20,600 "days since commit".
+func TestNullCommittedAtScansAsZeroTime(t *testing.T) {
+	db := setupTestDB(t)
+
+	_, err := db.Exec(`INSERT INTO commits (org, repo, sha, author_login, committed_at, message, parent_count, additions, deletions, href)
+		VALUES ('org1', 'repo1', 'nulldate01', 'dev1', NULL, 'm', 1, 1, 1, '')`)
+	require.NoError(t, err, "insert commit with NULL committed_at")
+	insertAuditResult(t, db, "org1", "repo1", "nulldate01", false, false, false, false, false, 0, nil, []string{"no associated pull request"})
+
+	r := New(db)
+	details, err := r.GetDetails(context.Background(), ReportOpts{})
+	require.NoError(t, err, "GetDetails")
+	require.Len(t, details, 1)
+	assert.True(t, details[0].CommittedAt.IsZero(), "NULL committed_at must scan as zero time, got %v", details[0].CommittedAt)
+
+	// CSV Date column renders blank, not an epoch date.
+	var buf bytes.Buffer
+	require.NoError(t, r.FormatCSV(&buf, details))
+	records, err := csv.NewReader(&buf).ReadAll()
+	require.NoError(t, err, "parsing CSV")
+	assert.Equal(t, "", records[1][16], "Date column must be blank for NULL committed_at")
+}
+
+// Rounding 99.95+%% up to "100.0" paints a false green: a repo with failing
+// commits must never display 100%%.
+func TestSummaryCompliancePctNeverShows100WithFailures(t *testing.T) {
+	db := setupTestDB(t)
+
+	// 10,000 commits, exactly one non-compliant → 99.99% rounds to 100.0.
+	_, err := db.Exec(`INSERT INTO commits (org, repo, sha, author_login, committed_at, message, parent_count, additions, deletions, href)
+		SELECT 'org1', 'repo1', 'sha' || i::VARCHAR, 'dev1', now(), 'm', 1, 1, 1, '' FROM range(10000) t(i)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO audit_results (org, repo, sha, is_empty_commit, is_bot, is_exempt_author, has_pr, has_final_approval, is_compliant)
+		SELECT 'org1', 'repo1', 'sha' || i::VARCHAR, false, false, false, true, true, i > 0 FROM range(10000) t(i)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO commit_branches (org, repo, sha, branch)
+		SELECT 'org1', 'repo1', 'sha' || i::VARCHAR, 'master' FROM range(10000) t(i)`)
+	require.NoError(t, err)
+
+	r := New(db)
+	summary, err := r.GetSummary(context.Background(), ReportOpts{})
+	require.NoError(t, err, "GetSummary")
+	require.Len(t, summary, 1)
+	s := summary[0]
+	require.Equal(t, 1, s.NonCompliantCount)
+	assert.Less(t, s.CompliancePct, 100.0, "must not display 100%% with non-compliant commits")
+	assert.InDelta(t, 99.9, s.CompliancePct, 0.0001)
+}
+
+// A fully compliant repo still reads exactly 100.
+func TestSummaryCompliancePctExact100WhenClean(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	insertCommit(t, db, "org1", "repo1", "aaa", "dev1", now, 10, 5)
+	insertAuditResult(t, db, "org1", "repo1", "aaa", false, false, true, true, true, 1, nil, []string{"compliant"})
+
+	r := New(db)
+	summary, err := r.GetSummary(context.Background(), ReportOpts{})
+	require.NoError(t, err, "GetSummary")
+	require.Len(t, summary, 1)
+	assert.Equal(t, 100.0, summary[0].CompliancePct)
+}
+
+// The Branch column must not flap between runs when a commit sits on several
+// matching branches: the lexicographically smallest match wins.
+func TestDetailRowBranchNameDeterministic(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	insertCommit(t, db, "org1", "repo1", "aaa111aaa", "dev1", now, 10, 5)
+	// Helper inserts 'master'; add 'main' so two audit branches match.
+	insertAuditResult(t, db, "org1", "repo1", "aaa111aaa", false, false, true, true, true, 1, nil, []string{"compliant"})
+	insertCommitBranch(t, db, "org1", "repo1", "aaa111aaa", "main")
+
+	r := New(db)
+	for i := 0; i < 5; i++ {
+		details, err := r.GetDetails(context.Background(), ReportOpts{})
+		require.NoError(t, err, "GetDetails run %d", i)
+		require.Len(t, details, 1)
+		assert.Equal(t, "main", details[0].BranchName, "run %d: min(branch) must win deterministically", i)
+	}
+}
+
+// Commits sharing a timestamp must come back in a stable order (SHA tiebreak).
+func TestGetDetailsDeterministicOrderOnTimestampTies(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	for _, sha := range []string{"zzz111", "mmm111", "aaa111"} {
+		insertCommit(t, db, "org1", "repo1", sha, "dev1", now, 10, 5)
+		insertAuditResult(t, db, "org1", "repo1", sha, false, false, true, true, true, 1, nil, []string{"compliant"})
+	}
+
+	r := New(db)
+	for i := 0; i < 5; i++ {
+		details, err := r.GetDetails(context.Background(), ReportOpts{})
+		require.NoError(t, err, "GetDetails run %d", i)
+		require.Len(t, details, 3)
+		var shas []string
+		for _, d := range details {
+			shas = append(shas, d.SHA)
+		}
+		assert.Equal(t, []string{"aaa111", "mmm111", "zzz111"}, shas, "run %d", i)
+	}
+}
+
+// DeriveRuleOutcomes marks R4 fail for every PR with no final approval,
+// including self-approved ones. The Summary's R4 count must agree so the
+// Summary, By Rule, and Decision Matrix surfaces never disagree.
+func TestSummaryR4CountIncludesSelfApproved(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	insertCommit(t, db, "org1", "repo1", "selfnofin1", "dev1", now, 10, 5)
+	insertAuditResultFull(t, db, "org1", "repo1", "selfnofin1", auditResultOpts{hasPR: true, hasApproval: false, isSelfApproved: true, prNumber: 1, approvers: []string{"dev1"}, reasons: []string{"self-approved"}})
+
+	// Sanity: the Decision Matrix derivation marks this row R4 fail.
+	o := DeriveRuleOutcomes(DetailRow{HasPR: true, HasFinalApproval: false, IsSelfApproved: true})
+	require.Equal(t, OutcomeFail, o.R4FinalApproval)
+
+	r := New(db)
+	summary, err := r.GetSummary(context.Background(), ReportOpts{})
+	require.NoError(t, err, "GetSummary")
+	require.Len(t, summary, 1)
+	assert.Equal(t, 1, summary[0].R4NoFinalCount, "Summary R4 count must match DeriveRuleOutcomes")
 }

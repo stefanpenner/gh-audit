@@ -13,6 +13,8 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/stefanpenner/gh-audit/internal/db"
+	"github.com/stefanpenner/gh-audit/internal/github"
 	"github.com/stefanpenner/gh-audit/internal/model"
 )
 
@@ -31,6 +33,13 @@ type GitHubSource interface {
 	ListOrgRepos(ctx context.Context, org string) ([]model.RepoInfo, error)
 	GetRepo(ctx context.Context, org, repo string) (model.RepoInfo, error)
 	ListCommits(ctx context.Context, org, repo, branch string, since, until time.Time) ([]model.Commit, error)
+	// GetBranchHead returns the branch's current tip SHA.
+	GetBranchHead(ctx context.Context, org, repo, branch string) (string, error)
+	// CompareCommits returns commits reachable from head but not base (the
+	// graph difference). Returns an error wrapping
+	// github.ErrCompareUnavailable when the range can't be served (base
+	// force-pushed away, or more commits than the compare API's ceiling).
+	CompareCommits(ctx context.Context, org, repo, base, head, branch string) ([]model.Commit, error)
 }
 
 // Enricher abstracts commit enrichment (fetching PRs, reviews, check runs).
@@ -43,12 +52,19 @@ type Store interface {
 	GetSyncCursor(ctx context.Context, org, repo, branch string) (*model.SyncCursor, error)
 	UpsertSyncCursor(ctx context.Context, cursor model.SyncCursor) error
 	UpsertCommits(ctx context.Context, commits []model.Commit) error
+	// InsertCommitsIfAbsent inserts commits whose PK is new and leaves
+	// existing rows untouched. Used for impoverished PR-branch commit
+	// rows that must never clobber rich phase-1 rows.
+	InsertCommitsIfAbsent(ctx context.Context, commits []model.Commit) error
 	UpsertCoAuthors(ctx context.Context, commits []model.Commit) error
 	UpsertCommitBranches(ctx context.Context, org, repo string, shas []string, branch string) error
 	UpsertPullRequests(ctx context.Context, prs []model.PullRequest) error
 	UpsertReviews(ctx context.Context, reviews []model.Review) error
 	UpsertCheckRuns(ctx context.Context, runs []model.CheckRun) error
 	UpsertCommitPRs(ctx context.Context, org, repo, sha string, prNumbers []int) error
+	// UpsertCommitPRLinks batch-links many (sha, pr) pairs in one merge —
+	// the per-row variant costs a full staging-table dance per call.
+	UpsertCommitPRLinks(ctx context.Context, org, repo string, links []db.CommitPRLink) error
 	UpsertAuditResults(ctx context.Context, results []model.AuditResult) error
 	UpdateCommitStats(ctx context.Context, org, repo, sha string, additions, deletions int) error
 	// GetUnauditedCommits returns commits in org/repo with no audit_results row.
@@ -66,20 +82,20 @@ type Store interface {
 
 // SyncConfig controls the sync pipeline behaviour.
 type SyncConfig struct {
-	Orgs                []OrgConfig
-	Concurrency         int
-	EnrichConcurrency   int
-	Since               time.Time // override, zero means use cursor
-	Until               time.Time // override, zero means now
+	Orgs              []OrgConfig
+	Concurrency       int
+	EnrichConcurrency int
+	Since             time.Time // override, zero means use cursor
+	Until             time.Time // override, zero means now
 	// OrgReposCacheFreshness is how long a cached /orgs/{org}/repos
 	// listing is trusted before we re-fetch. Zero disables the cache
 	// entirely (always live-enumerate); negative values are treated as
 	// zero. The default for sync runs is 24h (set in cmd/sync.go via
 	// the config validator).
 	OrgReposCacheFreshness time.Duration
-	InitialLookbackDays int
-	ExemptAuthors       []model.ExemptAuthor
-	RequiredChecks      []RequiredCheck
+	InitialLookbackDays    int
+	ExemptAuthors          []model.ExemptAuthor
+	RequiredChecks         []RequiredCheck
 }
 
 // OrgConfig describes an org and its repo include/exclude lists.
@@ -121,31 +137,35 @@ type APIStatsSnapshot struct {
 	// CommitDetailLazyEmpty: GetCommitDetail fired by audit rule §2's
 	// empty-commit fallback. The dominant lazy path on cold sweeps.
 	CommitDetailLazyEmpty int64
+	// CommitDetailLazyExempt: GetCommitDetail fired by audit rule §1's
+	// PR-branch emptiness verification.
+	CommitDetailLazyExempt int64
 	// CommitDetailLazySelf: GetCommitDetail fired by audit rule §5's
 	// PR-branch-author empty-stats disambiguation. Lower volume.
-	CommitDetailLazySelf  int64
-	CommitPRs          int64
-	PRDetail           int64
-	Reviews            int64
-	CheckRuns          int64
-	PRCommits          int64
-	RevertVerification int64
-	CacheHits          int64
-	DBHits             int64
+	CommitDetailLazySelf int64
+	CommitPRs            int64
+	PRDetail             int64
+	Reviews              int64
+	CheckRuns            int64
+	PRCommits            int64
+	RevertVerification   int64
+	CacheHits            int64
+	DBHits               int64
 
 	// Per-endpoint cumulative wall time (nanoseconds). Mean latency
 	// is Nanos/count. Useful for spotting a slow endpoint that's
 	// dragging the sweep tail (vs a high-volume endpoint that just
 	// has a lot of cheap calls).
-	CommitDetailEagerNanos     int64
-	CommitDetailLazyEmptyNanos int64
-	CommitDetailLazySelfNanos  int64
-	CommitPRsNanos             int64
-	PRDetailNanos              int64
-	ReviewsNanos               int64
-	CheckRunsNanos             int64
-	PRCommitsNanos             int64
-	RevertVerificationNanos    int64
+	CommitDetailEagerNanos      int64
+	CommitDetailLazyEmptyNanos  int64
+	CommitDetailLazySelfNanos   int64
+	CommitDetailLazyExemptNanos int64
+	CommitPRsNanos              int64
+	PRDetailNanos               int64
+	ReviewsNanos                int64
+	CheckRunsNanos              int64
+	PRCommitsNanos              int64
+	RevertVerificationNanos     int64
 	// PRRecovered counts commit→PR links repaired through the parse +
 	// canonical-verify fallback when GitHub's commit→PR reverse index
 	// returned empty. Excluded from Total() — the recovery rides on an
@@ -157,6 +177,7 @@ type APIStatsSnapshot struct {
 func (s APIStatsSnapshot) Total() int64 {
 	return s.CommitDetailEager +
 		s.CommitDetailLazyEmpty + s.CommitDetailLazySelf +
+		s.CommitDetailLazyExempt +
 		s.CommitPRs + s.PRDetail +
 		s.Reviews + s.CheckRuns + s.PRCommits + s.RevertVerification
 }
@@ -186,7 +207,7 @@ type Pipeline struct {
 	onProgress     ProgressCallback
 	tokenStats     TokenStatsFn
 	apiStats       APIStatsFn
-	telemetryOut   io.Writer        // optional JSONL sink for structured telemetry
+	telemetryOut   io.Writer    // optional JSONL sink for structured telemetry
 	statsFetcher   StatsFetcher // optional lazy additions/deletions resolver for audit empty-commit fallback
 	commitsSynced  atomic.Int64
 	commitsAudited atomic.Int64
@@ -196,6 +217,17 @@ type Pipeline struct {
 func NewPipeline(source GitHubSource, enricher Enricher, store Store, cfg *SyncConfig, logger *slog.Logger) *Pipeline {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	// Normalize concurrency knobs once so every consumer (Run's repo
+	// fan-out, syncRepo's branch fan-out, enrichment batching) sees a
+	// sane value. errgroup.SetLimit(0) blocks the first Go() forever
+	// with no context escape — a zero-valued SyncConfig used to
+	// deadlock the first branch instead of erroring.
+	if cfg.Concurrency <= 0 {
+		cfg.Concurrency = 32
+	}
+	if cfg.EnrichConcurrency <= 0 {
+		cfg.EnrichConcurrency = 16
 	}
 	return &Pipeline{
 		source:   source,
@@ -336,6 +368,7 @@ func (p *Pipeline) runTelemetry(ctx context.Context, done <-chan struct{}) {
 					"commit_detail_eager", api.CommitDetailEager,
 					"commit_detail_lazy_empty", api.CommitDetailLazyEmpty,
 					"commit_detail_lazy_self", api.CommitDetailLazySelf,
+					"commit_detail_lazy_exempt", api.CommitDetailLazyExempt,
 					"commit_prs", api.CommitPRs,
 					"pr_detail", api.PRDetail,
 					"reviews", api.Reviews,
@@ -349,6 +382,7 @@ func (p *Pipeline) runTelemetry(ctx context.Context, done <-chan struct{}) {
 					"avg_ms_commit_detail_eager", fmt.Sprintf("%.1f", meanMs(api.CommitDetailEagerNanos, api.CommitDetailEager)),
 					"avg_ms_commit_detail_lazy_empty", fmt.Sprintf("%.1f", meanMs(api.CommitDetailLazyEmptyNanos, api.CommitDetailLazyEmpty)),
 					"avg_ms_commit_detail_lazy_self", fmt.Sprintf("%.1f", meanMs(api.CommitDetailLazySelfNanos, api.CommitDetailLazySelf)),
+					"avg_ms_commit_detail_lazy_exempt", fmt.Sprintf("%.1f", meanMs(api.CommitDetailLazyExemptNanos, api.CommitDetailLazyExempt)),
 					"avg_ms_commit_prs", fmt.Sprintf("%.1f", meanMs(api.CommitPRsNanos, api.CommitPRs)),
 					"avg_ms_pr_detail", fmt.Sprintf("%.1f", meanMs(api.PRDetailNanos, api.PRDetail)),
 					"avg_ms_reviews", fmt.Sprintf("%.1f", meanMs(api.ReviewsNanos, api.Reviews)),
@@ -361,6 +395,7 @@ func (p *Pipeline) runTelemetry(ctx context.Context, done <-chan struct{}) {
 					"delta_commit_detail_eager", api.CommitDetailEager-lastAPI.CommitDetailEager,
 					"delta_commit_detail_lazy_empty", api.CommitDetailLazyEmpty-lastAPI.CommitDetailLazyEmpty,
 					"delta_commit_detail_lazy_self", api.CommitDetailLazySelf-lastAPI.CommitDetailLazySelf,
+					"delta_commit_detail_lazy_exempt", api.CommitDetailLazyExempt-lastAPI.CommitDetailLazyExempt,
 					"delta_commit_prs", api.CommitPRs-lastAPI.CommitPRs,
 					"delta_pr_detail", api.PRDetail-lastAPI.PRDetail,
 					"delta_reviews", api.Reviews-lastAPI.Reviews,
@@ -412,13 +447,13 @@ func (p *Pipeline) reportProgress(prog RepoProgress) {
 // telemetryRecord is the shape written to the JSONL sink each tick. Field
 // names are flat and lowercase so jq / duckdb ingestion stays trivial.
 type telemetryRecord struct {
-	Timestamp          string  `json:"timestamp"`
-	ElapsedSeconds     float64 `json:"elapsed_seconds"`
-	Final              bool    `json:"final"`
-	CommitsSynced      int64   `json:"commits_synced"`
-	CommitsAudited     int64   `json:"commits_audited"`
-	SyncRateRecent     float64 `json:"sync_rate_recent"`
-	AuditRateRecent    float64 `json:"audit_rate_recent"`
+	Timestamp       string  `json:"timestamp"`
+	ElapsedSeconds  float64 `json:"elapsed_seconds"`
+	Final           bool    `json:"final"`
+	CommitsSynced   int64   `json:"commits_synced"`
+	CommitsAudited  int64   `json:"commits_audited"`
+	SyncRateRecent  float64 `json:"sync_rate_recent"`
+	AuditRateRecent float64 `json:"audit_rate_recent"`
 
 	// Token pool (present only if tokenStats is wired)
 	TokensTotal              *int   `json:"tokens_total,omitempty"`
@@ -431,19 +466,20 @@ type telemetryRecord struct {
 	TokenReassigns           *int64 `json:"token_reassigns,omitempty"`
 
 	// API endpoint breakdown (present only if apiStats is wired)
-	TotalAPI           *int64 `json:"total_api,omitempty"`
-	CommitDetailEager  *int64 `json:"commit_detail_eager,omitempty"`
-	CommitDetailLazyEmpty *int64 `json:"commit_detail_lazy_empty,omitempty"`
-	CommitDetailLazySelf  *int64 `json:"commit_detail_lazy_self,omitempty"`
-	CommitPRs          *int64 `json:"commit_prs,omitempty"`
-	PRDetail           *int64 `json:"pr_detail,omitempty"`
-	Reviews            *int64 `json:"reviews,omitempty"`
-	CheckRuns          *int64 `json:"check_runs,omitempty"`
-	PRCommits          *int64 `json:"pr_commits,omitempty"`
-	RevertVerification *int64 `json:"revert_verify,omitempty"`
-	PRRecovered        *int64 `json:"pr_recovered,omitempty"`
-	CacheHits          *int64 `json:"cache_hits,omitempty"`
-	DBHits             *int64 `json:"db_hits,omitempty"`
+	TotalAPI               *int64 `json:"total_api,omitempty"`
+	CommitDetailEager      *int64 `json:"commit_detail_eager,omitempty"`
+	CommitDetailLazyEmpty  *int64 `json:"commit_detail_lazy_empty,omitempty"`
+	CommitDetailLazySelf   *int64 `json:"commit_detail_lazy_self,omitempty"`
+	CommitDetailLazyExempt *int64 `json:"commit_detail_lazy_exempt,omitempty"`
+	CommitPRs              *int64 `json:"commit_prs,omitempty"`
+	PRDetail               *int64 `json:"pr_detail,omitempty"`
+	Reviews                *int64 `json:"reviews,omitempty"`
+	CheckRuns              *int64 `json:"check_runs,omitempty"`
+	PRCommits              *int64 `json:"pr_commits,omitempty"`
+	RevertVerification     *int64 `json:"revert_verify,omitempty"`
+	PRRecovered            *int64 `json:"pr_recovered,omitempty"`
+	CacheHits              *int64 `json:"cache_hits,omitempty"`
+	DBHits                 *int64 `json:"db_hits,omitempty"`
 }
 
 func buildTelemetryRecord(now time.Time, elapsedSec, windowSec float64, final bool, synced, audited, lastSynced, lastAudited int64, p *Pipeline) telemetryRecord {
@@ -484,6 +520,7 @@ func buildTelemetryRecord(now time.Time, elapsedSec, windowSec float64, final bo
 		r.CommitDetailEager = &a.CommitDetailEager
 		r.CommitDetailLazyEmpty = &a.CommitDetailLazyEmpty
 		r.CommitDetailLazySelf = &a.CommitDetailLazySelf
+		r.CommitDetailLazyExempt = &a.CommitDetailLazyExempt
 		r.CommitPRs = &a.CommitPRs
 		r.PRDetail = &a.PRDetail
 		r.Reviews = &a.Reviews
@@ -529,10 +566,7 @@ func (p *Pipeline) resolveExplicitRepos(ctx context.Context, orgCfg OrgConfig, c
 }
 
 func (p *Pipeline) Run(ctx context.Context) error {
-	concurrency := p.config.Concurrency
-	if concurrency <= 0 {
-		concurrency = 32
-	}
+	concurrency := p.config.Concurrency // normalized in NewPipeline
 
 	var allRepos []repoWithOrg
 
@@ -563,7 +597,7 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		// the fast path. Set OrgReposCacheFreshness to 0 to force
 		// live fetch every time.
 		var (
-			repos       []model.RepoInfo
+			repos         []model.RepoInfo
 			discoveredVia = "api"
 		)
 		listStart := time.Now()
@@ -608,7 +642,11 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	}
 
 	writer := NewDBWriter(concurrency * 2)
-	defer writer.Close()
+	defer func() {
+		if err := writer.Close(); err != nil {
+			p.logger.Warn("db writer shutdown", "error", err)
+		}
+	}()
 
 	// Fail fast on real per-repo errors. Transient retries (rate-limit,
 	// network) are handled at the transport layer; anything that bubbles
@@ -665,11 +703,19 @@ func (p *Pipeline) syncRepo(ctx context.Context, repo model.RepoInfo, orgCfg Org
 	var (
 		mu   sync.Mutex
 		errs []error
+		// auditMu serializes the enrich+audit phase across this repo's
+		// branches. The unaudited set is repo-scoped (commits shared
+		// between branches appear once), so parallel branches would load
+		// near-identical sets and duplicate the whole enrichment+audit
+		// fan-out: same API calls, double audit_results writes, inflated
+		// telemetry. With the mutex, the first branch drains the backlog
+		// and siblings find nothing left.
+		auditMu sync.Mutex
 	)
 	for _, b := range branches {
 		b := b
 		branchEG.Go(func() error {
-			if err := p.syncRepoBranch(branchCtx, repo, b, writer); err != nil {
+			if err := p.syncRepoBranch(branchCtx, repo, b, writer, &auditMu); err != nil {
 				if errors.Is(err, context.Canceled) && branchCtx.Err() != nil {
 					p.logger.Debug("sync branch aborted (cascade)", "org", repo.Org, "repo", repo.Name, "branch", b)
 				} else {
@@ -686,7 +732,7 @@ func (p *Pipeline) syncRepo(ctx context.Context, repo model.RepoInfo, orgCfg Org
 	return errors.Join(errs...)
 }
 
-func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, branch string, writer *DBWriter) error {
+func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, branch string, writer *DBWriter, auditMu *sync.Mutex) error {
 	p.logger.Info("sync repo branch start", "org", repo.Org, "repo", repo.Name, "branch", branch)
 
 	// Phase timestamps captured per-repo so the "sync repo branch
@@ -707,57 +753,56 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 	}
 	p.reportProgress(prog)
 
-	since, err := p.determineSince(ctx, repo.Org, repo.Name, branch)
+	cursor, err := p.store.GetSyncCursor(ctx, repo.Org, repo.Name, branch)
 	if err != nil {
-		return fmt.Errorf("determining since: %w", err)
+		return fmt.Errorf("reading sync cursor: %w", err)
 	}
 
-	until := p.config.Until
-	if until.IsZero() {
-		until = time.Now()
-	}
-
-	commits, err := p.source.ListCommits(ctx, repo.Org, repo.Name, branch, since, until)
+	commits, headSHA, fetchedVia, err := p.fetchBranchCommits(ctx, repo, branch, cursor)
 	if err != nil {
 		prog.Phase = PhaseFailed
 		prog.Error = err
 		p.reportProgress(prog)
-		return fmt.Errorf("listing commits: %w", err)
+		return fmt.Errorf("fetching commits (%s): %w", fetchedVia, err)
 	}
 	fetchEnd = time.Now()
 
 	prog.Commits = len(commits)
 	p.reportProgress(prog)
 
-	p.logger.Info("fetched commits", "org", repo.Org, "repo", repo.Name, "branch", branch, "count", len(commits))
+	p.logger.Info("fetched commits", "org", repo.Org, "repo", repo.Name, "branch", branch, "count", len(commits), "via", fetchedVia)
 
-	if len(commits) == 0 {
-		prog.Phase = PhaseDone
-		prog.DoneAt = time.Now()
-		p.reportProgress(prog)
-		return nil
-	}
-
-	// Write commits through single writer
-	if err := writer.Write(ctx, func() error {
-		if err := p.store.UpsertCommits(ctx, commits); err != nil {
-			return err
+	// A zero-commit fetch window does NOT return early: a prior run may
+	// have failed between UpsertCommits and UpsertAuditResults, leaving
+	// unaudited backlog that only the mop-up below can clear. Returning
+	// here used to strand that backlog until a new commit happened to
+	// land on the branch.
+	if len(commits) > 0 {
+		// Write commits through single writer
+		if err := writer.Write(ctx, func() error {
+			if err := p.store.UpsertCommits(ctx, commits); err != nil {
+				return err
+			}
+			return p.store.UpsertCoAuthors(ctx, commits)
+		}); err != nil {
+			return fmt.Errorf("upserting commits: %w", err)
 		}
-		return p.store.UpsertCoAuthors(ctx, commits)
-	}); err != nil {
-		return fmt.Errorf("upserting commits: %w", err)
-	}
-	p.commitsSynced.Add(int64(len(commits)))
+		p.commitsSynced.Add(int64(len(commits)))
 
-	shas := make([]string, len(commits))
-	for i, c := range commits {
-		shas[i] = c.SHA
+		shas := make([]string, len(commits))
+		for i, c := range commits {
+			shas[i] = c.SHA
+		}
+		if err := writer.Write(ctx, func() error {
+			return p.store.UpsertCommitBranches(ctx, repo.Org, repo.Name, shas, branch)
+		}); err != nil {
+			return fmt.Errorf("upserting commit branches: %w", err)
+		}
 	}
-	if err := writer.Write(ctx, func() error {
-		return p.store.UpsertCommitBranches(ctx, repo.Org, repo.Name, shas, branch)
-	}); err != nil {
-		return fmt.Errorf("upserting commit branches: %w", err)
-	}
+
+	// Serialize enrich+audit across this repo's branches (see auditMu).
+	auditMu.Lock()
+	defer auditMu.Unlock()
 
 	// Reads are safe concurrent with the writer — DuckDB MVCC.
 	//
@@ -845,24 +890,50 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 	}
 	p.commitsAudited.Add(int64(len(auditResults)))
 
-	// Update sync cursor to latest commit date
+	// Update the sync cursor: the branch tip SHA (drives the graph-based
+	// compare next run) plus the newest committer date seen (the
+	// date-window fallback resume point). LastDate never regresses — a
+	// graph fetch can legitimately return only backdated commits, and
+	// moving the date watermark backwards would widen every future
+	// fallback window for no reason.
 	var latestDate time.Time
 	for _, c := range commits {
 		if c.CommittedAt.After(latestDate) {
 			latestDate = c.CommittedAt
 		}
 	}
+	if cursor != nil && cursor.LastDate.After(latestDate) {
+		latestDate = cursor.LastDate
+	}
 
-	if !latestDate.IsZero() {
-		cursor := model.SyncCursor{
+	// Two cases must not move the tip SHA:
+	//   - explicit --until: commits[0] is the newest commit BEFORE the
+	//     bound, not the branch tip; recording it would regress the graph
+	//     cursor to an ancestor and force the next run to re-walk the span.
+	//   - zero-commit fallback window (headSHA == ""): blanking the stored
+	//     tip would silently downgrade the next run from graph compare
+	//     (backdating-immune) to the date window.
+	// In both, keep whatever the cursor already holds.
+	newLastSHA := headSHA
+	if !p.config.Until.IsZero() || headSHA == "" {
+		newLastSHA = ""
+		if cursor != nil {
+			newLastSHA = cursor.LastSHA
+		}
+	}
+
+	if (newLastSHA != "" || !latestDate.IsZero()) &&
+		(cursor == nil || newLastSHA != cursor.LastSHA || latestDate != cursor.LastDate) {
+		newCursor := model.SyncCursor{
 			Org:       repo.Org,
 			Repo:      repo.Name,
 			Branch:    branch,
 			LastDate:  latestDate,
+			LastSHA:   newLastSHA,
 			UpdatedAt: time.Now(),
 		}
 		if err := writer.Write(ctx, func() error {
-			return p.store.UpsertSyncCursor(ctx, cursor)
+			return p.store.UpsertSyncCursor(ctx, newCursor)
 		}); err != nil {
 			return fmt.Errorf("upserting sync cursor: %w", err)
 		}
@@ -1031,9 +1102,6 @@ func (p *Pipeline) writeEnrichmentBatch(ctx context.Context, org, repo string, e
 				}
 			}
 		}
-		if err := p.store.UpsertPullRequests(ctx, allPRs); err != nil {
-			return fmt.Errorf("upserting PRs: %w", err)
-		}
 		if err := p.store.UpsertReviews(ctx, allReviews); err != nil {
 			return fmt.Errorf("upserting reviews: %w", err)
 		}
@@ -1041,13 +1109,23 @@ func (p *Pipeline) writeEnrichmentBatch(ctx context.Context, org, repo string, e
 			return fmt.Errorf("upserting check runs: %w", err)
 		}
 		if len(allBranchCommits) > 0 {
-			if err := p.store.UpsertCommits(ctx, allBranchCommits); err != nil {
-				return fmt.Errorf("upserting PR branch commits: %w", err)
+			// Insert-if-absent, never upsert: /pulls/{n}/commits rows lack
+			// author_email, href, is_verified, and diff stats. A blind
+			// upsert replaced rich phase-1 rows with gutted copies,
+			// breaking the §1 verified_emails fallback and merge
+			// classification on later DB reads.
+			if err := p.store.InsertCommitsIfAbsent(ctx, allBranchCommits); err != nil {
+				return fmt.Errorf("inserting PR branch commits: %w", err)
 			}
 			if err := p.store.UpsertCoAuthors(ctx, allBranchCommits); err != nil {
 				return fmt.Errorf("upserting PR branch co-authors: %w", err)
 			}
 		}
+		// Collect every (sha, pr) association into ONE staging-table merge.
+		// The per-row UpsertCommitPRs variant cost ~5 serialized SQL
+		// statements per link; a 25-commit batch with branch fan-out used
+		// to push thousands of statements through the single DBWriter.
+		var prLinks []db.CommitPRLink
 		for _, bl := range allBranchLinks {
 			if bl.branch != "" {
 				if err := p.store.UpsertCommitBranches(ctx, org, repo, bl.shas, bl.branch); err != nil {
@@ -1055,38 +1133,116 @@ func (p *Pipeline) writeEnrichmentBatch(ctx context.Context, org, repo string, e
 				}
 			}
 			for _, sha := range bl.shas {
-				if err := p.store.UpsertCommitPRs(ctx, org, repo, sha, []int{bl.prNumber}); err != nil {
-					return fmt.Errorf("upserting PR branch commit-PR links: %w", err)
-				}
+				prLinks = append(prLinks, db.CommitPRLink{SHA: sha, PRNumber: bl.prNumber})
 			}
 		}
 		for _, link := range allLinks {
-			if err := p.store.UpsertCommitPRs(ctx, org, repo, link.sha, link.prNumbers); err != nil {
-				return fmt.Errorf("upserting commit-PR links: %w", err)
+			for _, n := range link.prNumbers {
+				prLinks = append(prLinks, db.CommitPRLink{SHA: link.sha, PRNumber: n})
 			}
+		}
+		if err := p.store.UpsertCommitPRLinks(ctx, org, repo, prLinks); err != nil {
+			return fmt.Errorf("upserting commit-PR links: %w", err)
+		}
+		// PR rows go LAST. The caching layer's "merged PR is frozen"
+		// optimisation treats the existence of a merged PR row as proof
+		// that its reviews/check-runs/branch-commits are fully synced
+		// (and trusts an empty DB read as authoritative). Writing the PR
+		// first opened a crash window in which the PR row committed but
+		// its reviews never landed — and every later run then skipped
+		// the reviews fetch, permanently reporting "no approval on final
+		// commit". With the PR last, a crash leaves orphan sub-rows that
+		// the next run simply re-fetches.
+		if err := p.store.UpsertPullRequests(ctx, allPRs); err != nil {
+			return fmt.Errorf("upserting PRs: %w", err)
 		}
 		return nil
 	})
 }
 
-func (p *Pipeline) determineSince(ctx context.Context, org, repo, branch string) (time.Time, error) {
-	if !p.config.Since.IsZero() {
-		return p.config.Since, nil
+// cursorOverlap is re-listed behind the stored cursor on every incremental
+// sync. The cursor is a committer-date high-water mark and GitHub's
+// `?since=` filters on committer date, so commits pushed late with OLDER
+// committer dates (stale local branch, cherry-picks/backports with
+// preserved dates — exactly the release/hotfix flows this tool audits)
+// would otherwise never be listed and silently escape the audit. The
+// overlap is cheap: only the list endpoint re-pages, upserts are
+// idempotent, and already-audited commits skip enrichment. On its own it
+// does NOT close the adversarial GIT_COMMITTER_DATE backdating hole —
+// that's closed by the SHA-based graph compare in fetchBranchCommits,
+// which this date window only backstops.
+const cursorOverlap = 72 * time.Hour
+
+// fetchBranchCommits returns the branch's new commits, the tip SHA to
+// record on the cursor, and a label naming the path taken (for errors and
+// telemetry).
+//
+// Preferred path — graph compare. When the cursor recorded the previous
+// tip and no explicit --since/--until override is in play, the new commits
+// are exactly `last_sha...head` per GitHub's compare API. Being
+// graph-based, the result is immune to committer-date games entirely: a
+// commit pushed with a backdated GIT_COMMITTER_DATE is still reachable
+// from head and not from last_sha, so it is listed. `head == last_sha`
+// short-circuits to zero commits with a single API call.
+//
+// Fallback path — date-window listing (the pre-cursor-SHA behaviour, with
+// the 72h overlap). Used for explicit --since/--until runs, legacy cursors
+// without a SHA, first-time syncs, and whenever compare can't serve the
+// range (base force-pushed away, > compareCommitsCeiling commits). The
+// returned tip SHA is the first listed commit — the list endpoint returns
+// newest-first from the ref tip, so no extra API call is needed.
+func (p *Pipeline) fetchBranchCommits(ctx context.Context, repo model.RepoInfo, branch string, cursor *model.SyncCursor) ([]model.Commit, string, string, error) {
+	if p.config.Since.IsZero() && p.config.Until.IsZero() && cursor != nil && cursor.LastSHA != "" {
+		head, err := p.source.GetBranchHead(ctx, repo.Org, repo.Name, branch)
+		switch {
+		case err != nil:
+			p.logger.Warn("branch head lookup failed; falling back to date-window listing",
+				"org", repo.Org, "repo", repo.Name, "branch", branch, "error", err)
+		case head == cursor.LastSHA:
+			return nil, head, "graph-unchanged", nil
+		default:
+			commits, cerr := p.source.CompareCommits(ctx, repo.Org, repo.Name, cursor.LastSHA, head, branch)
+			if cerr == nil {
+				return commits, head, "graph", nil
+			}
+			if !errors.Is(cerr, github.ErrCompareUnavailable) {
+				return nil, "", "graph", cerr
+			}
+			p.logger.Warn("compare unavailable (force-push or range too large); falling back to date-window listing",
+				"org", repo.Org, "repo", repo.Name, "branch", branch, "error", cerr)
+		}
 	}
 
-	cursor, err := p.store.GetSyncCursor(ctx, org, repo, branch)
+	until := p.config.Until
+	if until.IsZero() {
+		until = time.Now()
+	}
+	commits, err := p.source.ListCommits(ctx, repo.Org, repo.Name, branch, p.sinceFor(cursor), until)
 	if err != nil {
-		return time.Time{}, err
+		return nil, "", "date-window", err
+	}
+	headSHA := ""
+	if len(commits) > 0 {
+		headSHA = commits[0].SHA
+	}
+	return commits, headSHA, "date-window", nil
+}
+
+// sinceFor resolves the date-window lower bound: explicit --since override,
+// then the cursor's date watermark minus the overlap, then the initial
+// lookback.
+func (p *Pipeline) sinceFor(cursor *model.SyncCursor) time.Time {
+	if !p.config.Since.IsZero() {
+		return p.config.Since
 	}
 	if cursor != nil && !cursor.LastDate.IsZero() {
-		return cursor.LastDate, nil
+		return cursor.LastDate.Add(-cursorOverlap)
 	}
-
 	days := p.config.InitialLookbackDays
 	if days <= 0 {
 		days = 90
 	}
-	return time.Now().AddDate(0, 0, -days), nil
+	return time.Now().AddDate(0, 0, -days)
 }
 
 func filterRepos(repos []model.RepoInfo, cfg OrgConfig) []model.RepoInfo {

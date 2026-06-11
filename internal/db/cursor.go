@@ -13,12 +13,12 @@ import (
 // GetSyncCursor returns the sync cursor for org/repo/branch, or nil if not found.
 func (d *DB) GetSyncCursor(ctx context.Context, org, repo, branch string) (*model.SyncCursor, error) {
 	row := d.DB.QueryRowContext(ctx, `
-		SELECT org, repo, branch, last_date, updated_at
+		SELECT org, repo, branch, last_date, COALESCE(last_sha, ''), updated_at
 		FROM sync_cursors
 		WHERE org = ? AND repo = ? AND branch = ?`, org, repo, branch)
 
 	var c model.SyncCursor
-	err := row.Scan(&c.Org, &c.Repo, &c.Branch, &c.LastDate, &c.UpdatedAt)
+	err := row.Scan(&c.Org, &c.Repo, &c.Branch, &c.LastDate, &c.LastSHA, &c.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -34,9 +34,9 @@ func (d *DB) UpsertSyncCursor(ctx context.Context, cursor model.SyncCursor) erro
 		cursor.UpdatedAt = time.Now()
 	}
 	_, err := d.DB.ExecContext(ctx, `
-		INSERT OR REPLACE INTO sync_cursors (org, repo, branch, last_date, updated_at)
-		VALUES (?, ?, ?, ?, ?)`,
-		cursor.Org, cursor.Repo, cursor.Branch, cursor.LastDate, cursor.UpdatedAt)
+		INSERT OR REPLACE INTO sync_cursors (org, repo, branch, last_date, last_sha, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		cursor.Org, cursor.Repo, cursor.Branch, cursor.LastDate, cursor.LastSHA, cursor.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("upsert sync cursor: %w", err)
 	}

@@ -44,9 +44,16 @@ check runs, and branch commits, then re-audits the commit.
 This is a precise, low-volume recovery — it only fires for commits that currently have no
 PR attribution, which on a typical sweep is well under 1% of in-scope commits.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg := loadConfigOrDefault(cfgFile)
+			if windowDays < 0 {
+				return fmt.Errorf("--window-days must be >= 0, got %d", windowDays)
+			}
 
-			dbConn, err := db.Open(resolveDBPath(cfg))
+			cfg, err := loadConfigOrDefault(cfgFile, cmd.Flag("config").Changed)
+			if err != nil {
+				return err
+			}
+
+			dbConn, err := db.Open(resolveDBPath(cfg, cmd.Flag("db").Changed))
 			if err != nil {
 				return fmt.Errorf("opening database: %w", err)
 			}
@@ -64,16 +71,6 @@ PR attribution, which on a typical sweep is well under 1% of in-scope commits.`,
 				client = ghclient.NewClient(pool, logger)
 			}
 
-			if reclassifyOnly {
-				if err := runReclassify(cmd.Context(), dbConn, logger, dryRun, repoFilter); err != nil {
-					return err
-				}
-				if verifyReverts {
-					return runVerifyReverts(cmd.Context(), dbConn, client, logger, dryRun, repoFilter)
-				}
-				return nil
-			}
-
 			exemptAuthors := append([]model.ExemptAuthor(nil), cfg.Exemptions.Authors...)
 
 			var requiredChecks []syncer.RequiredCheck
@@ -81,12 +78,31 @@ PR attribution, which on a typical sweep is well under 1% of in-scope commits.`,
 				requiredChecks = append(requiredChecks, syncer.RequiredCheck{Name: rc.Name, Conclusion: rc.Conclusion})
 			}
 
-			return runBackfill(cmd.Context(), dbConn, client, cfg, logger, exemptAuthors, requiredChecks, backfillOpts{
+			if reclassifyOnly {
+				if err := runReclassify(cmd.Context(), dbConn, logger, dryRun, repoFilter); err != nil {
+					return err
+				}
+				if verifyReverts {
+					return runVerifyReverts(cmd.Context(), dbConn, client, logger, dryRun, repoFilter, exemptAuthors, requiredChecks)
+				}
+				return nil
+			}
+
+			if err := runBackfill(cmd.Context(), dbConn, client, cfg, logger, exemptAuthors, requiredChecks, backfillOpts{
 				repoFilter: repoFilter,
 				windowDays: windowDays,
 				limit:      limit,
 				dryRun:     dryRun,
-			})
+			}); err != nil {
+				return err
+			}
+			// --verify-reverts composes with the full backfill too; it used
+			// to be honoured only alongside --reclassify-only and was
+			// silently ignored otherwise.
+			if verifyReverts {
+				return runVerifyReverts(cmd.Context(), dbConn, client, logger, dryRun, repoFilter, exemptAuthors, requiredChecks)
+			}
+			return nil
 		},
 	}
 
@@ -168,65 +184,6 @@ WHERE a.pr_count = 0
 	return out, rows.Err()
 }
 
-// fetchAndPersistPR ingests a single PR (the one FindMergingPR returned)
-// plus its reviews, check runs on its head SHA, and branch commits. After
-// the writes we link the candidate commit to this PR via commit_prs so
-// the re-audit path picks it up.
-func fetchAndPersistPR(
-	ctx context.Context,
-	client *ghclient.Client,
-	dbConn *db.DB,
-	org, repo, sha string,
-	pr *model.PullRequest,
-) error {
-	// Fetch full PR detail (includes merged_by, final head_sha, etc.).
-	fullPR, err := client.GetPullRequest(ctx, org, repo, pr.Number)
-	if err != nil {
-		return fmt.Errorf("get full PR detail: %w", err)
-	}
-	if err := dbConn.UpsertPullRequests(ctx, []model.PullRequest{*fullPR}); err != nil {
-		return fmt.Errorf("upsert PR: %w", err)
-	}
-
-	reviews, err := client.ListReviews(ctx, org, repo, pr.Number)
-	if err != nil {
-		return fmt.Errorf("list reviews: %w", err)
-	}
-	if len(reviews) > 0 {
-		if err := dbConn.UpsertReviews(ctx, reviews); err != nil {
-			return fmt.Errorf("upsert reviews: %w", err)
-		}
-	}
-
-	if fullPR.HeadSHA != "" {
-		runs, err := client.ListCheckRunsForRef(ctx, org, repo, fullPR.HeadSHA)
-		if err != nil {
-			return fmt.Errorf("list check runs: %w", err)
-		}
-		if len(runs) > 0 {
-			if err := dbConn.UpsertCheckRuns(ctx, runs); err != nil {
-				return fmt.Errorf("upsert check runs: %w", err)
-			}
-		}
-	}
-
-	branchCommits, err := client.ListPRCommits(ctx, org, repo, pr.Number)
-	if err != nil {
-		return fmt.Errorf("list PR commits: %w", err)
-	}
-	if len(branchCommits) > 0 {
-		if err := dbConn.UpsertCommits(ctx, branchCommits); err != nil {
-			return fmt.Errorf("upsert PR branch commits: %w", err)
-		}
-	}
-
-	// Link this commit to its newly-discovered PR.
-	if err := dbConn.UpsertCommitPRs(ctx, org, repo, sha, []int{pr.Number}); err != nil {
-		return fmt.Errorf("upsert commit_prs link: %w", err)
-	}
-	return nil
-}
-
 func runBackfill(
 	ctx context.Context,
 	dbConn *db.DB,
@@ -279,7 +236,7 @@ func runBackfill(
 		byRepo[key] = append(byRepo[key], c)
 	}
 
-	var found, notFound, flipped int
+	var found, notFound, flipped, enumFailed, writeFailed int
 	processed := 0
 	for _, rk := range repoOrder {
 		if ctx.Err() != nil {
@@ -301,7 +258,7 @@ func runBackfill(
 		if err != nil {
 			logger.Warn("repo PR enumeration failed; candidates in this repo will be skipped",
 				"repo", rk, "error", err, "candidates", len(group))
-			notFound += len(group)
+			enumFailed += len(group)
 			processed += len(group)
 			continue
 		}
@@ -324,35 +281,26 @@ func runBackfill(
 			}
 			if err := persistBackfilledPR(ctx, client, dbConn, c.org, c.repo, c.sha, pr); err != nil {
 				logger.Error("persisting PR failed", "org", c.org, "repo", c.repo, "sha", c.sha[:12], "pr", pr.Number, "error", err)
+				writeFailed++
 				continue
 			}
-			// Preserve the enrichment-phase revert / merge classification
-			// across the re-audit. buildEnrichmentFromDB doesn't populate
-			// those fields (they require GetCommitFiles against the
-			// reverted commit, which re-audit skips), so without this
-			// read-then-reapply step the re-audit would zero them out.
-			priorClass, err := dbConn.GetRevertMergeClassification(ctx, c.org, c.repo, c.sha)
-			if err != nil {
-				logger.Warn("couldn't read prior classification; re-audit will zero revert/merge fields",
-					"org", c.org, "repo", c.repo, "sha", c.sha[:12], "error", err)
-			}
-			if err := dbConn.DeleteAuditResultsBySHA(ctx, c.org, c.repo, c.sha); err != nil {
-				logger.Error("delete prior audit result failed", "error", err)
-				continue
-			}
+			// Re-evaluate against the still-present prior row:
+			// buildEnrichmentFromDB reads the revert/merge classification
+			// off the existing audit_results row (it can't be recomputed
+			// offline) and feeds it into EvaluateCommit, which both honours
+			// it (§8 clean-revert waiver) and copies it onto the new result.
+			// The old order deleted the row first, evaluated with zeroed
+			// classification, and pasted the flags back afterwards — storing
+			// verdicts inconsistent with their own classification.
 			newResults, err := reauditSingleCommit(ctx, dbConn, c.org, c.repo, c.sha, exemptAuthors, requiredChecks)
 			if err != nil {
 				logger.Error("re-audit failed", "error", err)
+				writeFailed++
 				continue
 			}
-			// Copy the preserved classification onto the re-audited row.
-			newResults[0].IsCleanRevert = priorClass.IsCleanRevert
-			newResults[0].RevertVerification = priorClass.RevertVerification
-			newResults[0].RevertedSHA = priorClass.RevertedSHA
-			newResults[0].IsCleanMerge = priorClass.IsCleanMerge
-			newResults[0].MergeVerification = priorClass.MergeVerification
 			if err := dbConn.UpsertAuditResults(ctx, newResults); err != nil {
 				logger.Error("upsert audit result failed", "error", err)
+				writeFailed++
 				continue
 			}
 			if newResults[0].IsCompliant {
@@ -368,9 +316,14 @@ func runBackfill(
 		"candidates", len(candidates),
 		"found_pr", found,
 		"no_pr_in_window", notFound,
+		"enumeration_failed", enumFailed,
+		"write_failed", writeFailed,
 		"flipped_to_compliant", flipped,
 		"dry_run", opts.dryRun,
 	)
+	if enumFailed > 0 || writeFailed > 0 {
+		return fmt.Errorf("backfill finished with failures: %d candidates skipped by repo enumeration errors, %d write/re-audit errors (see log)", enumFailed, writeFailed)
+	}
 	return nil
 }
 
@@ -445,8 +398,12 @@ func persistBackfilledPR(
 		return fmt.Errorf("list PR commits: %w", err)
 	}
 	if len(branchCommits) > 0 {
-		if err := dbConn.UpsertCommits(ctx, branchCommits); err != nil {
-			return fmt.Errorf("upsert PR branch commits: %w", err)
+		// Insert-if-absent, never upsert: /pulls/{n}/commits rows are
+		// impoverished (no author_email, href, is_verified, stats) and a
+		// blind upsert guts rich phase-1 rows — same rule as the sync
+		// pipeline's writeEnrichmentBatch.
+		if err := dbConn.InsertCommitsIfAbsent(ctx, branchCommits); err != nil {
+			return fmt.Errorf("insert PR branch commits: %w", err)
 		}
 	}
 	if err := dbConn.UpsertCommitPRs(ctx, org, repo, sha, []int{pr.Number}); err != nil {
@@ -472,10 +429,6 @@ func enumerateClosedPRs(
 ) error {
 	return client.ListClosedMergedPRs(ctx, org, repo, base, windowStart, windowEnd, cb)
 }
-
-// Delete the older fetchAndPersistPR path; the new index-based flow uses
-// persistBackfilledPR directly.
-var _ = fetchAndPersistPR
 
 // reauditSingleCommit rebuilds the enrichment snapshot for one commit from
 // the DB and runs EvaluateCommit against it. Mirrors the shape of the
@@ -517,12 +470,17 @@ func runReclassify(
 	repoFilter []string,
 ) error {
 	args := []any{}
+	// The two empty-classification arms are wrapped in one parenthesized
+	// predicate so the repo filter appended below ANDs against both. An
+	// earlier version left the OR bare; SQL precedence (AND > OR) then
+	// limited the filter to the second arm and the UPDATE leaked into
+	// every other repo whose revert_verification was empty.
 	sql := `
 SELECT a.org, a.repo, a.sha, c.message, c.parent_count, c.committer_login, c.is_verified
 FROM audit_results a
 JOIN commits c ON c.org=a.org AND c.repo=a.repo AND c.sha=a.sha
-WHERE (a.revert_verification IS NULL OR a.revert_verification = '')
-   OR (a.merge_verification  IS NULL OR a.merge_verification  = '')
+WHERE ((a.revert_verification IS NULL OR a.revert_verification = '')
+    OR (a.merge_verification  IS NULL OR a.merge_verification  = ''))
 `
 	if len(repoFilter) > 0 {
 		sql += ` AND ((a.org || '/' || a.repo) IN (`
@@ -579,22 +537,27 @@ WHERE (a.revert_verification IS NULL OR a.revert_verification = '')
 
 		mk := ghclient.ClassifyMerge(r.parentCount, r.message, r.committerLogin, r.isVerified)
 		isCleanMerge := mk == ghclient.CleanMerge
-		mergeVerification := mergeKindToVerification(mk)
+		mergeVerification := ghclient.MergeKindVerification(mk)
 
 		if dryRun {
 			updated++
 			continue
 		}
 
+		// Fill ONLY the empty family. The candidate query ORs the two
+		// families, so a row can arrive here with one family already
+		// verified at sync time — rewriting it would downgrade
+		// diff-verified reverts to message-only and destroy their §8
+		// waiver basis.
 		res, err := dbConn.DB.ExecContext(ctx, `
 UPDATE audit_results
-SET is_clean_revert = ?,
-    revert_verification = ?,
-    reverted_sha = ?,
-    is_clean_merge = ?,
-    merge_verification = ?
+SET is_clean_revert     = CASE WHEN revert_verification IS NULL OR revert_verification = '' THEN ? ELSE is_clean_revert END,
+    reverted_sha        = CASE WHEN revert_verification IS NULL OR revert_verification = '' THEN ? ELSE reverted_sha END,
+    revert_verification = CASE WHEN revert_verification IS NULL OR revert_verification = '' THEN ? ELSE revert_verification END,
+    is_clean_merge      = CASE WHEN merge_verification IS NULL OR merge_verification = '' THEN ? ELSE is_clean_merge END,
+    merge_verification  = CASE WHEN merge_verification IS NULL OR merge_verification = '' THEN ? ELSE merge_verification END
 WHERE org = ? AND repo = ? AND sha = ?`,
-			isCleanRevert, revertVerification, revertedSHA,
+			isCleanRevert, revertedSHA, revertVerification,
 			isCleanMerge, mergeVerification,
 			r.org, r.repo, r.sha)
 		if err != nil {
@@ -616,6 +579,15 @@ WHERE org = ? AND repo = ? AND sha = ?`,
 // by fetching both commits' files and running the same diff-inverse check
 // enrichOneCommit does at sync time. Idempotent — re-running is a no-op
 // because rows past message-only are skipped.
+//
+// AutoRevert rows are excluded (re-parsed from the commit message): the
+// bot's "Automatic revert of new..old" is trusted by construction and may
+// span multiple commits, so a diff check against the single parsed SHA
+// would spuriously revoke its clean flag.
+//
+// Rows whose verification upgrades to diff-verified are re-audited: the
+// §8 waiver can flip the stored verdict, and leaving the old verdict next
+// to the new verification would be internally inconsistent.
 func runVerifyReverts(
 	ctx context.Context,
 	dbConn *db.DB,
@@ -623,11 +595,14 @@ func runVerifyReverts(
 	logger *slog.Logger,
 	dryRun bool,
 	repoFilter []string,
+	exemptAuthors []model.ExemptAuthor,
+	requiredChecks []syncer.RequiredCheck,
 ) error {
 	args := []any{}
 	sql := `
-SELECT a.org, a.repo, a.sha, a.reverted_sha
+SELECT a.org, a.repo, a.sha, a.reverted_sha, c.message
 FROM audit_results a
+JOIN commits c ON c.org = a.org AND c.repo = a.repo AND c.sha = a.sha
 WHERE a.revert_verification = 'message-only'
   AND a.reverted_sha IS NOT NULL AND a.reverted_sha <> ''`
 	if len(repoFilter) > 0 {
@@ -645,18 +620,27 @@ WHERE a.revert_verification = 'message-only'
 	if err != nil {
 		return fmt.Errorf("verify-reverts query: %w", err)
 	}
-	type row struct{ org, repo, sha, revertedSHA string }
+	type row struct{ org, repo, sha, revertedSHA, message string }
 	var candidates []row
+	skippedAuto := 0
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.org, &r.repo, &r.sha, &r.revertedSHA); err != nil {
+		if err := rows.Scan(&r.org, &r.repo, &r.sha, &r.revertedSHA, &r.message); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan verify-reverts row: %w", err)
 		}
+		if kind, _ := ghclient.ParseRevert(r.message); kind != ghclient.ManualRevert {
+			skippedAuto++
+			continue
+		}
 		candidates = append(candidates, r)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("verify-reverts row iteration: %w", err)
+	}
 	rows.Close()
-	logger.Info("verify-reverts candidates", "count", len(candidates))
+	logger.Info("verify-reverts candidates", "count", len(candidates), "skipped_non_manual", skippedAuto)
 
 	var verified, mismatch, fetchErrors int
 	for i, r := range candidates {
@@ -696,6 +680,18 @@ WHERE org = ? AND repo = ? AND sha = ?`,
 			logger.Warn("verify-reverts update failed", "sha", r.sha[:12], "error", err)
 			continue
 		}
+		// A verification upgrade can flip the §8 waiver — re-audit so the
+		// stored verdict matches the new classification.
+		if isClean {
+			newResults, err := reauditSingleCommit(ctx, dbConn, r.org, r.repo, r.sha, exemptAuthors, requiredChecks)
+			if err != nil {
+				logger.Warn("post-verification re-audit failed", "sha", r.sha[:12], "error", err)
+				continue
+			}
+			if err := dbConn.UpsertAuditResults(ctx, newResults); err != nil {
+				logger.Warn("post-verification re-audit upsert failed", "sha", r.sha[:12], "error", err)
+			}
+		}
 		if (i+1)%100 == 0 {
 			logger.Info("verify-reverts progress",
 				"processed", i+1, "total", len(candidates),
@@ -711,22 +707,6 @@ WHERE org = ? AND repo = ? AND sha = ?`,
 		"dry_run", dryRun,
 	)
 	return nil
-}
-
-// mergeKindToVerification mirrors enrichOneCommit's classifier mapping so
-// the reclassify path produces identical merge_verification strings.
-func mergeKindToVerification(mk ghclient.MergeKind) string {
-	switch mk {
-	case ghclient.NotMerge:
-		return "none"
-	case ghclient.CleanMerge:
-		return "message-only"
-	case ghclient.DirtyMerge:
-		return "dirty"
-	case ghclient.OctopusMerge:
-		return "octopus"
-	}
-	return "none"
 }
 
 // containsGlob returns true iff s uses glob syntax the PR-list API can't

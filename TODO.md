@@ -1,5 +1,16 @@
 # TODO
 
+## Positional post-approval check in isApprovalRefreshable
+
+The §4 stale-approval carve-out classifies "post-approval commits" by
+`CommittedAt > approval.SubmittedAt` — also a client-settable timestamp. A
+backdated human commit pushed after the approval escapes the post-approval
+set, so an exempt bot commit alongside it can still promote the approval.
+The fix is positional, not temporal: any non-exempt commit *after the
+approved CommitID in the branch's commit graph* voids the promotion. Needs
+the PR-branch parent graph (not persisted today) or the reviews'
+commit-position from the timeline API.
+
 ## Revert-chain claim detection
 
 Deferred work around revert chains that require cross-commit / cross-PR

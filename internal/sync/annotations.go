@@ -11,7 +11,7 @@ import (
 // *why* the commit has the shape it does, independent of compliance
 // verdict. The main audit decides "compliant / not"; annotations add
 // metadata like "this commit is an automated dep-bump". Surfaced in
-// the XLSX as a column and (for discovery) as a dedicated sheet.
+// the XLSX as an Annotations column on the Decision Matrix sheet.
 //
 // Annotations are purely informational and never affect IsCompliant.
 // See TODO.md for deferred work (revert-chain claim parsing, diff-verified

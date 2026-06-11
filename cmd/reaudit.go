@@ -48,9 +48,12 @@ func newReAuditCmd() *cobra.Command {
 			"  • populate commit-message annotations (use `annotate-commits` for that)\n\n" +
 			"The legacy alias `re-audit` remains wired to this same command.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg := loadConfigOrDefault(cfgFile)
+			cfg, err := loadConfigOrDefault(cfgFile, cmd.Flag("config").Changed)
+			if err != nil {
+				return err
+			}
 
-			dbConn, err := db.Open(resolveDBPath(cfg))
+			dbConn, err := db.Open(resolveDBPath(cfg, cmd.Flag("db").Changed))
 			if err != nil {
 				return fmt.Errorf("opening database: %w", err)
 			}
@@ -143,7 +146,14 @@ func runReAuditPass(
 		}
 		pairs = append(pairs, or)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, 0, fmt.Errorf("iterating org/repo pairs: %w", err)
+	}
 	rows.Close()
+	if len(filter.repos) > 0 && len(pairs) == 0 {
+		return 0, 0, fmt.Errorf("--repo filter matched no repos in the database: %v", filter.repos)
+	}
 
 	concurrency := filter.concurrency
 	if concurrency < 1 {
@@ -196,22 +206,11 @@ func runReAuditPass(
 			tWrite := time.Now()
 			writeMu.Lock()
 			defer writeMu.Unlock()
-			// DuckDB's INSERT OR REPLACE can't UPDATE LIST columns in place
-			// (reasons / approver_logins). When we're rewriting every row in
-			// the repo we can DELETE the whole repo's rows and pure-INSERT the
-			// batch. When --only-failures (or another filter) narrows the set,
-			// per-sha DELETE keeps the other rows untouched.
-			if filter.onlyFailures || len(filter.repos) > 0 {
-				for _, r := range results {
-					if err := dbConn.DeleteAuditResultsBySHA(gctx, r.Org, r.Repo, r.SHA); err != nil {
-						return fmt.Errorf("per-sha delete %s/%s@%s: %w", r.Org, r.Repo, r.SHA[:12], err)
-					}
-				}
-			} else {
-				if err := dbConn.DeleteAuditResults(gctx, or.org, or.repo); err != nil {
-					return fmt.Errorf("clearing audit_results for %s/%s: %w", or.org, or.repo, err)
-				}
-			}
+			// UpsertAuditResults handles replacing existing rows (including
+			// LIST columns) internally, so no pre-DELETE is needed. The old
+			// delete-then-insert pair could destroy a repo's audit history
+			// when a sibling repo's failure cancelled gctx between the two
+			// statements.
 			if err := dbConn.UpsertAuditResults(gctx, results); err != nil {
 				return fmt.Errorf("inserting re-audit results for %s/%s: %w", or.org, or.repo, err)
 			}
@@ -296,11 +295,15 @@ func loadRepoEnrichmentBundle(ctx context.Context, dbConn *db.DB, org, repo stri
 		priorCompliance:      map[string]bool{},
 	}
 
-	// 1. pull_requests — same column shape as db.GetPullRequest.
+	// 1. pull_requests — same column shape as db.GetPullRequest. The
+	// numeric IDs are load-bearing: §5's self-approval matching is
+	// ID-only, so omitting author_id silently disabled PR-author
+	// self-approval detection on bulk re-audits.
 	prRows, err := dbConn.DB.QueryContext(ctx, `
 		SELECT org, repo, number, title, merged, head_sha,
 		       COALESCE(head_branch, ''), merge_commit_sha, author_login,
-		       COALESCE(merged_by_login, ''), merged_at, href
+		       COALESCE(author_id, 0), COALESCE(merged_by_login, ''),
+		       COALESCE(merged_by_id, 0), merged_at, href
 		FROM pull_requests
 		WHERE org = ? AND repo = ?`, org, repo)
 	if err != nil {
@@ -310,7 +313,7 @@ func loadRepoEnrichmentBundle(ctx context.Context, dbConn *db.DB, org, repo stri
 		var pr model.PullRequest
 		if err := prRows.Scan(&pr.Org, &pr.Repo, &pr.Number, &pr.Title, &pr.Merged,
 			&pr.HeadSHA, &pr.HeadBranch, &pr.MergeCommitSHA, &pr.AuthorLogin,
-			&pr.MergedByLogin, &pr.MergedAt, &pr.Href); err != nil {
+			&pr.AuthorID, &pr.MergedByLogin, &pr.MergedByID, &pr.MergedAt, &pr.Href); err != nil {
 			prRows.Close()
 			return nil, fmt.Errorf("scan pull_request: %w", err)
 		}
@@ -339,8 +342,12 @@ func loadRepoEnrichmentBundle(ctx context.Context, dbConn *db.DB, org, repo stri
 	// 3. reviews — same column shape as GetReviewsForPR; ORDER BY
 	// submitted_at preserves the per-PR ordering that the evaluator may
 	// rely on for "earliest approval" / "most recent dismissal" semantics.
+	// reviewer_id is load-bearing: identity matching is ID-only and a
+	// review with ReviewerID==0 is distrusted entirely, so omitting the
+	// column made bulk re-audits reject every approval in the repo.
 	rvRows, err := dbConn.DB.QueryContext(ctx, `
 		SELECT org, repo, pr_number, review_id, reviewer_login,
+		       COALESCE(reviewer_id, 0),
 		       COALESCE(state::TEXT, ''), commit_id, submitted_at, href
 		FROM reviews WHERE org = ? AND repo = ?
 		ORDER BY pr_number, submitted_at`, org, repo)
@@ -350,7 +357,7 @@ func loadRepoEnrichmentBundle(ctx context.Context, dbConn *db.DB, org, repo stri
 	for rvRows.Next() {
 		var r model.Review
 		if err := rvRows.Scan(&r.Org, &r.Repo, &r.PRNumber, &r.ReviewID, &r.ReviewerLogin,
-			&r.State, &r.CommitID, &r.SubmittedAt, &r.Href); err != nil {
+			&r.ReviewerID, &r.State, &r.CommitID, &r.SubmittedAt, &r.Href); err != nil {
 			rvRows.Close()
 			return nil, fmt.Errorf("scan review: %w", err)
 		}
@@ -382,8 +389,10 @@ func loadRepoEnrichmentBundle(ctx context.Context, dbConn *db.DB, org, repo stri
 	// column shape as scanCommits in internal/db.
 	cbRows, err := dbConn.DB.QueryContext(ctx, `
 		SELECT cp.pr_number,
-		       c.org, c.repo, c.sha, c.author_login, c.author_id, c.author_email, c.committer_login,
-		       c.committed_at, c.message, c.parent_count, c.additions, c.deletions, c.is_verified, c.href
+		       c.org, c.repo, c.sha, COALESCE(c.author_login, ''), c.author_id,
+		       COALESCE(c.author_email, ''), COALESCE(c.committer_login, ''),
+		       c.committed_at, COALESCE(c.message, ''), COALESCE(c.parent_count, 0),
+		       COALESCE(c.additions, 0), COALESCE(c.deletions, 0), c.is_verified, COALESCE(c.href, '')
 		FROM commits c
 		INNER JOIN commit_prs cp ON c.org = cp.org AND c.repo = cp.repo AND c.sha = cp.sha
 		WHERE cp.org = ? AND cp.repo = ?`, org, repo)

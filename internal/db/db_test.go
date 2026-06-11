@@ -33,14 +33,14 @@ func TestUpsertCommitsAndGetUnaudited(t *testing.T) {
 			Org: "org1", Repo: "repo1", SHA: "aaa",
 			AuthorLogin: "alice", AuthorEmail: "alice@example.com",
 			CommittedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-			Message: "first", ParentCount: 1, Additions: 10, Deletions: 5,
+			Message:     "first", ParentCount: 1, Additions: 10, Deletions: 5,
 			Href: "https://github.com/org1/repo1/commit/aaa",
 		},
 		{
 			Org: "org1", Repo: "repo1", SHA: "bbb",
 			AuthorLogin: "bob", AuthorEmail: "bob@example.com",
 			CommittedAt: time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC),
-			Message: "second", ParentCount: 1, Additions: 3, Deletions: 1,
+			Message:     "second", ParentCount: 1, Additions: 3, Deletions: 1,
 			Href: "https://github.com/org1/repo1/commit/bbb",
 		},
 	}
@@ -93,7 +93,7 @@ func TestUpsertCommitsIdempotent(t *testing.T) {
 		Org: "org1", Repo: "repo1", SHA: "aaa",
 		AuthorLogin: "alice", AuthorEmail: "alice@example.com",
 		CommittedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-		Message: "first", ParentCount: 1, Additions: 10, Deletions: 5,
+		Message:     "first", ParentCount: 1, Additions: 10, Deletions: 5,
 	}
 
 	require.NoError(t, db.UpsertCommits(ctx, []model.Commit{c}))
@@ -138,8 +138,8 @@ func TestUpsertPullRequestsAndGetPRsForCommit(t *testing.T) {
 			Title: "Add feature", Merged: true,
 			HeadSHA: "abc", MergeCommitSHA: "def",
 			AuthorLogin: "alice",
-			MergedAt: time.Date(2025, 1, 5, 0, 0, 0, 0, time.UTC),
-			Href: "https://github.com/org1/repo1/pull/42",
+			MergedAt:    time.Date(2025, 1, 5, 0, 0, 0, 0, time.UTC),
+			Href:        "https://github.com/org1/repo1/pull/42",
 		},
 	}
 
@@ -162,7 +162,7 @@ func TestUpsertReviewsAndGetReviewsForPR(t *testing.T) {
 			ReviewID: 100, ReviewerLogin: "bob",
 			State: "APPROVED", CommitID: "abc",
 			SubmittedAt: time.Date(2025, 1, 4, 0, 0, 0, 0, time.UTC),
-			Href: "https://github.com/org1/repo1/pull/42#pullrequestreview-100",
+			Href:        "https://github.com/org1/repo1/pull/42#pullrequestreview-100",
 		},
 	}
 
@@ -226,7 +226,7 @@ func TestUpsertAuditResultsAndGetAuditResults(t *testing.T) {
 			Org: "org1", Repo: "repo1", SHA: "sha1",
 			AuthorLogin: "alice",
 			CommittedAt: time.Date(2025, 3, 1, 0, 0, 0, 0, time.UTC),
-			Message: "feat: something",
+			Message:     "feat: something",
 		},
 	}
 	require.NoError(t, db.UpsertCommits(ctx, commits))
@@ -235,13 +235,13 @@ func TestUpsertAuditResultsAndGetAuditResults(t *testing.T) {
 		{
 			Org: "org1", Repo: "repo1", SHA: "sha1",
 			IsEmptyCommit: false, IsBot: false, IsExemptAuthor: false, HasPR: true, PRNumber: 42,
-			HasFinalApproval: true,
-			ApproverLogins:   []string{"bob", "carol"},
+			HasFinalApproval:   true,
+			ApproverLogins:     []string{"bob", "carol"},
 			OwnerApprovalCheck: "success",
-			IsCompliant: true,
-			Reasons:     nil,
-			CommitHref:  "https://github.com/org1/repo1/commit/sha1",
-			PRHref:      "https://github.com/org1/repo1/pull/42",
+			IsCompliant:        true,
+			Reasons:            nil,
+			CommitHref:         "https://github.com/org1/repo1/commit/sha1",
+			PRHref:             "https://github.com/org1/repo1/pull/42",
 		},
 	}
 
@@ -414,11 +414,13 @@ func TestEnumColumnsAcceptValidValues(t *testing.T) {
 	require.Len(t, got, 1)
 	require.Equal(t, "APPROVED", got[0].State)
 
-	// Inserting an invalid enum value should fail.
+	// reviews.state is TEXT (migrated from an ENUM that hard-failed whole
+	// batches on PENDING drafts and future GitHub states): unknown values
+	// are stored as-is and validated at the application layer.
 	_, err = db.ExecContext(ctx,
 		`INSERT INTO reviews (org, repo, pr_number, review_id, state)
-		 VALUES ('org1', 'repo1', 2, 2, 'INVALID_STATE')`)
-	require.Error(t, err)
+		 VALUES ('org1', 'repo1', 2, 2, 'FUTURE_STATE')`)
+	require.NoError(t, err)
 
 	// Verify check_runs accept arbitrary status/conclusion values (TEXT columns).
 	checkRuns := []model.CheckRun{
@@ -447,7 +449,7 @@ func TestEmptyCommitStoredCorrectly(t *testing.T) {
 			Org: "org1", Repo: "repo1", SHA: "empty",
 			AuthorLogin: "bot",
 			CommittedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-			Message: "empty commit", Additions: 0, Deletions: 0,
+			Message:     "empty commit", Additions: 0, Deletions: 0,
 		},
 	}
 

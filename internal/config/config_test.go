@@ -229,3 +229,97 @@ tokens:
 		assert.Contains(t, err.Error(), "parsing config")
 	})
 }
+
+func TestExpandHomeInPaths(t *testing.T) {
+	home, err := os.UserHomeDir()
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+database: ~/custom/audit.db
+orgs:
+  - name: testorg
+tokens:
+  - kind: app
+    app_id: 1
+    installation_id: 2
+    private_key_path: ~/keys/app.pem
+    scopes:
+      - org: testorg
+`
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(home, "custom", "audit.db"), cfg.Database)
+	assert.Equal(t, filepath.Join(home, "keys", "app.pem"), cfg.Tokens[0].PrivateKeyPath)
+}
+
+func TestValidateRejectsInertAndDuplicateEntries(t *testing.T) {
+	base := `
+orgs:
+  - name: testorg
+tokens:
+  - kind: pat
+    env: TOK
+    scopes:
+      - org: testorg
+`
+	write := func(t *testing.T, yaml string) (*Config, error) {
+		t.Helper()
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
+		return Load(path)
+	}
+
+	t.Run("exempt entry with neither id nor verified_emails is rejected", func(t *testing.T) {
+		// Login-only entries can never match anything (matching is id-or-
+		// verified-emails); accepting one silently produces false flags —
+		// the inverse of the documented "mae" incident.
+		_, err := write(t, base+`
+exemptions:
+  authors:
+    - login: somebot
+`)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "exemptions")
+	})
+
+	t.Run("exempt entry with id passes", func(t *testing.T) {
+		_, err := write(t, base+`
+exemptions:
+  authors:
+    - login: somebot
+      id: 12345
+`)
+		require.NoError(t, err)
+	})
+
+	t.Run("duplicate org names rejected", func(t *testing.T) {
+		_, err := write(t, `
+orgs:
+  - name: testorg
+  - name: testorg
+tokens:
+  - kind: pat
+    env: TOK
+    scopes:
+      - org: testorg
+`)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duplicate org")
+	})
+
+	t.Run("duplicate token envs rejected", func(t *testing.T) {
+		_, err := write(t, base+`
+  - kind: pat
+    env: TOK
+    scopes:
+      - org: testorg
+`)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duplicate token")
+	})
+}

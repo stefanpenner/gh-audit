@@ -10,27 +10,28 @@ For every commit on configured branches, in this order:
 2. **Empty commits** (0 additions / 0 deletions) -- short-circuit to compliant.
 3. **Has an associated merged PR** -- direct pushes are flagged.
 4. **Approved on the final commit at merge time** -- stale approvals (on an earlier force-pushed commit) don't count. Reviews submitted after `pr.merged_at` are excluded (see [Point-in-time compliance](#point-in-time-compliance)).
-5. **Not self-approved** -- reviewer must not be the PR author, commit author, committer, or co-author.
+5. **Not self-approved** -- the reviewer's immutable numeric GitHub ID must not match the PR author, the commit author (skipped for verified GitHub merge-button commits), or any PR-branch contributor who shipped real code. Committer and `Co-authored-by` trailers are intentionally **not** checked — neither carries a forgery-resistant API-resolved ID.
 6. **Required checks passed** -- e.g. "Owner Approval" check ran successfully on the PR's head commit.
+7. **Clean-revert waiver** -- if the verdict so far is non-compliant (including direct pushes) but the commit is a bot auto-revert or a diff-verified manual revert, it is waived to compliant. Every other revert shape falls through to the normal rules.
 
-### Informational signals (do not change `IsCompliant`)
+### Informational signals
 
-These flags are recorded on every audit result for separate triage — they surface governance-relevant events that reviewers may want to look at, but the compliance gate remains peer review + required checks.
+These flags are recorded on every audit result for separate triage — they surface governance-relevant events that reviewers may want to look at.
 
-- **`HasPostMergeConcern`** — a reviewer submitted a `CHANGES_REQUESTED` or `DISMISSED` review **after** the PR merged. The merge itself was compliant at the time; this captures the later concern so it isn't lost. See the `Post-Merge Concerns` XLSX sheet.
-- **`IsCleanRevert` + `RevertVerification`** — classifies a commit that undoes a prior commit. Compliance policy for clean reverts is not yet codified, so they are surfaced without affecting `IsCompliant`. Verification values:
+- **`HasPostMergeConcern`** — a reviewer submitted a `CHANGES_REQUESTED` or `DISMISSED` review **after** the PR merged. The merge itself was compliant at the time; this captures the later concern so it isn't lost (does not change `IsCompliant`). Filter the `Decision Matrix` XLSX sheet's R4c column to triage these.
+- **`IsCleanRevert` + `RevertVerification`** — classifies a commit that undoes a prior commit. A clean revert (see check 7 above) waives an otherwise non-compliant verdict. Verification values:
   - `none` — not a revert
   - `message-only` — bot auto-revert (`Automatic revert of <sha>..<sha>`), trusted clean by pattern; or a manual revert whose referenced commit could not be fetched
   - `diff-verified` — manual revert whose per-file patches are the exact inverse of the referenced commit's patches
   - `diff-mismatch` — manual revert that partially or incorrectly reverses the referenced commit (intervening edits, conflict resolutions, partial revert)
 
-  Auto-reverts and diff-verified manual reverts set `IsCleanRevert = true`. See the `Clean Reverts` XLSX sheet.
+  Auto-reverts and diff-verified manual reverts set `IsCleanRevert = true`. Waived reverts appear in the `Waivers Log` XLSX sheet.
 
 ### Exempt authors
 
-The `exemptions.authors` config is a list of exact login matches (case-insensitive) that short-circuit the compliance check — **but only when every PR-branch contributor is also exempt**. This matches "bot-merged, no human code" semantics: if a service-account autobot (e.g., translation updater, dep upgrader, auto-revert) authors and merges a PR where every commit on the branch is by the same or another exempt author, no human review is required.
+The `exemptions.authors` config is a list of structured entries matched by **immutable numeric GitHub account id** (`id`), with an operator-curated `verified_emails` fallback for service accounts whose git-author email GitHub doesn't bind to an account (`login` is display-only). The exemption short-circuits the compliance check — **but only when every PR-branch contributor is also exempt**. This matches "bot-merged, no human code" semantics: if a service-account autobot (e.g., translation updater, dep upgrader, auto-revert) authors and merges a PR where every commit on the branch is by the same or another exempt author, no human review is required.
 
-If even a single PR-branch commit is by a non-exempt contributor, the exempt shortcut does **not** fire and the commit falls through to the normal peer-review check. This protects against an exempt author squashing in human code unnoticed.
+If even a single PR-branch commit is by a non-exempt contributor (with a verifiably non-empty diff), the exempt shortcut does **not** fire and the commit falls through to the normal peer-review check. This protects against an exempt author squashing in human code unnoticed.
 
 ### Point-in-time compliance
 
@@ -60,6 +61,7 @@ gh-audit sync --org my-org
 gh-audit sync --repo my-org/my-repo --since 2026-01-01 --until 2026-04-01
 
 # Audit the repo's entire history (since the first commit)
+# (`all` and `beginning` are accepted aliases for `epoch`)
 gh-audit sync --repo my-org/my-repo --since epoch
 
 # Generate a report
@@ -85,7 +87,7 @@ For each commit on a branch, gh-audit runs a REST trace to collect the evidence 
 ```
 commit (SHA)
   |
-  +-- GET /repos/{owner}/{repo}/commits/{sha}
+  +-- GET /repos/{owner}/{repo}/commits/{sha}   (DB-first; fetched lazily)
   |     -> additions, deletions, commit message, files/patches
   |     -> empty-commit detection
   |     -> revert classification (see below)
@@ -121,6 +123,7 @@ commit (SHA)
         has_approval_on_final_commit? -> no: FAIL (stale or absent approval)
         required_checks_passed?       -> no: FAIL
         yes to all                    -> COMPLIANT
+        any FAIL + is_clean_revert?   -> COMPLIANT (clean-revert waiver)
 ```
 
 Every REST endpoint is fully paginated. No data is silently truncated -- if a pagination boundary is hit, all pages are fetched.
@@ -136,12 +139,12 @@ reviewer B: COMMENTED (09:00) -> APPROVED (10:30)   -> final state: APPROVED
 
 ### Self-approval detection
 
-A review is considered self-approval if the reviewer matches any of:
+A review is considered self-approval if the reviewer's immutable numeric GitHub ID matches any of:
 - PR author
-- Commit author
-- Committer (excluding GitHub merge bots: "web-flow", "github")
-- Co-authors (from `Co-authored-by` trailers)
+- Commit author (skipped for verified GitHub merge-button commits, which cannot carry author-written code)
 - Any PR-branch commit author with a non-empty contribution (covers squash-merges where the reviewer's code landed in the squash)
+
+Committer login and `Co-authored-by` trailers are intentionally excluded: GitHub provides no committer ID on the commit object, and trailers are unvalidated message text — both are forgeable. A review whose reviewer ID cannot be resolved (deleted/ghost account) counts as neither a self-approval nor an independent approval.
 
 A reviewer whose only PR-branch contribution is a zero-diff "rerun CI" commit is **not** treated as a code author — diff stats are lazy-fetched (DB-cached) to distinguish truly empty admin commits from `/pulls/{n}/commits`'s missing-stats default. Fetch errors fail open (treat as contributor).
 
@@ -164,11 +167,13 @@ The diff-inverse check treats `+` lines and `-` lines as multisets per file. `++
 
 **Why not verify bot reverts?** An auto-revert bot emits clean reverts by construction — its whole job is to produce a pure inverse. Skipping diff verification for auto-reverts keeps the API cost at zero for the common case; manual reverts still pay 2 extra REST calls for their verification.
 
-**Compliance is not affected by revert status.** Clean reverts still go through the normal PR + approval + required-check evaluation. The `IsCleanRevert` / `RevertVerification` fields exist so reviewers can triage reverts separately from novel code in the `Clean Reverts` XLSX sheet.
+**Clean reverts waive non-compliance.** A commit still goes through the normal PR + approval + required-check evaluation first; only when that verdict is non-compliant does the clean-revert waiver fire (auto-revert or `diff-verified` manual revert). Conflict-resolved (`diff-mismatch`) and message-only reverts never waive. Waived reverts are logged with their evidence in the `Waivers Log` XLSX sheet.
 
 ## Config file (optional)
 
-For advanced use (multi-token, audit rules, exemptions), create `~/.config/gh-audit/config.yaml`:
+For advanced use (multi-token, audit rules, exemptions), create `~/.config/gh-audit/config.yaml`.
+
+A missing file at the default path is fine — built-in defaults apply. Pointing `--config` at a file that doesn't exist is an error, and an invalid config (bad YAML or failed validation) is always fatal: gh-audit never silently falls back to default rules, which could produce wrong compliance verdicts. A leading `~` is expanded in `database:` and `private_key_path:`.
 
 ```yaml
 orgs:
@@ -282,18 +287,17 @@ gh-audit report --repo my-org/my-repo --since 2026-01-01 --until 2026-04-01
 
 ### XLSX output
 
-The `--format xlsx` output produces a workbook with 9 sheets:
+The `--format xlsx` output produces a workbook with 8 sheets, organized Action → Overview → Trace/Evidence (`--only-failures` is not supported for xlsx — the summary sheets would disagree with filtered details; filter in Excel instead):
 
 | Sheet | Purpose |
 |---|---|
-| **Summary** | Rollup by org/repo -- compliance counts and percentages |
-| **All Commits** | Every commit with hyperlinked SHA and PR # |
-| **Non-Compliant** | Failures only, with empty "Resolution" column for auditor notes |
-| **Exemptions** | Bot and empty commits with exemption reasons |
-| **Self-Approved** | Commits where the only approval came from a code contributor |
-| **Stale Approvals** | Commits merged after approval became stale (force-push after review) |
-| **Post-Merge Concerns** | PRs where a reviewer flipped to CHANGES_REQUESTED / DISMISSED after merge |
-| **Clean Reverts** | Bot auto-reverts and diff-verified manual reverts — triage separately from novel code |
+| **README** | Legend for rule codes (R1..R8), cell-outcome values, and the report period |
+| **Action Queue** | Prioritized non-compliant commits with severity, prescribed action, and a "Resolution" column for auditor notes |
+| **Summary** | Rollup by org/repo -- compliance counts, percentages, waived and per-rule columns |
+| **By Rule** | One row per rule (R1..R8) -- fires, outcomes, top repo / top author |
+| **By Author** | Per-author rollup sorted by non-compliant count |
+| **Decision Matrix** | One row per commit, one color-coded column per rule (pass / fail / skip / n/a / missing / waived) -- autofilter for per-rule drill-downs |
+| **Waivers Log** | One row per waiver (exempt-author / empty-commit / clean-revert / clean-merge / bot) with the evidence behind it |
 | **Multiple PRs** | Commits associated with more than one PR (one row per commit-PR pair) |
 
 ## Architecture
@@ -381,3 +385,5 @@ level=INFO msg=telemetry elapsed=30s commits_synced=244 commits_audited=54 \
 --db        DuckDB database path (default: ~/.local/share/gh-audit/audit.db)
 --verbose   Enable debug logging
 ```
+
+`sync --since`/`--until` accept ISO 8601 dates; `--until` must not be before `--since`, and `--org` cannot be combined with `--repo` (the `--repo` values already pin their orgs). SIGINT/SIGTERM cancel in-flight work cooperatively — DB writes finish or roll back instead of being killed mid-merge; a second signal hard-kills.

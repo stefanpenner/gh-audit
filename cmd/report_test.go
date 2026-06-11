@@ -40,9 +40,9 @@ func TestParseRepoFlag(t *testing.T) {
 			wantOpts: report.ReportOpts{Org: "nodejs"},
 		},
 		{
-			name:  "org/repo does not override explicit --org",
-			repos: []string{"nodejs/node"},
-			orgArg:  "other-org",
+			name:   "org/repo does not override explicit --org",
+			repos:  []string{"nodejs/node"},
+			orgArg: "other-org",
 			wantOpts: report.ReportOpts{
 				Org:   "other-org",
 				Repos: []report.RepoFilter{{Org: "nodejs", Repo: "node"}},

@@ -68,13 +68,13 @@ type SummaryRow struct {
 
 // ByAuthorRow is a per-author rollup used by the "By Author" sheet.
 type ByAuthorRow struct {
-	Author                string  `json:"author"`
-	Commits               int     `json:"commits"`
-	NonCompliant          int     `json:"non_compliant"`
-	SelfApproved          int     `json:"self_approved"`
-	StaleApproval         int     `json:"stale_approval"`
-	PostMergeConcern      int     `json:"post_merge_concern"`
-	CompliancePct         float64 `json:"compliance_pct"`
+	Author           string  `json:"author"`
+	Commits          int     `json:"commits"`
+	NonCompliant     int     `json:"non_compliant"`
+	SelfApproved     int     `json:"self_approved"`
+	StaleApproval    int     `json:"stale_approval"`
+	PostMergeConcern int     `json:"post_merge_concern"`
+	CompliancePct    float64 `json:"compliance_pct"`
 }
 
 // An OtherPR is a PR associated with a commit other than the audited one.
@@ -86,46 +86,46 @@ type OtherPR struct {
 
 // DetailRow is a single commit's audit detail.
 type DetailRow struct {
-	Org                string    `json:"org"`
-	Repo               string    `json:"repo"`
-	SHA                string    `json:"sha"`
-	AuthorLogin        string    `json:"author_login"`
-	CommitterLogin     string    `json:"committer_login"`
-	CommittedAt        time.Time `json:"committed_at"`
-	Message            string    `json:"message"`
-	IsBot              bool      `json:"is_bot"`
-	IsExemptAuthor     bool      `json:"is_exempt_author"`
-	IsEmptyCommit      bool      `json:"is_empty_commit"`
-	IsSelfApproved     bool      `json:"is_self_approved"`
-	HasStaleApproval   bool      `json:"has_stale_approval"`
-	HasPostMergeConcern bool     `json:"has_post_merge_concern"`
-	IsCleanRevert      bool      `json:"is_clean_revert"`
-	RevertVerification string    `json:"revert_verification"`
-	RevertedSHA        string    `json:"reverted_sha"`
-	IsCleanMerge       bool      `json:"is_clean_merge"`
-	MergeVerification  string    `json:"merge_verification"`
-	HasPR              bool      `json:"has_pr"`
-	PRNumber           int       `json:"pr_number"`
-	PRCount            int       `json:"pr_count"`
-	PRHref             string    `json:"pr_href"`
+	Org                 string    `json:"org"`
+	Repo                string    `json:"repo"`
+	SHA                 string    `json:"sha"`
+	AuthorLogin         string    `json:"author_login"`
+	CommitterLogin      string    `json:"committer_login"`
+	CommittedAt         time.Time `json:"committed_at"`
+	Message             string    `json:"message"`
+	IsBot               bool      `json:"is_bot"`
+	IsExemptAuthor      bool      `json:"is_exempt_author"`
+	IsEmptyCommit       bool      `json:"is_empty_commit"`
+	IsSelfApproved      bool      `json:"is_self_approved"`
+	HasStaleApproval    bool      `json:"has_stale_approval"`
+	HasPostMergeConcern bool      `json:"has_post_merge_concern"`
+	IsCleanRevert       bool      `json:"is_clean_revert"`
+	RevertVerification  string    `json:"revert_verification"`
+	RevertedSHA         string    `json:"reverted_sha"`
+	IsCleanMerge        bool      `json:"is_clean_merge"`
+	MergeVerification   string    `json:"merge_verification"`
+	HasPR               bool      `json:"has_pr"`
+	PRNumber            int       `json:"pr_number"`
+	PRCount             int       `json:"pr_count"`
+	PRHref              string    `json:"pr_href"`
 	// OtherPRs lists PRs associated with the same commit other than the
 	// audited PRNumber. Empty for commits with a single PR, populated when
 	// PRCount > 1.
-	OtherPRs           []OtherPR `json:"other_prs,omitempty"`
-	MergedByLogin      string    `json:"merged_by_login"`
-	HasFinalApproval   bool      `json:"has_final_approval"`
-	ApproverLogins     string    `json:"approver_logins"`
-	OwnerApprovalCheck string    `json:"owner_approval_check"`
-	IsCompliant        bool      `json:"is_compliant"`
-	Reasons            string    `json:"reasons"`
-	MergeStrategy         string `json:"merge_strategy"`
-	PRCommitAuthorLogins  string `json:"pr_commit_author_logins"`
-	CommitHref            string `json:"commit_href"`
-	BranchName         string    `json:"branch_name"`
+	OtherPRs             []OtherPR `json:"other_prs,omitempty"`
+	MergedByLogin        string    `json:"merged_by_login"`
+	HasFinalApproval     bool      `json:"has_final_approval"`
+	ApproverLogins       string    `json:"approver_logins"`
+	OwnerApprovalCheck   string    `json:"owner_approval_check"`
+	IsCompliant          bool      `json:"is_compliant"`
+	Reasons              string    `json:"reasons"`
+	MergeStrategy        string    `json:"merge_strategy"`
+	PRCommitAuthorLogins string    `json:"pr_commit_author_logins"`
+	CommitHref           string    `json:"commit_href"`
+	BranchName           string    `json:"branch_name"`
 	// Annotations is the comma-joined informational tags (automation
 	// markers, etc.). Non-compliance-bearing; reviewers filter by prefix
 	// like "automation:". See internal/sync/annotations.go.
-	Annotations        string    `json:"annotations"`
+	Annotations string `json:"annotations"`
 }
 
 // New creates a new Reporter scoped to the default audit branches
@@ -241,20 +241,29 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 			COUNT(*) FILTER (WHERE COALESCE(a.is_clean_revert, false) = true) AS clean_revert_count,
 			COUNT(*) FILTER (WHERE COALESCE(a.is_clean_merge, false) = true) AS clean_merge_count,
 			COUNT(*) FILTER (WHERE COALESCE(a.pr_count, 0) > 1) AS multiple_pr_count,
-			COUNT(*) FILTER (WHERE a.is_compliant = false
-			                   AND COALESCE(a.is_exempt_author, false) = false
-			                   AND a.is_empty_commit = false
-			                   AND COALESCE(a.is_clean_revert, false) = false) AS action_queue_count,
-			COUNT(*) FILTER (WHERE COALESCE(a.is_exempt_author, false) = true
-			                    OR a.is_empty_commit = true
-			                    OR COALESCE(a.is_clean_revert, false) = true
-			                    OR COALESCE(a.is_clean_merge, false) = true) AS waived_count,
+			-- The verdict alone decides the queue: every granted waiver is
+			-- already folded into is_compliant=true. Excluding flag-bearers
+			-- (is_exempt_author) used to hide non-compliant bot squashes
+			-- carrying unreviewed human code, where the flag is visibility-only.
+			COUNT(*) FILTER (WHERE a.is_compliant = false) AS action_queue_count,
+			-- Tags only count as waivers when the stored verdict is
+			-- compliant: the tool actually didn't flag the commit. The
+			-- is_exempt_author flag without a compliant verdict is the
+			-- voided-carve-out case, not a waiver.
+			COUNT(*) FILTER (WHERE a.is_compliant = true
+			                   AND ((COALESCE(a.is_exempt_author, false) = true
+			                         AND COALESCE(array_to_string(a.reasons, '; '), '') = 'exempt: configured author')
+			                     OR a.is_empty_commit = true
+			                     OR COALESCE(a.is_clean_revert, false) = true
+			                     OR COALESCE(a.is_clean_merge, false) = true)) AS waived_count,
 			COUNT(*) FILTER (WHERE a.has_pr = false
 			                   AND a.is_empty_commit = false
-			                   AND COALESCE(a.is_exempt_author, false) = false) AS r3_no_pr_count,
+			                   AND NOT (a.is_compliant = true AND COALESCE(a.is_exempt_author, false) = true)) AS r3_no_pr_count,
+			-- Matches DeriveRuleOutcomes: R4 fails for every PR without a
+			-- final approval, including self-approved ones, so Summary,
+			-- By Rule, and Decision Matrix agree.
 			COUNT(*) FILTER (WHERE a.has_pr = true
-			                   AND a.has_final_approval = false
-			                   AND COALESCE(a.is_self_approved, false) = false) AS r4_no_final_count,
+			                   AND a.has_final_approval = false) AS r4_no_final_count,
 			COUNT(*) FILTER (WHERE a.owner_approval_check IN ('failure', 'missing')) AS r6_owner_fail_count
 		FROM audit_results a
 		JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
@@ -292,6 +301,11 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 		}
 		if s.TotalCommits > 0 {
 			s.CompliancePct = math.Round(float64(s.CompliantCount)/float64(s.TotalCommits)*1000.0) / 10.0
+			// Rounding must never paint a false 100% — cap when any
+			// commit failed.
+			if s.NonCompliantCount > 0 && s.CompliancePct >= 100 {
+				s.CompliancePct = 99.9
+			}
 		}
 		result = append(result, s)
 	}
@@ -307,7 +321,7 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			a.sha,
 			COALESCE(c.author_login, ''),
 			COALESCE(c.committer_login, ''),
-			COALESCE(c.committed_at, '1970-01-01'::TIMESTAMP),
+			c.committed_at,
 			COALESCE(c.message, ''),
 			a.is_bot,
 			COALESCE(a.is_exempt_author, false),
@@ -347,9 +361,13 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 		JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
 		LEFT JOIN pull_requests p ON a.org = p.org AND a.repo = p.repo AND a.pr_number = p.number
 		LEFT JOIN (
-			SELECT DISTINCT ON (org, repo, sha) org, repo, sha, branch
+			-- min(branch) keeps the Branch column deterministic when a commit
+			-- sits on several matching branches (DISTINCT ON without ORDER BY
+			-- picks an arbitrary row).
+			SELECT org, repo, sha, min(branch) AS branch
 			FROM commit_branches
 			WHERE regexp_matches(branch, ?)
+			GROUP BY org, repo, sha
 		) cb ON a.org = cb.org AND a.repo = cb.repo AND a.sha = cb.sha
 		WHERE 1=1
 	` + defaultBranchExists + `
@@ -371,7 +389,9 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 		query += " AND a.is_compliant = false"
 	}
 
-	query += " ORDER BY c.committed_at DESC"
+	// SHA as the final sort key keeps output stable when commits share a
+	// timestamp.
+	query += " ORDER BY c.committed_at DESC, a.sha"
 
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -382,9 +402,10 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 	var result []DetailRow
 	for rows.Next() {
 		var d DetailRow
+		var committedAt sql.NullTime
 		var otherPRsStr string
 		if err := rows.Scan(
-			&d.Org, &d.Repo, &d.SHA, &d.AuthorLogin, &d.CommitterLogin, &d.CommittedAt,
+			&d.Org, &d.Repo, &d.SHA, &d.AuthorLogin, &d.CommitterLogin, &committedAt,
 			&d.Message, &d.IsBot, &d.IsExemptAuthor, &d.IsEmptyCommit, &d.IsSelfApproved,
 			&d.HasStaleApproval, &d.HasPostMergeConcern,
 			&d.IsCleanRevert, &d.RevertVerification, &d.RevertedSHA,
@@ -396,6 +417,9 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 			&otherPRsStr,
 		); err != nil {
 			return nil, fmt.Errorf("scan detail: %w", err)
+		}
+		if committedAt.Valid {
+			d.CommittedAt = committedAt.Time
 		}
 		d.OtherPRs = parseOtherPRs(otherPRsStr)
 		result = append(result, d)
@@ -432,7 +456,7 @@ func (r *Reporter) FormatTable(w io.Writer, summary []SummaryRow, details []Deta
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%v\t%s\n",
 			d.Org, d.Repo, sha, d.AuthorLogin, mergedBy,
-			d.CommittedAt.Format("2006-01-02 15:04"), d.IsCompliant, d.Reasons)
+			formatTimestamp(d.CommittedAt, "2006-01-02 15:04"), d.IsCompliant, d.Reasons)
 	}
 
 	return tw.Flush()
@@ -459,20 +483,23 @@ func (r *Reporter) FormatCSV(w io.Writer, details []DetailRow) error {
 	}
 
 	for _, d := range details {
+		// Free-text fields (logins, branch names, messages, reasons) are
+		// attacker-influenced and must be escaped against spreadsheet
+		// formula injection. Enum and URL fields are written raw.
 		record := []string{
 			d.Org, d.Repo, d.SHA,
 			fmt.Sprintf("%d", d.PRNumber), d.PRHref,
-			d.AuthorLogin, d.CommitterLogin, d.MergedByLogin, d.ApproverLogins,
+			sanitizeCSVField(d.AuthorLogin), sanitizeCSVField(d.CommitterLogin), sanitizeCSVField(d.MergedByLogin), sanitizeCSVField(d.ApproverLogins),
 			fmt.Sprintf("%v", d.HasFinalApproval),
 			fmt.Sprintf("%v", d.IsSelfApproved),
 			d.OwnerApprovalCheck,
 			fmt.Sprintf("%v", d.IsCompliant),
-			d.Reasons,
+			sanitizeCSVField(d.Reasons),
 			d.MergeStrategy,
-			d.PRCommitAuthorLogins,
-			d.CommittedAt.Format("2006-01-02 15:04:05"),
-			d.BranchName,
-			d.Message,
+			sanitizeCSVField(d.PRCommitAuthorLogins),
+			formatTimestamp(d.CommittedAt, "2006-01-02 15:04:05"),
+			sanitizeCSVField(d.BranchName),
+			sanitizeCSVField(d.Message),
 			fmt.Sprintf("%v", d.IsBot),
 			fmt.Sprintf("%v", d.IsEmptyCommit),
 			fmt.Sprintf("%v", !d.HasPR),
@@ -500,7 +527,7 @@ func (r *Reporter) FormatCSV(w io.Writer, details []DetailRow) error {
 func (r *Reporter) FormatJSON(w io.Writer, summary []SummaryRow, details []DetailRow) error {
 	output := struct {
 		Summary []SummaryRow `json:"summary"`
-		Details []DetailRow `json:"details"`
+		Details []DetailRow  `json:"details"`
 	}{
 		Summary: summary,
 		Details: details,
@@ -519,20 +546,20 @@ func (r *Reporter) FormatJSON(w io.Writer, summary []SummaryRow, details []Detai
 
 // MultiplePRRow represents one PR associated with a commit that has multiple PRs.
 type MultiplePRRow struct {
-	Org            string    `json:"org"`
-	Repo           string    `json:"repo"`
-	SHA            string    `json:"sha"`
-	AuthorLogin    string    `json:"author_login"`
-	CommittedAt    time.Time `json:"committed_at"`
-	Message        string    `json:"message"`
-	CommitHref     string    `json:"commit_href"`
-	PRCount        int       `json:"pr_count"`
-	PRNumber       int       `json:"pr_number"`
-	PRTitle        string    `json:"pr_title"`
-	PRAuthorLogin  string    `json:"pr_author_login"`
-	PRMergedBy     string    `json:"pr_merged_by"`
-	PRHref         string    `json:"pr_href"`
-	IsAuditedPR    bool      `json:"is_audited_pr"`
+	Org           string    `json:"org"`
+	Repo          string    `json:"repo"`
+	SHA           string    `json:"sha"`
+	AuthorLogin   string    `json:"author_login"`
+	CommittedAt   time.Time `json:"committed_at"`
+	Message       string    `json:"message"`
+	CommitHref    string    `json:"commit_href"`
+	PRCount       int       `json:"pr_count"`
+	PRNumber      int       `json:"pr_number"`
+	PRTitle       string    `json:"pr_title"`
+	PRAuthorLogin string    `json:"pr_author_login"`
+	PRMergedBy    string    `json:"pr_merged_by"`
+	PRHref        string    `json:"pr_href"`
+	IsAuditedPR   bool      `json:"is_audited_pr"`
 }
 
 // GetMultiplePRDetails returns one row per commit-PR pair for commits with >1 associated PR.
@@ -541,7 +568,7 @@ func (r *Reporter) GetMultiplePRDetails(ctx context.Context, opts ReportOpts) ([
 		SELECT
 			a.org, a.repo, a.sha,
 			COALESCE(c.author_login, ''),
-			COALESCE(c.committed_at, '1970-01-01'::TIMESTAMP),
+			c.committed_at,
 			COALESCE(c.message, ''),
 			COALESCE(a.commit_href, ''),
 			COALESCE(a.pr_count, 0),
@@ -581,14 +608,18 @@ func (r *Reporter) GetMultiplePRDetails(ctx context.Context, opts ReportOpts) ([
 	var result []MultiplePRRow
 	for rows.Next() {
 		var m MultiplePRRow
+		var committedAt sql.NullTime
 		var auditedPRNumber int
 		var assocPRNumber int
 		if err := rows.Scan(
-			&m.Org, &m.Repo, &m.SHA, &m.AuthorLogin, &m.CommittedAt,
+			&m.Org, &m.Repo, &m.SHA, &m.AuthorLogin, &committedAt,
 			&m.Message, &m.CommitHref, &m.PRCount, &auditedPRNumber,
 			&assocPRNumber, &m.PRTitle, &m.PRAuthorLogin, &m.PRMergedBy, &m.PRHref,
 		); err != nil {
 			return nil, fmt.Errorf("scan multiple PR row: %w", err)
+		}
+		if committedAt.Valid {
+			m.CommittedAt = committedAt.Time
 		}
 		m.PRNumber = assocPRNumber
 		m.IsAuditedPR = assocPRNumber == auditedPRNumber
@@ -667,6 +698,32 @@ func (r *Reporter) GetByAuthor(ctx context.Context, opts ReportOpts) ([]ByAuthor
 		result = append(result, b)
 	}
 	return result, rows.Err()
+}
+
+// sanitizeCSVField prevents spreadsheet formula injection when the CSV is
+// opened in Excel/LibreOffice by prefixing dangerous values with a single
+// quote, which forces the cell to be treated as text. Tab and carriage
+// return are included because importers strip leading whitespace before
+// interpreting the first character. xlsx cells don't need this: excelize
+// writes strings as string cells, which are never evaluated as formulas.
+func sanitizeCSVField(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + s
+	}
+	return s
+}
+
+// formatTimestamp renders t with the given layout, or "" when t is zero
+// (SQL NULL committed_at) so reports show a blank instead of an epoch date.
+func formatTimestamp(t time.Time, layout string) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(layout)
 }
 
 // truncate shortens a string to maxLen runes, adding "..." if truncated.

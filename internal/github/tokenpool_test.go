@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,13 @@ import (
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+}
+
+// instantSleep is an injected backoff that returns immediately (still
+// honouring an already-cancelled context) so retry tests don't wait on
+// wall-clock time.
+func instantSleep(ctx context.Context, _ time.Duration) error {
+	return ctx.Err()
 }
 
 func TestTokenPool_Pick(t *testing.T) {
@@ -230,6 +238,7 @@ func TestRateLimitTransport_Handles429(t *testing.T) {
 		base:   http.DefaultTransport,
 		token:  token,
 		logger: testLogger(),
+		sleep:  instantSleep,
 	}
 
 	client := &http.Client{Transport: transport}
@@ -239,6 +248,8 @@ func TestRateLimitTransport_Handles429(t *testing.T) {
 
 	assert.Equal(t, 200, resp.StatusCode)
 	assert.Equal(t, 2, callCount)
+	assert.Equal(t, int64(4999), token.rateRemaining.Load(),
+		"rate-limit headers from the post-429 retry response must be applied")
 }
 
 func TestAddPATToken(t *testing.T) {
@@ -357,12 +368,302 @@ func TestSecondaryRateLimitExhaustedAllTokens(t *testing.T) {
 	client, err := pool.Pick(context.Background(), "", "")
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// The cooldowns set by the abuse responses are far in the future; the
+	// deadline only needs to be long enough for the reassign loop to park in
+	// Pick's wait, not for any real backoff to elapse.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "GET", srv.URL, nil)
 	_, err = client.Do(req)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "rate limit", "expected rate-limit error, got: %v", err)
+}
+
+func TestTokenPool_Pick_PicksTokenWithNegativeScore(t *testing.T) {
+	// A token whose inFlight exceeds its remaining quota scores below the
+	// old bestScore sentinel (-1). It is still eligible (above the
+	// rate-limit threshold, no cooldown) and MUST be pickable — otherwise
+	// Pick busy-spins at 100% CPU with no token recorded in earliestReset.
+	pool := NewTokenPool(testLogger())
+	pool.AddPATToken("busy", "token-busy", []OrgScope{{Org: "myorg"}})
+	pool.tokens[0].rateRemaining.Store(200) // above rateLimitThreshold → eligible
+	pool.tokens[0].inFlight.Store(500)      // score = -300
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	client, err := pool.Pick(ctx, "myorg", "repo")
+	require.NoError(t, err)
+	require.NotNil(t, client)
+	transport := client.Transport.(*rateLimitTransport)
+	assert.Equal(t, "busy", transport.token.ID)
+}
+
+func TestMarkSecondaryRateLimit_IgnoresStalePrimaryReset(t *testing.T) {
+	// The cooldown clamp must not use a PAST primary-reset timestamp: a
+	// stale rateResetAt would zero out the abuse cooldown entirely.
+	token := &ManagedToken{ID: "stale"}
+	token.rateRemaining.Store(5000)
+	token.rateResetAt.Store(time.Now().Add(-time.Hour).Unix())
+
+	tr := &rateLimitTransport{
+		token:  token,
+		logger: testLogger(),
+		sleep:  instantSleep,
+	}
+
+	_, err := tr.markSecondaryRateLimit("", "secondary rate limit")
+	require.Error(t, err)
+	var sec *SecondaryRateLimitError
+	require.ErrorAs(t, err, &sec)
+
+	assert.Greater(t, token.abuseCooldownUntil.Load(), time.Now().Unix(),
+		"cooldown must not be clamped to a stale past reset time")
+}
+
+func TestMarkSecondaryRateLimit_ClampsToFuturePrimaryReset(t *testing.T) {
+	// A FUTURE primary reset earlier than the computed cooldown still
+	// clamps — the hourly refill clears abuse state anyway.
+	resetAt := time.Now().Add(30 * time.Second).Unix()
+	token := &ManagedToken{ID: "fresh"}
+	token.rateResetAt.Store(resetAt)
+
+	tr := &rateLimitTransport{
+		token:  token,
+		logger: testLogger(),
+		sleep:  instantSleep,
+	}
+
+	_, err := tr.markSecondaryRateLimit("", "secondary rate limit")
+	require.Error(t, err)
+	assert.Equal(t, resetAt, token.abuseCooldownUntil.Load(),
+		"cooldown should clamp to the future primary reset")
+}
+
+func TestRateLimitTransport_429SecondaryBodyCoolsDownToken(t *testing.T) {
+	// GitHub serves secondary rate limits as 429 too. A 429 whose body
+	// indicates abuse must go through markSecondaryRateLimit (cooldown +
+	// classified error) rather than the plain sleep-and-retry path.
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(429)
+		fmt.Fprint(w, `{"message": "You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}`)
+	}))
+	defer srv.Close()
+
+	token := &ManagedToken{ID: "test"}
+	token.rateRemaining.Store(5000)
+
+	transport := &rateLimitTransport{
+		base:   http.DefaultTransport,
+		token:  token,
+		logger: testLogger(),
+		sleep:  instantSleep,
+	}
+
+	client := &http.Client{Transport: transport}
+	_, err := client.Get(srv.URL)
+	require.Error(t, err)
+	var sec *SecondaryRateLimitError
+	require.ErrorAs(t, err, &sec)
+
+	assert.Equal(t, 1, callCount, "secondary 429 must not be retried on the same token")
+	assert.Greater(t, token.abuseCooldownUntil.Load(), time.Now().Unix(),
+		"token must be cooling down after a secondary 429")
+}
+
+func TestRateLimitTransport_429StillThrottledAfterRetry(t *testing.T) {
+	// A plain 429 gets one retry; if the retry is still 429 the transport
+	// must classify it as a secondary rate limit instead of handing the raw
+	// 429 back to the caller.
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(429)
+	}))
+	defer srv.Close()
+
+	token := &ManagedToken{ID: "test"}
+	token.rateRemaining.Store(5000)
+
+	transport := &rateLimitTransport{
+		base:   http.DefaultTransport,
+		token:  token,
+		logger: testLogger(),
+		sleep:  instantSleep,
+	}
+
+	client := &http.Client{Transport: transport}
+	_, err := client.Get(srv.URL)
+	require.Error(t, err)
+	var sec *SecondaryRateLimitError
+	require.ErrorAs(t, err, &sec)
+
+	assert.Equal(t, 2, callCount, "exactly one retry before classifying")
+	assert.Greater(t, token.abuseCooldownUntil.Load(), time.Now().Unix(),
+		"token must be cooling down after a second consecutive 429")
+}
+
+func TestRateLimitTransport_429SecondaryReassignsToken(t *testing.T) {
+	// With a pool attached, a secondary 429 should cool down the first
+	// token and transparently re-pick a healthy one.
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(429)
+			fmt.Fprint(w, `{"message": "You have exceeded a secondary rate limit"}`)
+			return
+		}
+		w.Header().Set("x-ratelimit-remaining", "4999")
+		w.WriteHeader(200)
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	pool := NewTokenPool(testLogger())
+	pool.AddPATToken("t1", "token1", nil)
+	pool.AddPATToken("t2", "token2", nil)
+
+	client, err := pool.Pick(context.Background(), "", "")
+	require.NoError(t, err)
+
+	resp, err := client.Get(srv.URL)
+	require.NoError(t, err, "expected reassigned token retry to succeed")
+	defer resp.Body.Close()
+	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(t, 2, callCount, "should have reassigned once and succeeded")
+}
+
+func TestRateLimitTransport_Generic403RetryClassified(t *testing.T) {
+	// The one-shot retry after a generic 403 must be re-classified: if the
+	// retry comes back as an abuse 403 the token has to cool down instead
+	// of the raw 403 bypassing the cooldown machinery.
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			w.WriteHeader(403)
+			fmt.Fprint(w, `{"message": "Forbidden"}`)
+			return
+		}
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(403)
+		fmt.Fprint(w, `{"message": "You have triggered an abuse detection mechanism"}`)
+	}))
+	defer srv.Close()
+
+	token := &ManagedToken{ID: "test"}
+	token.rateRemaining.Store(5000)
+
+	transport := &rateLimitTransport{
+		base:   http.DefaultTransport,
+		token:  token,
+		logger: testLogger(),
+		sleep:  instantSleep,
+	}
+
+	client := &http.Client{Transport: transport}
+	_, err := client.Get(srv.URL)
+	require.Error(t, err)
+	var sec *SecondaryRateLimitError
+	require.ErrorAs(t, err, &sec)
+
+	assert.Equal(t, 2, callCount)
+	assert.Greater(t, token.abuseCooldownUntil.Load(), time.Now().Unix(),
+		"token must be cooling down when the 403 retry hits abuse detection")
+}
+
+func TestRateLimitTransport_Generic403RetryStill403ReturnsResponse(t *testing.T) {
+	// A genuinely unclassifiable 403 (e.g. real permission gap) must still
+	// surface as a readable 403 response after the one-shot retry.
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.WriteHeader(403)
+		fmt.Fprint(w, `{"message": "Forbidden"}`)
+	}))
+	defer srv.Close()
+
+	token := &ManagedToken{ID: "test"}
+	token.rateRemaining.Store(5000)
+
+	transport := &rateLimitTransport{
+		base:   http.DefaultTransport,
+		token:  token,
+		logger: testLogger(),
+		sleep:  instantSleep,
+	}
+
+	client := &http.Client{Transport: transport}
+	resp, err := client.Get(srv.URL)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, 403, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "Forbidden", "response body must remain readable")
+	assert.Equal(t, 2, callCount, "exactly one retry for a generic 403")
+}
+
+func TestUpdateRateLimitHeaders_MonotonicGuard(t *testing.T) {
+	mkResp := func(remaining, reset string) *http.Response {
+		h := http.Header{}
+		if remaining != "" {
+			h.Set("x-ratelimit-remaining", remaining)
+		}
+		if reset != "" {
+			h.Set("x-ratelimit-reset", reset)
+		}
+		return &http.Response{Header: h}
+	}
+
+	token := &ManagedToken{ID: "test"}
+	tr := &rateLimitTransport{token: token, logger: testLogger()}
+
+	// Fresh window accepted.
+	tr.updateRateLimitHeaders(mkResp("100", "2000"))
+	assert.Equal(t, int64(100), token.rateRemaining.Load())
+	assert.Equal(t, int64(2000), token.rateResetAt.Load())
+
+	// Same window, HIGHER remaining → out-of-order response, ignored.
+	tr.updateRateLimitHeaders(mkResp("500", "2000"))
+	assert.Equal(t, int64(100), token.rateRemaining.Load(),
+		"out-of-order response must not resurrect remaining quota")
+
+	// Same window, lower remaining → accepted.
+	tr.updateRateLimitHeaders(mkResp("50", "2000"))
+	assert.Equal(t, int64(50), token.rateRemaining.Load())
+
+	// Older window (reset regressed) → stale, ignored entirely.
+	tr.updateRateLimitHeaders(mkResp("5000", "1000"))
+	assert.Equal(t, int64(50), token.rateRemaining.Load(),
+		"stale response from a previous window must be ignored")
+	assert.Equal(t, int64(2000), token.rateResetAt.Load())
+
+	// Newer window → always accepted, even with higher remaining.
+	tr.updateRateLimitHeaders(mkResp("4999", "3000"))
+	assert.Equal(t, int64(4999), token.rateRemaining.Load())
+	assert.Equal(t, int64(3000), token.rateResetAt.Load())
+
+	// No reset header → remaining applied as-is (no window to compare).
+	tr.updateRateLimitHeaders(mkResp("42", ""))
+	assert.Equal(t, int64(42), token.rateRemaining.Load())
+}
+
+func TestParseRetryAfter_HTTPDate(t *testing.T) {
+	future := time.Now().Add(90 * time.Second).UTC().Format(http.TimeFormat)
+	d := parseRetryAfter(future)
+	assert.InDelta(t, 90, d.Seconds(), 3, "HTTP-date Retry-After should yield the delta to that time")
+
+	past := time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat)
+	assert.Equal(t, time.Duration(0), parseRetryAfter(past), "past HTTP-date clamps to zero")
+
+	assert.Equal(t, 60*time.Second, parseRetryAfter("not a date"), "garbage still falls back to 60s")
 }
 
 func TestParseOrgRepoFromPath(t *testing.T) {

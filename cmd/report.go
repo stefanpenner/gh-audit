@@ -26,9 +26,12 @@ func newReportCmd() *cobra.Command {
 		Use:   "report",
 		Short: "Generate audit reports",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg := loadConfigOrDefault(cfgFile)
+			cfg, err := loadConfigOrDefault(cfgFile, cmd.Flag("config").Changed)
+			if err != nil {
+				return err
+			}
 
-			dbConn, err := db.Open(resolveDBPath(cfg))
+			dbConn, err := db.Open(resolveDBPath(cfg, cmd.Flag("db").Changed))
 			if err != nil {
 				return fmt.Errorf("opening database: %w", err)
 			}
@@ -75,6 +78,13 @@ func newReportCmd() *cobra.Command {
 			case "xlsx":
 				if output == "" {
 					return fmt.Errorf("--output is required for xlsx format")
+				}
+				// The workbook's sheets cross-reference each other (README
+				// at-a-glance stats vs Summary vs Decision Matrix); filtering
+				// details to failures only while summaries stay unfiltered
+				// produces a self-contradicting workbook.
+				if onlyFailures {
+					return fmt.Errorf("--only-failures is not supported with --format xlsx: the workbook's summary sheets would disagree with its filtered detail sheets (use table/csv/json, or filter in Excel)")
 				}
 				return r.GenerateXLSX(cmd.Context(), opts, output)
 

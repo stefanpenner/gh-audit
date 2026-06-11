@@ -10,6 +10,8 @@ If the commit author matches an entry in `exemptions.authors`, the commit is **c
 
 The match prefers the **numeric account id** (`commit.author_id` against `ExemptAuthor.id`) — GitHub-controlled, immutable, never reused, and not forgeable client-side.
 
+The PR-branch contributor check (`hasNonExemptPRContributors`) ignores a non-exempt author's branch commit only when it is **verifiably empty** — zero lines AND zero files touched: `/pulls/{n}/commits` omits diff stats, so emptiness is confirmed via a lazy `GetCommitDetail` (`StatsTriggerExemption`), which also persists the result with a `detail_fetched_at` marker (`MarkCommitDetail`). A row carrying that marker answers offline re-audits with the same verified facts, so sync-time and re-audit verdicts agree. Unverifiable emptiness — no marker, nil stats fetcher, or a fetch error — **fails closed** and voids the carve-out; trusting locally-zero stats would skip every branch commit and waive unreviewed human code.
+
 For service accounts whose git-author email isn't bound to a GitHub account (so `commit.author_id` arrives as 0), the rule falls back to matching `commit.author_email` against the exempt entry's curated `verified_emails` list. This covers internal service accounts that push commits with a generic email GitHub doesn't recognize. The email path is forgeable in isolation, so when the audited commit is a squash-merge, **every** PR-branch commit must independently pass the same id-or-email check (`hasNonExemptPRContributors`); a single human contributor in the squash voids the carve-out. The combination "operator-vetted email list + every contributor passes" recovers the same trust property id-only matching provides.
 
 ```
@@ -36,9 +38,11 @@ EvaluateCommit (audit.go)
 
 ### 2. Empty commit
 
-If `additions == 0 && deletions == 0`, the commit is **compliant** (flagged for visibility, no review required).
+If the commit verifiably changes nothing — zero added lines, zero deleted lines, AND zero files touched — it is **compliant** (flagged for visibility, no review required). The file-count condition matters: GitHub reports `0/0` line stats for pure renames and mode-only changes, and a commit that swaps `auth_enabled.go` for `auth_disabled.go` is not a no-op.
 
 `applyEmptyCommitFallback` (`audit.go`) runs lazily — only on paths heading to non-compliant: once when there's no PR, and again after all PRs fail. Already-compliant commits skip the `GetCommitDetail` REST call entirely.
+
+A stats-fetch **error fails closed**: the waiver does not fire and the commit keeps its non-compliant verdict (recoverable via re-audit). Treating unresolved zero stats as "empty" would convert a transient API blip into a permanent compliant row. Offline re-audit (nil fetcher) keeps the legacy "stored zero stats → empty" reading for rows that were never detail-fetched; rows verified at sync time carry their file count (`files_changed` + `detail_fetched_at`), so verified rename-only commits stay blocked offline too.
 
 ```
 GET /repos/{o}/{r}/commits/{sha}
@@ -46,7 +50,7 @@ GET /repos/{o}/{r}/commits/{sha}
       │
       ▼
 EvaluateCommit (audit.go)
-      → additions == 0 && deletions == 0?
+      → additions == 0 && deletions == 0 && files_changed == 0?
           yes → IsCompliant=true, IsEmptyCommit=true, reason="empty commit"
           no  → continue to rule 3
 ```
@@ -130,13 +134,14 @@ Any APPROVED (non-self)?     yes → HasStaleApproval=true
 
 CI tooling at many orgs auto-merges the base branch (e.g. `master`) into open PR branches to keep them current, or applies routine post-approval automation (dependency bumps, autoformatting, sync merges). Each such commit moves the PR's head SHA without adding human-authored code that needs review — and naïvely fires §4 stale-approval against any PR whose reviewer approved before the bot ran.
 
-The carve-out — implemented as `isApprovalRefreshable` in `internal/sync/audit.go` — promotes such an approval to `approvalOnFinal` when **every** PR-branch commit committed strictly after the approval's `submitted_at` is **authored by an account on the configured exempt list (matched by numeric ID)**.
+The carve-out — implemented as `isApprovalRefreshable` in `internal/sync/audit.go` — promotes such an approval to `approvalOnFinal` when **every** PR-branch commit committed strictly after the approval's `submitted_at` passes the **same `isExemptCommit` check §1 uses** (numeric ID match, with the operator-curated `verified_emails` fallback when the ID is unresolved). The PR's own `merge_commit_sha` is skipped before the check — `commit_prs ⨝ commits` links the squash-merge commit on master into the per-PR list, and a human-authored squash commit (the normal case) would otherwise always void the carve-out.
 
 The exempt-author ID is the unforgeable trust boundary. GitHub binds `AuthorID` to a verified email account; the exempt list contains the curated set of bot/service-account IDs the operator has already vetted as not requiring human review (the same list that drives §1). A local actor cannot make a commit appear to be authored by another account's verified ID without compromising that account. If §1 trusts these accounts to ship without human review, §4 trusts their post-approval commits not to invalidate the reviewer's approval coverage.
 
 If any post-approval commit is by a non-exempt account, the original §4 stale-approval verdict stands. The carve-out never weakens compliance for cases where real human-authored code shipped after the approval.
 
-### 
+### 5. No self-approval
+
 A review is self-approval if the reviewer's **immutable numeric GitHub ID** matches any of:
 - PR author (`AuthorID`)
 - Commit author (`AuthorID`) — skipped for `CleanMerge` commits (see below)
@@ -176,6 +181,8 @@ All approvals are self (or ReviewerID==0)?
 
 Configured checks (e.g. `Owner Approval`) must appear on the PR's head SHA with the expected conclusion. Missing or failed checks make the commit **non-compliant**.
 
+The same check name can appear multiple times on one SHA (re-runs mint new check-run ids; the DB accumulates them across syncs). Only the **latest** same-named run counts — selected by `completed_at` with `check_run_id` as tiebreak — mirroring GitHub's "latest run wins" UI semantics.
+
 ```
 config.yaml: audit_rules.required_checks   ← SOT: user-configured list
       │
@@ -185,7 +192,7 @@ GET /repos/{o}/{r}/commits/{head_sha}/check-runs
       │
       ▼
 evaluateRequiredChecks (audit.go)
-      → for each required check:
+      → for each required check (latest same-named run only):
           found with matching conclusion? → "success"
           found with wrong conclusion?   → "failure"
           not found?                     → "missing"
@@ -206,7 +213,7 @@ If multiple PRs exist for a commit, gh-audit picks the one closest to compliant 
 
 ### 8. Clean-revert waiver (standalone)
 
-If the primary verdict above is **non-compliant**, one last check runs. It is evaluated per-commit — it does not look at the reverted commit's audit verdict (see `TODO.md` for the deferred cross-commit variant).
+If the primary verdict above is **non-compliant**, one last check runs — including on the §3 no-PR path, so a diff-verified clean revert pushed directly to the branch is waived too. It is evaluated per-commit — it does not look at the reverted commit's audit verdict (see `TODO.md` for the deferred cross-commit variant).
 
 A `IsCleanRevert=true` commit is **compliant**. The signal means one of:
 - `AutoRevert` — bot-generated, trusted by construction.
@@ -215,7 +222,7 @@ A `IsCleanRevert=true` commit is **compliant**. The signal means one of:
 Every other revert shape — conflict-resolved (`diff-mismatch`), message-only, revert-of-revert, hand-crafted — falls through to the normal PR-approval rules. Provenance signals like `committer == web-flow` or a verified signature are **not** sufficient on their own: if the diff isn't a pure inverse, there are bytes on master that weren't there before, and those bytes deserve review.
 
 ```
-non-compliant verdict from rules 1–7
+non-compliant verdict from rules 1–7 (incl. "no associated pull request")
       │
       ▼
 IsCleanRevert == true?
@@ -271,19 +278,51 @@ The sync pipeline runs per-repo, per-branch. Repos sync in parallel (bounded by 
 ### Phase 1: Fetch commits
 
 ```
-ListCommits(org, repo, branch, since, until)
+fetchBranchCommits (pipeline.go)
+  ├── graph path:    GetBranchHead + CompareCommits(last_sha...head)
+  └── fallback:      ListCommits(org, repo, branch, since, until)
   │
   ▼
 UpsertCommits ──▶ commits table
 UpsertCommitBranches ──▶ commit_branches table
 ```
 
-The `since` date comes from (in priority order):
+**Graph path (preferred).** The cursor stores the branch tip SHA observed
+at the end of the last sync (`sync_cursors.last_sha`). A cursor-driven
+incremental sync (no explicit `--since`/`--until`) fetches the current tip
+(`GET /branches/{branch}`) and:
+- tip unchanged → zero new commits, one API call (the unaudited mop-up
+  still runs);
+- tip moved → `GET /compare/{last_sha}...{head}` returns exactly the
+  commits reachable from the new tip but not the old one. The comparison
+  is **graph-based**, so commits pushed with backdated
+  `GIT_COMMITTER_DATE` values — invisible to the date-filtered list
+  endpoint — are still ingested. This closes the audit-evasion hole where
+  an attacker hides a direct push by backdating the committer timestamp.
+
+**Date-window fallback.** Used for explicit `--since`/`--until` runs,
+legacy cursors without a SHA, first-time syncs, and when compare can't
+serve the range (base force-pushed away → 404, or the range exceeds the
+compare API's 250-commit ceiling). The `since` date comes from (in
+priority order):
 1. `--since` CLI flag (an ISO 8601 date, or `epoch`/`all`/`beginning` for
    the repo's full history — these map to a 1970-01-01 sentinel that
    predates GitHub, so the REST API returns every commit)
-2. Stored sync cursor for this org/repo/branch
+2. Stored sync cursor date for this org/repo/branch, **minus a 72h
+   overlap** (catches honest stale pushes with older committer dates;
+   upserts are idempotent and already-audited commits skip enrichment)
 3. `initial_lookback_days` config (default 90)
+
+After either path, the cursor records the new tip SHA (on the fallback
+path: the first listed commit — the list endpoint returns newest-first
+from the ref tip) and the newest committer date seen; the date watermark
+never regresses.
+
+A zero-commit fetch window does **not** end the branch sync: the unaudited
+mop-up below still runs, so backlog left by a prior failed run is cleared
+even on dormant branches. Within one repo, branches fetch in parallel but
+the enrich+audit phase is serialized (the unaudited set is repo-scoped;
+parallel branches would duplicate the same work).
 
 **`commit_branches` column provenance:**
 
@@ -296,7 +335,7 @@ The `since` date comes from (in priority order):
 
 ### Phase 2: Enrich
 
-For each unaudited commit (no row in `audit_results`), the enricher calls five REST endpoints:
+For each unaudited commit (no row in `audit_results`), the enricher draws on six REST endpoints (the first is DB-first and usually skipped — see [Caching layer](#caching-layer)):
 
 ```
 commit SHA
@@ -330,11 +369,25 @@ Enrichment goes through `CachingEnricher` (see [Caching layer](#caching-layer)),
 Results are deduplicated by primary key before writing:
 
 ```
-UpsertPullRequests ──▶ pull_requests table
-UpsertReviews ──▶ reviews table
+UpsertReviews ──▶ reviews table              (PENDING drafts filtered out)
 UpsertCheckRuns ──▶ check_runs table
+InsertCommitsIfAbsent ──▶ commits table      (PR-branch commits; never clobbers rich rows)
 UpsertCommitPRs ──▶ commit_prs table
+UpsertPullRequests ──▶ pull_requests table   (LAST — see below)
 ```
+
+Two ordering/merge rules are load-bearing:
+- **PR rows are written last.** The caching layer's merged-PR freeze treats
+  the existence of a merged PR row as proof that its reviews/check-runs/
+  branch commits are fully synced. Writing the PR first opened a crash
+  window in which the PR row committed but its reviews never landed — and
+  every later run skipped the reviews fetch, permanently reporting "no
+  approval on final commit". With the PR last, a crash leaves orphan
+  sub-rows that the next run re-fetches.
+- **PR-branch commits insert-if-absent, never upsert.** `/pulls/{n}/commits`
+  rows lack `author_email`, `href`, `is_verified`, and diff stats; a blind
+  upsert replaced rich phase-1 rows with gutted copies, breaking the §1
+  `verified_emails` fallback and merge classification on later DB reads.
 
 ### Phase 3: Audit
 
@@ -342,16 +395,16 @@ Each unaudited commit is evaluated by `EvaluateCommit()` using the enrichment da
 
 ### Phase 4: Cursor update
 
-The sync cursor is updated to the latest commit date, so the next sync picks up where this one left off.
+The sync cursor records the branch tip SHA (drives the next run's graph compare) and the newest committer date seen (the date-window fallback resume point), so the next sync picks up where this one left off.
 
 ## Database schema
 
-DuckDB with 9 tables:
+DuckDB with 10 tables:
 
 | Table | Primary Key | Purpose |
 |---|---|---|
-| `sync_cursors` | (org, repo, branch) | Incremental sync progress |
-| `commits` | (org, repo, sha) | Git commits from GitHub |
+| `sync_cursors` | (org, repo, branch) | Incremental sync progress (`last_sha` tip for graph compare + `last_date` watermark) |
+| `commits` | (org, repo, sha) | Git commits from GitHub. `files_changed` + `detail_fetched_at` record verified commit detail: NULL `detail_fetched_at` means "never fetched", letting verified-zero stats survive as facts. Stat-less re-ingestion (cursor-overlap re-lists) preserves verified detail via a staging-table pre-merge UPDATE. |
 | `co_authors` | (org, repo, sha, email) | Co-authors parsed from "Co-authored-by:" trailers |
 | `commit_branches` | (org, repo, sha, branch) | Which branches a commit appears on |
 | `commit_prs` | (org, repo, sha, pr_number) | Commit → PR associations |
@@ -359,8 +412,11 @@ DuckDB with 9 tables:
 | `reviews` | (org, repo, pr_number, review_id) | PR reviews with per-reviewer state |
 | `check_runs` | (org, repo, commit_sha, check_run_id) | CI/CD check results |
 | `audit_results` | (org, repo, sha) | Compliance verdicts with reasons |
+| `org_repos_cache` | (org, name) | Memoised `/orgs/{org}/repos` enumeration (freshness-gated) |
 
-Bulk writes use the DuckDB Appender API (staging table → INSERT OR REPLACE). All writes go through a serialized `DBWriter` — DuckDB supports concurrent reads but single-writer.
+Bulk writes use the DuckDB Appender API (staging table → merge). The merge is `INSERT OR REPLACE` on the fast path; when the target row carries non-empty LIST columns DuckDB raises "List Update is not supported" and the merge falls back to DELETE-colliding-rows + INSERT (separate statements — DuckDB's ART index rejects same-key delete+insert within one transaction). Intra-batch duplicates dedupe deterministically last-wins (`ROW_NUMBER … ORDER BY rowid DESC`). All writes go through a serialized `DBWriter` — DuckDB supports concurrent reads but single-writer.
+
+`reviews.state` and `check_runs.status/conclusion` are TEXT, not ENUMs: GitHub returns `PENDING` for the caller's own draft reviews and may add states; one un-castable value used to hard-fail the whole batch. `UpsertReviews` filters `PENDING` (drafts are not audit events); unknown states are stored as-is. Commit read paths scan nullable columns through `sql.Null*` so legacy rows (e.g. NULL `committer_login` predating that column's migration) can't brick reads on upgraded databases.
 
 ## Token pool
 
@@ -393,9 +449,12 @@ Classic PAT: the `repo` scope covers all of the above. Fine-grained PAT or GitHu
 - Tracks `x-ratelimit-remaining` and `x-ratelimit-reset` from response headers
 - Scores each token by `rateRemaining - inFlight` and picks the highest; the in-flight counter prevents concurrent `Pick` calls from herding onto a single token before any response has landed
 - Blocks and waits for reset when all matching tokens are exhausted (threshold: 100 remaining)
-- Retries on 429 (respects `Retry-After`, defaults to 60s)
-- Detects 403 abuse/secondary rate limit responses
-- Disables tokens permanently on 401
+- Retries on 429 (respects `Retry-After`, both delta-seconds and HTTP-date forms, defaults to 60s); a 429 whose body indicates the secondary rate limit cools the token down and re-picks, same as the 403 path
+- Detects 403 abuse/secondary rate limit responses; the generic-403 one-shot retry re-classifies its response so an abuse 403 on retry still cools the token
+- Header updates are monotonic per token (mutex + ignore out-of-order responses) so a stale response can't resurrect an exhausted token; selection tolerates negative scores and honours ctx cancellation instead of busy-spinning
+- A global in-flight cap (counting semaphore, default 300) bounds concurrent HTTP requests across the whole pool so pipeline-level fan-out can't trip GitHub's ~480-concurrent secondary-rate-limit ceiling
+- Repeat secondary-rate-limit trips escalate the token's cooldown (90s → 15m), clamped to the hourly primary reset
+- `MarkDisabled` permanently removes a token from rotation (intended for credential failures such as 401)
 
 ## Caching layer
 
@@ -414,13 +473,15 @@ DB (commits, pull_requests,    ── hit ──▶ APIStats.DBHits++
   │ miss
   ▼
 REST Client ── hit ──▶ per-endpoint APIStats counter
-               (CommitDetail / CommitPRs / PRDetail / Reviews /
-                CheckRuns / PRCommits / RevertVerification)
+               (CommitDetailEager / CommitDetailLazyEmpty / CommitDetailLazySelf /
+                CommitPRs / PRDetail / Reviews / CheckRuns / PRCommits /
+                RevertVerification)
 ```
 
 Key design points:
 - **Reverse PR index.** A PR fetched for commit A may also be the merge PR for commit B. `indexPR` populates a reverse map so B's enrichment finds A's PR work without a second API round-trip.
 - **Lazy commit detail.** `commits` written by phase 1 already carry most of what the audit needs. `GetCommitDetail` is only called when the decision tree actually needs stats (empty-commit fallback) — saving roughly 16% of REST traffic on a typical run.
+- **Merged-PR freeze.** Sub-data of a merged PR already in the DB (reviews, check runs, PR commits) is treated as frozen and never re-fetched. The freeze requires the PR row to actually be merged — rows snapshotted for a non-merged PR are a moment-in-time copy and always refetch, no matter how many rows exist. Two carve-outs: check-run rows are only authoritative when every run is `status=completed` (in-flight runs persisted minutes after a merge would otherwise cache "missing" forever); and the freeze knowingly does not observe post-merge review changes (dismissals) after the first sync — re-sync is required for that. The pipeline writes the PR row last so the freeze can't trust a half-persisted PR.
 - **Fan-out bounds.** `enrichCommitFanout = 10` (per batch) and `enrichPRFanout = 5` (per commit) cap goroutine growth without flooding the token pool.
 - **Revert-verification telemetry.** `GetCommitFiles` calls made to diff-verify manual reverts are tracked separately in `APIStats.RevertVerification`, because they're the most expensive per-commit call and worth monitoring on their own.
 
@@ -434,10 +495,12 @@ Two small classifiers feed the audit tree and the XLSX report.
 |---|---|---|
 | `NotRevert` | Message has no recognised revert prefix | — |
 | `AutoRevert` | `Automatic revert of <new>..<old>` | **Yes** (trusted by construction) |
-| `ManualRevert` | `Revert "..."` with `This reverts commit <sha>.` | **Only if** `IsCleanRevertDiff` confirms the diff is the exact inverse of the reverted commit |
+| `ManualRevert` | `Revert "..."` prefix; the reverted SHA comes from the `This reverts commit <sha>.` trailer, or — for GitHub's "Revert" button, which omits the trailer — from the reverted PR's `merge_commit_sha` via the `revert-<N>-<base-branch>` head-branch convention (`ResolveRevertedSHA`) | **Only if** `IsCleanRevertDiff` confirms the diff is the exact inverse of the reverted commit |
 | `RevertOfRevert` | Revert-of-revert (re-application) | No — treated as fresh code |
 
-`IsCleanRevertDiff` compares file patches as multisets of added/removed lines; order is ignored. A `ManualRevert` with a failing diff check becomes `revert_verification = "diff-mismatch"` (or `"message-only"` when no trailer SHA was found) and does **not** qualify for rule 8's clean-revert waiver — it falls through to the normal PR-approval rules.
+`IsCleanRevertDiff` compares file patches as multisets of added/removed lines; order is ignored. Patch parsing is hunk-aware: `+++ `/`--- ` are only treated as file headers before the first `@@`, so content lines whose text begins with `++` or `--` (C-style increments, diff-in-diff) are compared as real lines instead of being dropped. A `ManualRevert` with a failing diff check becomes `revert_verification = "diff-mismatch"` (or `"message-only"` when no trailer SHA was found) and does **not** qualify for rule 8's clean-revert waiver — it falls through to the normal PR-approval rules.
+
+`GetCommitFiles` paginates the commit's `files[]` to GitHub's 3,000-file ceiling; a commit that hits the ceiling returns `ErrCommitFilesTruncated` and classifies as `message-only` (unverifiable), never `diff-verified` — a truncated comparison could otherwise "verify" a revert that smuggles changes in files past the truncation point.
 
 ### `ClassifyMerge` (`internal/github/merge.go`)
 
@@ -452,7 +515,7 @@ The `CleanMerge` signal is deliberately strict. Message-only matching is forgeab
 
 `is_verified` is read from the GitHub REST API's `commit.verification.verified` field (available on both `GET /commits/{sha}` and `GET /repos/{o}/{r}/commits`). It's persisted in the `commits` table so the enrichment DB-read path preserves it.
 
-These flags drive the **Clean Reverts** and **Clean Merges** XLSX sheets, the rule-8 fallback, and the self-approval CleanMerge exclusion (rule 5). They are **informational for compliance** except when `IsCleanRevert` is true and the reverted commit is itself compliant.
+These flags drive the **Waivers Log** and **Decision Matrix** XLSX sheets, the rule-8 fallback, and the self-approval CleanMerge exclusion (rule 5). They are **informational for compliance** except `IsCleanRevert`, which rule 8 turns into a standalone waiver (the reverted commit's own verdict is not consulted — see `TODO.md` for the stricter cross-commit variant).
 
 ### `classifyMergeStrategy` (`internal/sync/audit.go`)
 
@@ -487,7 +550,7 @@ The `report` command queries `audit_results` joined with `commits` and `pull_req
 
   **Layer 1 — Action**
   1. **README** — legend for rule codes (R1..R8), cell-outcome values, and report period. Static; one-screen orientation for new auditors.
-  2. **Action Queue** — prioritized list of commits requiring action. Rows are non-compliant commits with no waiver (R1 exempt / R2 empty / R8 clean revert). Sorted by severity desc, then repo, then commit date desc. Columns: Priority, Severity (High/Medium/Low), Repo, SHA, PR #, Author, Merged By, Failing Rule, Prescribed Action, Days Since Commit, Resolution, Notes. Severity and action are synthesized by `SynthesizeAction` (`internal/report/rules.go`) from the primary failing rule.
+  2. **Action Queue** — prioritized list of commits requiring action. Rows are non-compliant commits with no waiver (R1 exempt / R2 empty; an R8 clean-revert tag only waives when the pipeline already folded it into a compliant verdict). Sorted by severity desc, then org/repo, then commit date desc. Columns: Priority, Severity (High/Medium/Low), Repo, SHA, PR #, Author, Merged By, Failing Rule, Prescribed Action, Context, Committed, Days Since Commit, Resolution, Notes. Severity and action are synthesized by `SynthesizeAction` (`internal/report/rules.go`) from the primary failing rule; Context is the secondary fact pattern from `SynthesizeContext` (self-merged, merge strategy, failed revert classification, etc.).
 
   **Layer 2 — Overview (filterable totals)**
   3. **Summary** — per-repo rollup with `Total = Compliant + Non-Compliant`. Beyond the primary partition, columns cover waived (R1/R2/R8 + clean-merge), per-rule fire counts (R3 NoPR, R4 NoFinal, R6 OwnerFail), and informational tags (Self-Approved, Stale, Post-Merge, Clean Reverts, Clean Merges, Bots, Exempt, Empty, Multiple PRs). Compliance % is color-coded; a TOTAL row carries SUM/IF formulas.
@@ -496,7 +559,7 @@ The `report` command queries `audit_results` joined with `commits` and `pull_req
 
   **Layer 3 — Trace & Evidence**
   6. **Decision Matrix** — one row per commit, one column per rule. Cells are `pass` / `fail` / `skip` / `n/a` / `missing` / `waived`, color-coded. Freezes first 3 columns (Repo / SHA / PR #) so rule columns scroll horizontally against fixed identity. Autofilter on any rule column produces per-rule drill-downs — replaces the old dedicated Self-Approved / Stale / Post-Merge / Clean Reverts / Clean Merges sheets.
-  7. **Waivers Log** — one row per waiver tag (exempt-author / empty-commit / clean-revert / clean-merge / bot) with the evidence that led the tool to skip full evaluation. Required for defending the report: shows what the tool did NOT flag and why.
+  7. **Waivers Log** — one row per waiver tag (exempt-author / empty-commit / clean-revert / clean-merge / bot) with the evidence that led the tool to skip full evaluation. Clean-revert, clean-merge, and bot rows appear only when the stored verdict is compliant — the log is evidence of what the tool did NOT flag and why, so non-compliant commits never appear here.
   8. **Multiple PRs** — one row per commit-PR pair for commits with `pr_count > 1`.
 
 Rule outcomes in the Decision Matrix are derived by `DeriveRuleOutcomes` (`internal/report/rules.go`) from the stored `audit_results` booleans — no additional SQL runs. The derivation mirrors the decision order in `internal/sync/audit.go` (R1 → R2 → R3 → R4 → R5 → R6 → R7 → R8); any change to the audit logic must be reflected there.
@@ -508,8 +571,8 @@ cmd/
   root.go                    Cobra root + flag wiring
   sync.go                    `sync` — fetch + enrich + audit (the main loop)
   report.go                  `report` — table / csv / json / xlsx output
-  config.go                  `config` — show effective config, list tokens
-  reaudit.go                 `re-audit` — re-evaluate audit_results from DB (no API, single pass)
+  config.go                  `config validate` / `config show` — validate config file, print resolved config
+  reaudit.go                 `re-evaluate-commits` (alias `re-audit`) — re-evaluate audit_results from DB (no API, single pass)
   backfill.go                `backfill-missing-prs` — recover PR attribution for "no associated pull request" rows via time-windowed merge_commit_sha lookup
   annotate_commits.go        `annotate-commits` — recompute informational annotations on every row from commit messages (no API)
 internal/
@@ -544,11 +607,12 @@ internal/
 
 ## Concurrency model
 
-- **Repo sync**: `concurrency` goroutines via `errgroup` (default 32)
+- **Repo sync**: `concurrency` goroutines via `errgroup` (default 32); branches within a repo fetch at the same limit, but each repo's enrich+audit phase is serialized across branches (`auditMu`)
 - **Enrichment**: `enrich_concurrency` batch goroutines per repo (default 16); each batch additionally fans out across commits (≤10) and PRs (≤5)
+- **Audit**: ≤16 concurrent `EvaluateCommit` calls per repo (`auditFanoutLimit`) — keeps the lazy `GetCommitDetail` paths (§2/§5) from serializing
 - **DB writes**: Single `DBWriter` goroutine per pipeline run — all writes serialized through a buffered channel
 - **DB reads**: Safe to run concurrently (DuckDB MVCC)
 
 ## Rate limits
 
-GitHub REST API: 5,000->15,000 requests/hour per token (PAT or App). Cost per commit: ~5 requests (detail + PRs list + PR detail + reviews + check runs). One token audits ~1,000 commits/hour. Multiple tokens multiply throughput linearly — the token pool routes requests to the least-loaded scoped token automatically. See [Token pool](#token-pool) for details.
+GitHub REST API: 5,000->15,000 requests/hour per token (PAT or App). Cost per commit: ~5 requests (PRs list + PR detail + reviews + check runs + PR commits; commit detail is lazy). One token audits ~1,000 commits/hour. Multiple tokens multiply throughput linearly — the token pool routes requests to the least-loaded scoped token automatically. See [Token pool](#token-pool) for details.

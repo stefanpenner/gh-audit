@@ -39,15 +39,20 @@ type APIStats struct {
 	// we need to know whether they actually contributed code. Lower
 	// volume than the §2 path; only fires when reviewer-as-author
 	// appears.
-	CommitDetailLazySelf  atomic.Int64
-	CommitPRs          atomic.Int64
-	PRDetail           atomic.Int64
-	Reviews            atomic.Int64
-	CheckRuns          atomic.Int64
-	PRCommits          atomic.Int64
-	RevertVerification atomic.Int64 // GetCommitFiles calls made for clean-revert diff check
-	CacheHits          atomic.Int64
-	DBHits             atomic.Int64
+	CommitDetailLazySelf atomic.Int64
+	// CommitDetailLazyExempt is GET /commits/{sha} fired by audit rule
+	// §1's PR-branch emptiness verification: a non-exempt branch commit
+	// in an exempt author's squash looks zero-stat locally and the
+	// carve-out needs proof it truly shipped no code.
+	CommitDetailLazyExempt atomic.Int64
+	CommitPRs              atomic.Int64
+	PRDetail               atomic.Int64
+	Reviews                atomic.Int64
+	CheckRuns              atomic.Int64
+	PRCommits              atomic.Int64
+	RevertVerification     atomic.Int64 // GetCommitFiles calls made for clean-revert diff check
+	CacheHits              atomic.Int64
+	DBHits                 atomic.Int64
 	// PRRecovered counts commit→PR links discovered through the
 	// parse-then-canonical-verify fallback when GitHub's commit→PR
 	// reverse index returned empty. Each increment represents one
@@ -67,6 +72,7 @@ type APIStats struct {
 	CommitDetailEagerNanos      atomic.Int64
 	CommitDetailLazyEmptyNanos  atomic.Int64
 	CommitDetailLazySelfNanos   atomic.Int64
+	CommitDetailLazyExemptNanos atomic.Int64
 	CommitPRsNanos              atomic.Int64
 	PRDetailNanos               atomic.Int64
 	ReviewsNanos                atomic.Int64
@@ -79,6 +85,7 @@ type APIStats struct {
 func (s *APIStats) Total() int64 {
 	return s.CommitDetailEager.Load() +
 		s.CommitDetailLazyEmpty.Load() + s.CommitDetailLazySelf.Load() +
+		s.CommitDetailLazyExempt.Load() +
 		s.CommitPRs.Load() + s.PRDetail.Load() +
 		s.Reviews.Load() + s.CheckRuns.Load() + s.PRCommits.Load() +
 		s.RevertVerification.Load()
@@ -118,17 +125,17 @@ type EnrichmentCache interface {
 //	             ├── in-memory cache (PRs, reviews, checks, commits)
 //	             └── reverse PR index (merge_commit_sha → PR numbers)
 type CachingEnricher struct {
-	client *Client
+	client  *Client
 	dbCache EnrichmentCache
-	Stats  APIStats
+	Stats   APIStats
 
-	mu              sync.Mutex
-	prCache         map[string]*model.PullRequest
-	reviewCache     map[string][]model.Review
-	checkRunCache   map[string][]model.CheckRun
-	prCommitCache   map[string][]model.Commit
-	commitPRCache   map[string][]model.PullRequest // sha → PRs (from API or reverse index)
-	mergeCommitIdx  map[string][]int               // merge_commit_sha → PR numbers
+	mu             sync.Mutex
+	prCache        map[string]*model.PullRequest
+	reviewCache    map[string][]model.Review
+	checkRunCache  map[string][]model.CheckRun
+	prCommitCache  map[string][]model.Commit
+	commitPRCache  map[string][]model.PullRequest // sha → PRs (from API or reverse index)
+	mergeCommitIdx map[string][]int               // merge_commit_sha → PR numbers
 }
 
 // NewCachingEnricher creates a new caching enricher. If dbCache is non-nil,
@@ -352,6 +359,17 @@ func (ce *CachingEnricher) isPRMerged(ctx context.Context, org, repo string, prN
 	return pr.Merged
 }
 
+// getReviews fetches the reviews for a PR, preferring the in-memory cache,
+// then the DB (under the merged-PR freeze), then the API.
+//
+// Known limitation: reviews CAN change after merge — a post-merge dismissal
+// (exactly what HasPostMergeConcern detects) lands on an already-merged PR.
+// Because the merged-PR freeze treats the first synced snapshot as final,
+// review changes that happen after the first sync are not observed; picking
+// them up requires re-syncing the window. The freeze is kept regardless:
+// removing it re-opens the ~55% false-flag mode documented on isPRMerged
+// and would re-fetch reviews for every merged PR on every run (an API
+// storm). Revisit deliberately, not here.
 func (ce *CachingEnricher) getReviews(ctx context.Context, org, repo string, prNumber int) ([]model.Review, error) {
 	key := fmt.Sprintf("%s/%s/%d", org, repo, prNumber)
 
@@ -363,13 +381,16 @@ func (ce *CachingEnricher) getReviews(ctx context.Context, org, repo string, prN
 	}
 	ce.mu.Unlock()
 
-	// DB fallback. When the PR is merged (frozen), a zero-row result is
-	// authoritative — reviews on a merged PR don't change — so we cache
-	// the empty slice and skip the API. Open PRs still hit the API on
-	// DB-empty so newly-added reviews are discovered.
+	// DB fallback — but ONLY under the merged-PR freeze, regardless of
+	// row count. For a merged PR the stored snapshot (including a
+	// zero-row result) is authoritative. Rows for a non-merged PR are a
+	// moment-in-time copy: trusting them would hide reviews submitted
+	// after the snapshot (false "no approval on final commit"). No
+	// current writer persists open-PR reviews, but the freeze must not
+	// depend on that invariant holding forever.
 	if ce.dbCache != nil {
 		reviews, err := ce.dbCache.GetReviewsForPR(ctx, org, repo, prNumber)
-		if err == nil && (len(reviews) > 0 || ce.isPRMerged(ctx, org, repo, prNumber)) {
+		if err == nil && ce.isPRMerged(ctx, org, repo, prNumber) {
 			ce.mu.Lock()
 			ce.reviewCache[key] = reviews
 			ce.mu.Unlock()
@@ -408,10 +429,15 @@ func (ce *CachingEnricher) getCheckRuns(ctx context.Context, org, repo, ref stri
 	}
 	ce.mu.Unlock()
 
-	// DB fallback. Merged-PR freeze trusts a zero-row result.
+	// DB fallback — only under the merged-PR freeze AND only when every
+	// persisted run has reached its terminal "completed" status. Runs
+	// stored as queued/in_progress were snapshotted mid-flight; an open
+	// PR's head can also gain re-runs. Either condition failing forces a
+	// refetch; the sync pipeline persists the refreshed rows on its
+	// normal write path.
 	if ce.dbCache != nil {
 		runs, err := ce.dbCache.GetCheckRunsForCommit(ctx, org, repo, ref)
-		if err == nil && (len(runs) > 0 || ce.isPRMerged(ctx, org, repo, prNumber)) {
+		if err == nil && ce.isPRMerged(ctx, org, repo, prNumber) && allCheckRunsCompleted(runs) {
 			ce.mu.Lock()
 			ce.checkRunCache[key] = runs
 			ce.mu.Unlock()
@@ -434,6 +460,18 @@ func (ce *CachingEnricher) getCheckRuns(ctx context.Context, org, repo, ref stri
 	return runs, nil
 }
 
+// allCheckRunsCompleted reports whether every run has reached the terminal
+// "completed" status. An empty slice is trivially complete (the merged-PR
+// freeze's authoritative-empty case).
+func allCheckRunsCompleted(runs []model.CheckRun) bool {
+	for _, r := range runs {
+		if r.Status != "completed" {
+			return false
+		}
+	}
+	return true
+}
+
 func (ce *CachingEnricher) getPRCommits(ctx context.Context, org, repo string, prNumber int) ([]model.Commit, error) {
 	key := fmt.Sprintf("%s/%s/%d", org, repo, prNumber)
 
@@ -445,12 +483,14 @@ func (ce *CachingEnricher) getPRCommits(ctx context.Context, org, repo string, p
 	}
 	ce.mu.Unlock()
 
-	// DB fallback. Merged-PR freeze trusts a zero-row result; in
-	// practice every real PR has at least one branch commit, so this
-	// branch only matters for empty PRs that somehow got merged.
+	// DB fallback — only under the merged-PR freeze, regardless of row
+	// count: branch commits of a non-merged PR can still grow (a later
+	// push), and trusting a snapshot would blind §1/§5 contributor
+	// analysis to them. The zero-row arm only matters for empty PRs
+	// that somehow got merged.
 	if ce.dbCache != nil {
 		commits, err := ce.dbCache.GetCommitsForPR(ctx, org, repo, prNumber)
-		if err == nil && (len(commits) > 0 || ce.isPRMerged(ctx, org, repo, prNumber)) {
+		if err == nil && ce.isPRMerged(ctx, org, repo, prNumber) {
 			ce.mu.Lock()
 			ce.prCommitCache[key] = commits
 			ce.mu.Unlock()
@@ -701,7 +741,7 @@ func (ce *CachingEnricher) classifyRevertAndMerge(
 	// parent count, message, committer, and signature verification are all
 	// in the commit detail we fetched at the start of enrichOneCommit.
 	mk := ClassifyMerge(parentCount, result.Commit.Message, result.Commit.CommitterLogin, result.Commit.IsVerified)
-	result.MergeVerification = mergeKindVerification(mk)
+	result.MergeVerification = MergeKindVerification(mk)
 	if mk == CleanMerge {
 		result.IsCleanMerge = true
 	}

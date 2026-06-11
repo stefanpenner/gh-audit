@@ -107,10 +107,16 @@ func ParsePRReference(message string) (int, bool) {
 	return n, true
 }
 
-// mergeKindVerification returns the string persisted to
+// MergeKindVerification returns the string persisted to
 // audit_results.merge_verification for a given kind. Parallel to
 // revert_verification's vocabulary.
-func mergeKindVerification(k MergeKind) string {
+// MergeKindVerification maps a MergeKind to the canonical
+// merge_verification vocabulary stored on audit rows. Every writer (sync
+// enrichment, backfill reclassify) MUST use this mapping — a second
+// hand-rolled copy once forked the vocabulary ("message-only" vs
+// "verified-merge-bot") and broke consumers filtering on the canonical
+// value.
+func MergeKindVerification(k MergeKind) string {
 	switch k {
 	case CleanMerge:
 		return "verified-merge-bot"
