@@ -55,6 +55,20 @@ func LoginFromNoreplyEmail(email string) string {
 	return m[1]
 }
 
+// GhostUserID is GitHub's shared sentinel account ("ghost") substituted
+// for every deleted user on PR and review user fields. It is not a real
+// identity: two different deleted people both surface as this id, and an
+// approval attributed to it is unverifiable.
+const GhostUserID int64 = 10137
+
+// TrustedID reports whether a numeric account id is a usable identity:
+// non-zero (resolved) and not the shared ghost sentinel. Every identity
+// claim in the audit (§4 approval counting, §5 self-approval, the report's
+// self-merged signal) must gate on this — never on id != 0 alone.
+func TrustedID(id int64) bool {
+	return id != 0 && id != GhostUserID
+}
+
 // A Commit is a git commit synced from GitHub.
 //
 // Modeled as a pure git object — knows parents, author, and committer.
@@ -204,9 +218,14 @@ type AuditResult struct {
 	PRCount          int
 	HasFinalApproval bool
 	HasStaleApproval bool // approval exists but on a pre-force-push commit
-	// HasPostMergeConcern is true when a reviewer submitted a CHANGES_REQUESTED
-	// or DISMISSED review after the PR merged. Informational — does not affect
-	// IsCompliant (compliance is evaluated point-in-time at merge).
+	// HasPostMergeConcern is true when a reviewer submitted a
+	// CHANGES_REQUESTED or DISMISSED review after the PR merged, OR when a
+	// reviewer's final pre-merge state on the head SHA is DISMISSED —
+	// GitHub mutates dismissed reviews in place (original submitted_at
+	// retained), so such a dismissal may have happened after the merge and
+	// the ambiguity is surfaced for an auditor to adjudicate.
+	// Informational — does not affect IsCompliant (compliance is evaluated
+	// point-in-time at merge).
 	HasPostMergeConcern bool
 	// IsCleanRevert is true when the commit is a clean revert of a prior
 	// commit. For bot auto-reverts this is trusted by message pattern; for

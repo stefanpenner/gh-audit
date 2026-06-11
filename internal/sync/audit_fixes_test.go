@@ -275,17 +275,17 @@ func TestGhostUser_IsNeverTrusted(t *testing.T) {
 	at := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
 	merged := at.Add(time.Hour)
 	commit := model.Commit{
-		Org: "o", Repo: "r", SHA: "squash", AuthorID: ghostUserID, AuthorLogin: "ghost",
+		Org: "o", Repo: "r", SHA: "squash", AuthorID: model.GhostUserID, AuthorLogin: "ghost",
 		Additions: 10, Deletions: 2, ParentCount: 1, CommittedAt: merged,
 	}
 	enrichment := model.EnrichmentResult{
 		Commit: commit,
 		PRs: []model.PullRequest{{
 			Org: "o", Repo: "r", Number: 1, Merged: true, HeadSHA: "head",
-			AuthorID: ghostUserID, MergedAt: merged,
+			AuthorID: model.GhostUserID, MergedAt: merged,
 		}},
 		Reviews: []model.Review{{
-			PRNumber: 1, ReviewID: 9, ReviewerID: ghostUserID, ReviewerLogin: "ghost",
+			PRNumber: 1, ReviewID: 9, ReviewerID: model.GhostUserID, ReviewerLogin: "ghost",
 			State: "APPROVED", CommitID: "head", SubmittedAt: at,
 		}},
 	}
@@ -307,4 +307,44 @@ func TestRequiredChecks_QueuedOnlyIsMissingNotFailure(t *testing.T) {
 		{CommitSHA: "head", CheckName: "Owner Approval", Status: "in_progress", CheckRunID: 1},
 	}
 	assert.Equal(t, "missing", evaluateRequiredChecks(runs, "head", required))
+}
+
+// A dismissal SUPERSEDED by a later re-approval is moot: the standing
+// approval covers the merge, so no concern flag — flagging every
+// dismiss-then-reapprove cycle would bury real signals in noise. And an
+// unmerged PR has no merge for a dismissal to be ambiguous against.
+func TestDismissedReview_SupersededOrUnmergedStaysQuiet(t *testing.T) {
+	at := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	pr := model.PullRequest{Number: 1, HeadSHA: "head", MergedAt: at.Add(time.Hour)}
+
+	t.Run("re-approved after dismissal", func(t *testing.T) {
+		reviews := []model.Review{
+			{PRNumber: 1, ReviewID: 1, ReviewerID: 42, State: "DISMISSED", CommitID: "head", SubmittedAt: at},
+			{PRNumber: 1, ReviewID: 2, ReviewerID: 42, State: "APPROVED", CommitID: "head", SubmittedAt: at.Add(10 * time.Minute)},
+		}
+		latest, concern := latestReviewStatesOnFinal(reviews, pr)
+		require.Len(t, latest, 1)
+		assert.False(t, concern, "a superseded dismissal is moot")
+	})
+
+	t.Run("dismissal on unmerged PR", func(t *testing.T) {
+		open := pr
+		open.MergedAt = time.Time{}
+		reviews := []model.Review{
+			{PRNumber: 1, ReviewID: 1, ReviewerID: 42, State: "DISMISSED", CommitID: "head", SubmittedAt: at},
+		}
+		_, concern := latestReviewStatesOnFinal(reviews, open)
+		assert.False(t, concern, "post-merge concern is meaningless without a merge")
+	})
+}
+
+// A vetted service account whose GitHub user was DELETED authors commits
+// with AuthorID == ghost. The ghost id carries no identity, so the §1
+// match must fall through to the operator-curated verified_emails list —
+// the account's exemption survives account deletion.
+func TestExemptCommit_GhostAuthorFallsBackToVerifiedEmails(t *testing.T) {
+	exempt := []model.ExemptAuthor{{Login: "svc", VerifiedEmails: []string{"svc@corp.example"}}}
+	assert.True(t, isExemptCommit(model.GhostUserID, "svc@corp.example", exempt),
+		"ghost id must not block the email fallback")
+	assert.False(t, isExemptCommit(model.GhostUserID, "other@corp.example", exempt))
 }

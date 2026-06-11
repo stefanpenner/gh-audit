@@ -75,11 +75,9 @@ func (d *DB) UpsertCommits(ctx context.Context, commits []model.Commit) error {
 
 // InsertCommitsIfAbsent inserts commits whose (org, repo, sha) is not yet
 // present and leaves existing rows untouched. For PR-branch commits from
-// /pulls/{n}/commits, whose rows lack author_email, href, is_verified, and
-// diff stats: a blind upsert would replace rows ingested rich by phase 1's
-// ListCommits (or enriched by the lazy stats fetcher) with gutted copies,
-// breaking the §1 verified_emails fallback and merge classification on
-// every later DB read.
+// /pulls/{n}/commits, which carry no diff stats: a blind upsert would
+// replace rows whose stats were already resolved (phase-1 ingestion plus
+// the lazy detail fetch) with zero-stat copies.
 func (d *DB) InsertCommitsIfAbsent(ctx context.Context, commits []model.Commit) error {
 	if len(commits) == 0 {
 		return nil

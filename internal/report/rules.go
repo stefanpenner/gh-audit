@@ -3,6 +3,8 @@ package report
 import (
 	"fmt"
 	"strings"
+
+	"github.com/stefanpenner/gh-audit/internal/model"
 )
 
 // A RuleOutcome is a single rule's verdict for one commit in the Decision
@@ -176,13 +178,18 @@ func (o RuleOutcomes) RequiresAction() bool {
 
 // isSelfMerged reports whether the commit's author also clicked merge.
 // Prefers the immutable numeric ids (logins are mutable and reclaimable);
-// falls back to login equality only when either id is unresolved, matching
+// falls back to login equality only when either id is untrusted, matching
 // the data available on rows synced before merged_by_id was persisted.
+// Ghost ids never claim identity (two deleted users share id 10137), and
+// the login fallback excludes "ghost" for the same reason.
 func isSelfMerged(d DetailRow) bool {
-	if d.AuthorID != 0 && d.MergedByID != 0 {
+	if model.TrustedID(d.AuthorID) && model.TrustedID(d.MergedByID) {
 		return d.AuthorID == d.MergedByID
 	}
-	return d.AuthorLogin != "" && d.MergedByLogin != "" && d.AuthorLogin == d.MergedByLogin
+	if d.AuthorLogin == "" || strings.EqualFold(d.AuthorLogin, "ghost") {
+		return false
+	}
+	return d.AuthorLogin == d.MergedByLogin
 }
 
 // SynthesizeContext returns a compact, human-readable string of secondary

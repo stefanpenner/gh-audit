@@ -92,3 +92,16 @@ func TestExemptFlagWithPRComplianceIsNotAWaiver(t *testing.T) {
 		"compliant-via-PR with a visibility flag is not an exemption waiver")
 	assert.Zero(t, summaries[0].ActionQueueCount)
 }
+
+// Two deleted accounts both surface as the ghost id — that is two unknown
+// identities, not proof the author merged their own commit.
+func TestSelfMerged_GhostNeverClaimsIdentity(t *testing.T) {
+	ghost := DetailRow{
+		AuthorID: 10137, MergedByID: 10137,
+		AuthorLogin: "ghost", MergedByLogin: "ghost",
+	}
+	assert.NotContains(t, SynthesizeContext(ghost), "self-merged")
+
+	real := DetailRow{AuthorID: 7, MergedByID: 7, AuthorLogin: "dev", MergedByLogin: "dev"}
+	assert.Contains(t, SynthesizeContext(real), "self-merged")
+}

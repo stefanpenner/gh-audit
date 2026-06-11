@@ -1109,11 +1109,10 @@ func (p *Pipeline) writeEnrichmentBatch(ctx context.Context, org, repo string, e
 			return fmt.Errorf("upserting check runs: %w", err)
 		}
 		if len(allBranchCommits) > 0 {
-			// Insert-if-absent, never upsert: /pulls/{n}/commits rows lack
-			// author_email, href, is_verified, and diff stats. A blind
-			// upsert replaced rich phase-1 rows with gutted copies,
-			// breaking the §1 verified_emails fallback and merge
-			// classification on later DB reads.
+			// Insert-if-absent, never upsert: /pulls/{n}/commits rows
+			// carry no diff stats (the endpoint omits them), so a blind
+			// upsert would replace phase-1 rows whose stats were already
+			// resolved with zero-stat copies.
 			if err := p.store.InsertCommitsIfAbsent(ctx, allBranchCommits); err != nil {
 				return fmt.Errorf("inserting PR branch commits: %w", err)
 			}

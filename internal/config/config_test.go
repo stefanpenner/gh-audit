@@ -323,3 +323,54 @@ tokens:
 		assert.Contains(t, err.Error(), "duplicate token")
 	})
 }
+
+func TestValidateGhostExemptionAndCheckDefaults(t *testing.T) {
+	dir := t.TempDir()
+	write := func(t *testing.T, yaml string) (*Config, error) {
+		t.Helper()
+		path := filepath.Join(dir, "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
+		return Load(path)
+	}
+	base := `
+orgs:
+  - name: testorg
+tokens:
+  - kind: pat
+    env: TOK
+    scopes:
+      - org: testorg
+`
+
+	t.Run("ghost user id rejected in exemptions", func(t *testing.T) {
+		_, err := write(t, base+`
+exemptions:
+  authors:
+    - login: ghost
+      id: 10137
+`)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ghost")
+	})
+
+	t.Run("required check without conclusion defaults to success", func(t *testing.T) {
+		cfg, err := write(t, base+`
+audit_rules:
+  required_checks:
+    - name: "Owner Approval"
+`)
+		require.NoError(t, err)
+		require.Len(t, cfg.AuditRules.RequiredChecks, 1)
+		assert.Equal(t, "success", cfg.AuditRules.RequiredChecks[0].Conclusion)
+	})
+
+	t.Run("required check without name rejected", func(t *testing.T) {
+		_, err := write(t, base+`
+audit_rules:
+  required_checks:
+    - conclusion: success
+`)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "required_checks")
+	})
+}

@@ -189,6 +189,14 @@ func (c *Config) applyDefaults() {
 	if len(c.AuditRules.AuditBranches) == 0 {
 		c.AuditRules.AuditBranches = []string{"master", "main"}
 	}
+	// A required check without an explicit conclusion means "must have
+	// succeeded" — the only sensible reading. An empty conclusion used to
+	// compare literally and could never match a real run.
+	for i := range c.AuditRules.RequiredChecks {
+		if c.AuditRules.RequiredChecks[i].Conclusion == "" {
+			c.AuditRules.RequiredChecks[i].Conclusion = "success"
+		}
+	}
 }
 
 func (c *Config) validate() error {
@@ -255,6 +263,17 @@ func (c *Config) validate() error {
 	for i, e := range c.Exemptions.Authors {
 		if e.ID == 0 && len(e.VerifiedEmails) == 0 {
 			return fmt.Errorf("config: exemptions.authors[%d] (%q) needs 'id' or 'verified_emails' — login alone never matches", i, e.Login)
+		}
+		if e.ID == model.GhostUserID {
+			// Every deleted account shares the ghost id; exempting it
+			// would exempt all of them.
+			return fmt.Errorf("config: exemptions.authors[%d] (%q) uses the ghost user id %d, which is shared by every deleted account and cannot identify anyone", i, e.Login, model.GhostUserID)
+		}
+	}
+
+	for i, rc := range c.AuditRules.RequiredChecks {
+		if strings.TrimSpace(rc.Name) == "" {
+			return fmt.Errorf("config: audit_rules.required_checks[%d] needs a 'name'", i)
 		}
 	}
 

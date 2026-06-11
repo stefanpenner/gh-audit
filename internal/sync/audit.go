@@ -227,7 +227,12 @@ func applyExemptAuthorRule(result *model.AuditResult, commit model.Commit, enric
 // list + every contributor passes" recovers the same trust property
 // id-only matching provided.
 func isExemptCommit(authorID int64, authorEmail string, exemptAuthors []model.ExemptAuthor) bool {
-	if authorID != 0 {
+	// The ghost id carries zero identity information (every deleted user
+	// shares it), so it is treated like an unresolved id: fall through to
+	// the operator-curated verified_emails list rather than taking the
+	// id path — a vetted service account whose GitHub user was deleted
+	// keeps its exemption through the email it still commits with.
+	if model.TrustedID(authorID) {
 		for _, e := range exemptAuthors {
 			if e.ID != 0 && e.ID == authorID {
 				return true
@@ -370,7 +375,7 @@ func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *mode
 		if review.State != "APPROVED" {
 			continue
 		}
-		if !isTrustedID(review.ReviewerID) {
+		if !model.TrustedID(review.ReviewerID) {
 			continue
 		}
 		if isSelfApproval(review, commit, *pr, v.prBranchCommits) {
@@ -387,7 +392,7 @@ func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *mode
 			if review.PRNumber != pr.Number || review.CommitID == pr.HeadSHA {
 				continue
 			}
-			if !isTrustedID(review.ReviewerID) {
+			if !model.TrustedID(review.ReviewerID) {
 				continue
 			}
 			if review.State != "APPROVED" || isSelfApproval(review, commit, *pr, v.prBranchCommits) {
@@ -502,7 +507,7 @@ func finalizeNonCompliant(result model.AuditResult, commit model.Commit, enrichm
 		result.OwnerApprovalCheck = best.ownerApproval
 		fallbackLatest, _ := latestReviewStatesOnFinal(enrichment.Reviews, *best.pr)
 		for _, review := range fallbackLatest {
-			if review.State == "APPROVED" && isTrustedID(review.ReviewerID) && !isSelfApproval(review, commit, *best.pr, best.prBranchCommits) {
+			if review.State == "APPROVED" && model.TrustedID(review.ReviewerID) && !isSelfApproval(review, commit, *best.pr, best.prBranchCommits) {
 				result.HasFinalApproval = true
 				break
 			}
@@ -527,7 +532,7 @@ func latestReviewStatesOnFinal(reviews []model.Review, pr model.PullRequest) (ma
 	latest := make(map[string]model.Review)
 	postMergeConcern := false
 	for _, review := range reviews {
-		if review.PRNumber != pr.Number || review.CommitID != pr.HeadSHA || !isTrustedID(review.ReviewerID) {
+		if review.PRNumber != pr.Number || review.CommitID != pr.HeadSHA || !model.TrustedID(review.ReviewerID) {
 			continue
 		}
 		if !pr.MergedAt.IsZero() && review.SubmittedAt.After(pr.MergedAt) {
@@ -535,20 +540,6 @@ func latestReviewStatesOnFinal(reviews []model.Review, pr model.PullRequest) (ma
 				postMergeConcern = true
 			}
 			continue
-		}
-		// GitHub dismisses a review by MUTATING it in place: state flips
-		// to DISMISSED while submitted_at/commit_id keep their original
-		// submission values (the dismissal time lives only in timeline
-		// events we don't fetch). A DISMISSED row submitted pre-merge is
-		// therefore ambiguous — the dismissal may have happened before
-		// the merge (the review never stood) or after it (the review WAS
-		// an approval at merge time and the point-in-time doctrine says
-		// it should count). Fail closed — keep it in the map as a
-		// non-approval — but surface the ambiguity so an auditor decides
-		// instead of the verdict silently depending on sync timing. See
-		// TODO.md for the timeline-event resolution.
-		if review.State == "DISMISSED" && review.CommitID == pr.HeadSHA {
-			postMergeConcern = true
 		}
 		key := reviewerKey(review)
 		existing, exists := latest[key]
@@ -575,6 +566,27 @@ func latestReviewStatesOnFinal(reviews []model.Review, pr model.PullRequest) (ma
 			continue
 		}
 		latest[key] = review
+	}
+	// GitHub dismisses a review by MUTATING it in place: state flips to
+	// DISMISSED while submitted_at/commit_id keep their original
+	// submission values (the dismissal time lives only in timeline events
+	// we don't fetch). A DISMISSED entry that SURVIVES as a reviewer's
+	// final pre-merge state is therefore ambiguous — the dismissal may
+	// predate the merge (the review never stood) or postdate it (it WAS
+	// an approval at merge time and the point-in-time doctrine says it
+	// should count). Fail closed — DISMISSED never counts as approval —
+	// but surface the ambiguity so an auditor decides instead of the
+	// verdict silently depending on sync timing. Superseded dismissals
+	// (reviewer re-approved afterwards) are moot and stay quiet, and an
+	// unmerged PR has no merge for the dismissal to be ambiguous against.
+	// See TODO.md for the timeline-event resolution.
+	if !pr.MergedAt.IsZero() {
+		for _, r := range latest {
+			if r.State == "DISMISSED" {
+				postMergeConcern = true
+				break
+			}
+		}
 	}
 	return latest, postMergeConcern
 }
@@ -666,7 +678,7 @@ func evaluateRequiredChecks(checkRuns []model.CheckRun, headSHA string, required
 // GitHub's merge button refuses to produce a CleanMerge under conflicts,
 // so no author-contributed bytes can ride along.
 func isSelfApproval(review model.Review, commit model.Commit, pr model.PullRequest, prBranchCommits []model.Commit) bool {
-	if !isTrustedID(review.ReviewerID) {
+	if !model.TrustedID(review.ReviewerID) {
 		return false
 	}
 
@@ -690,24 +702,12 @@ func isSelfApproval(review model.Review, commit model.Commit, pr model.PullReque
 	return false
 }
 
-// ghostUserID is GitHub's shared sentinel account ("ghost", id 10137)
-// substituted for deleted users on PR and review user fields. It is not a
-// real identity: two different deleted people both surface as 10137, and
-// an approval attributed to it is unverifiable.
-const ghostUserID = 10137
-
-// isTrustedID reports whether a numeric account ID is a usable identity:
-// non-zero (resolved) and not the shared ghost sentinel.
-func isTrustedID(id int64) bool {
-	return id != 0 && id != ghostUserID
-}
-
 // sameUser returns true if two GitHub identities refer to the same account.
 // ID-only: returns true only when both IDs are trusted and equal. Returns
 // false when either ID is missing or the ghost sentinel — no identity claim
 // without immutable proof (ghost==ghost may be two different deleted users).
 func sameUser(id1, id2 int64) bool {
-	return isTrustedID(id1) && isTrustedID(id2) && id1 == id2
+	return model.TrustedID(id1) && model.TrustedID(id2) && id1 == id2
 }
 
 // ----- Pure utilities -----
