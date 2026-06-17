@@ -216,7 +216,7 @@ func (b *xlsxBuilder) writeREADME(opts ReportOpts, summary []SummaryRow, details
 		{"R5 SelfApproval — the only approver is the code author / committer / co-author", body},
 		{"R6 OwnerCheck — required status check (e.g. Owner Approval) configured for this repo", body},
 		{"R7 Verdict — overall compliance verdict from the audit pipeline", body},
-		{"R8 RevertWaiver — clean-revert waiver applied (bot auto-revert or diff-verified manual revert)", body},
+		{"R8 RevertWaiver — clean-revert waiver applied (diff-verified auto or manual revert)", body},
 		{"", 0},
 		{"Cell outcomes", h2},
 		{"pass — rule evaluated and passed", body},

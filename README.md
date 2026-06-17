@@ -160,9 +160,11 @@ sync:
   org_repos_cache_freshness: 24h   # "0s" disables the cache
 
 exemptions:
-  # Matched by immutable numeric account id. `login` is display only.
-  # `verified_emails` is a fallback for service accounts whose email
-  # GitHub does not bind to an account. See Architecture.md §1.
+  # Matched by immutable numeric account id ONLY. `login` is display only.
+  # There is no email path — a git-author email is forgeable, so matching it
+  # would let any pusher forge an exemption. Service accounts must have a
+  # GitHub account id. (The old `verified_emails` key is now rejected at load
+  # time.) See Architecture.md §1.
   authors:
     - login: "dependabot[bot]"
       id: 49699333

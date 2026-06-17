@@ -804,10 +804,10 @@ func (c *Client) ListPRCommits(ctx context.Context, org, repo string, prNumber i
 
 		for _, rc := range commits {
 			// Full conversion, same as every other ingestion path. A
-			// hand-rolled subset here once dropped AuthorEmail — and
-			// squash-merged PRs' branch commits exist ONLY via this
-			// endpoint, so §1's verified_emails fallback and §4's
-			// refresh carve-out silently lost their input.
+			// hand-rolled subset here once dropped fields that squash-merged
+			// PRs' branch commits carry ONLY via this endpoint (author id,
+			// parent SHAs, verification), silently breaking the §1 squash
+			// backstop, the §4 refresh carve-out, and merge classification.
 			all = append(all, c.convertRepoCommit(org, repo, "", rc))
 		}
 
@@ -988,14 +988,13 @@ func (c *Client) EnrichCommits(ctx context.Context, org, repo string, shas []str
 // Why not error out:
 //
 //   - The forgery-resistance contract lives in audit-time matching
-//     (audit.go::isExemptCommit matches on id when present; a zero ID
-//     only matches through the operator-curated verified_emails
-//     fallback). Aborting sync at ingest doesn't add security; it
+//     (audit.go::isExemptCommit matches on id only; a zero ID can never
+//     be exempt). Aborting sync at ingest doesn't add security; it
 //     just denies coverage.
 //   - Real developer commits routinely arrive with laptop-hostname
-//     emails (e.g. "user@user-mn4857.linkedin.biz") that aren't on
-//     the user's verified-emails list. These are not exempt anyway,
-//     so missing AuthorID is fine — they fall through to normal
+//     emails (e.g. "user@user-mn4857.linkedin.biz") that GitHub can't
+//     bind to an account. They're not exempt anyway (no email path),
+//     so a missing AuthorID is fine — they fall through to normal
 //     review rules.
 //
 // The fix-it text in the warning helps operators surface and remediate

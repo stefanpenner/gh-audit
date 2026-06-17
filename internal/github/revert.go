@@ -17,7 +17,9 @@ const (
 	// NotRevert — the message has no recognized revert prefix.
 	NotRevert RevertKind = iota
 	// AutoRevert — a bot-generated revert of the form "Automatic revert of <new>..<old>".
-	// Trusted clean by construction: the generator emits pure inverses.
+	// The message is forgeable, so it is NOT trusted on its own; its only edge
+	// over a ManualRevert is that the reverted SHA is carried in the message.
+	// Cleanliness is still verified against that commit's diff, like ManualRevert.
 	AutoRevert
 	// ManualRevert — a human-authored revert of the form `Revert "..."` with
 	// a `This reverts commit <sha>` body line. Cleanliness must be verified
@@ -60,8 +62,8 @@ func ParseRevert(message string) (RevertKind, string) {
 	if m := autoRevertRe.FindStringSubmatch(message); m != nil {
 		// m[1] = new SHA (the commit being reverted from master's view),
 		// m[2] = old SHA (the commit whose state is being restored).
-		// To verify an auto-revert we'd compare against m[1]; we don't
-		// (policy: trust bot-generated auto-reverts).
+		// We verify the auto-revert by diffing against m[1] — the message
+		// alone is forgeable and never waives a commit on its own.
 		return AutoRevert, m[1]
 	}
 	if strings.HasPrefix(message, "Revert \"") {

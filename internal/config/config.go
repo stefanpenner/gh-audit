@@ -256,13 +256,21 @@ func (c *Config) validate() error {
 		}
 	}
 
-	// Exemption matching is id-or-verified-emails only (logins are
-	// display-only — mutable and forgery-prone). An entry with neither is
-	// silently inert: it never matches, and the operator believes the
-	// account is exempt while every one of its commits gets flagged.
+	// Exemption matching is id-only (logins are display-only — mutable and
+	// forgery-prone; emails are client-set and unverifiable when GitHub
+	// can't bind them). An entry without an id is silently inert: it never
+	// matches, and the operator believes the account is exempt while every
+	// one of its commits gets flagged.
 	for i, e := range c.Exemptions.Authors {
-		if e.ID == 0 && len(e.VerifiedEmails) == 0 {
-			return fmt.Errorf("config: exemptions.authors[%d] (%q) needs 'id' or 'verified_emails' — login alone never matches", i, e.Login)
+		if len(e.VerifiedEmails) > 0 {
+			// Removed 2026-06: a git-author email is forgeable (any pusher
+			// can set it) and GitHub doesn't bind it to an account when it
+			// can't verify it, so matching it let a forged email waive
+			// unreviewed code. Reject loudly rather than silently ignore.
+			return fmt.Errorf("config: exemptions.authors[%d] (%q) sets 'verified_emails', which is no longer supported — it was forgeable. Exempt by immutable account 'id' instead", i, e.Login)
+		}
+		if e.ID == 0 {
+			return fmt.Errorf("config: exemptions.authors[%d] (%q) needs 'id' — login and email never match (forgeable)", i, e.Login)
 		}
 		if e.ID == model.GhostUserID {
 			// Every deleted account shares the ghost id; exempting it

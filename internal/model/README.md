@@ -159,6 +159,7 @@ classDiagram
         Comment string
         VerifiedEmails []string
     }
+    note for ExemptAuthor "Matched by ID only.\nVerifiedEmails is retired:\nrejected at config load."
 
     RepoInfo "1" --o "*" Commit : contains
     RepoInfo "1" --o "1" SyncCursor : tracks
