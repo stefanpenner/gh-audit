@@ -202,6 +202,16 @@ func applyExemptAuthorRule(result *model.AuditResult, commit model.Commit, enric
 		return false
 	}
 	result.IsExemptAuthor = true
+	// The match came via the forgeable verified_emails fallback iff the
+	// AuthorID is unresolved (a trusted id would have matched on the
+	// non-forgeable id path). That fallback is only safe when an associated
+	// PR brings the every-contributor backstop (hasNonExemptPRContributors)
+	// into play. On a direct push there is no PR and no backstop, so a
+	// forged git-author email could waive unreviewed code — fail closed.
+	// A non-forgeable id match needs no such backstop and is unaffected.
+	if !model.TrustedID(commit.AuthorID) && len(enrichment.PRs) == 0 {
+		return false
+	}
 	if hasNonExemptPRContributors(commit.Org, commit.Repo, enrichment, exemptAuthors, fetchStats) {
 		return false
 	}
@@ -612,9 +622,12 @@ func latestReviewStatesOnFinal(reviews []model.Review, pr model.PullRequest) (ma
 	return latest, postMergeConcern
 }
 
-// reviewerKey returns a stable per-reviewer identity for map deduplication.
-// Prefers the immutable numeric ReviewerID (immune to login renames); falls
-// back to lowercased login for legacy data where ReviewerID is zero.
+// reviewerKey returns a stable per-reviewer identity for map deduplication,
+// keyed solely on the immutable numeric ReviewerID (immune to login renames).
+// No login fallback is needed or wanted: the only caller folds reviews after
+// gating on model.TrustedID(ReviewerID), so untrusted/zero ids never reach
+// here — keying them by login would risk collapsing two distinct deleted
+// accounts (all ghosts share one login) into one approval.
 func reviewerKey(r model.Review) string {
 	return fmt.Sprintf("id:%d", r.ReviewerID)
 }

@@ -283,6 +283,37 @@ func TestEvaluateCommit_Rule1_VerifiedEmailFallback(t *testing.T) {
 		assert.True(t, result.IsCompliant)
 		assert.True(t, result.IsExemptAuthor)
 	})
+
+	// The email path is forgeable in isolation (any local committer can set
+	// their git-author email). It is only trustworthy when an associated PR
+	// brings the every-contributor backstop (hasNonExemptPRContributors) into
+	// play. On a direct push there is no PR and no backstop, so a forged
+	// git-author email would otherwise waive unreviewed code as "exempt".
+	// Fail closed: the email-path exemption requires a PR.
+	t.Run("direct push (no PR) via email path — NOT exempt, fails closed", func(t *testing.T) {
+		commit := model.Commit{
+			Org: "myorg", Repo: "myrepo", SHA: "direct-sha",
+			AuthorID: 0, AuthorEmail: "svc-bot@example.com",
+			ParentCount: 1, Additions: 40, Deletions: 2,
+		}
+		result := EvaluateCommit(commit, model.EnrichmentResult{}, exempt, nil, nil)
+		assert.False(t, result.IsCompliant, "a forgeable email match must not waive a direct push with no PR backstop")
+		assert.True(t, result.IsExemptAuthor, "the email still matched; IsExemptAuthor stays informational")
+		assert.Equal(t, []string{"no associated pull request"}, result.Reasons)
+	})
+
+	// Contrast: the same direct push authored by the non-forgeable exempt
+	// ID stays exempt — no PR backstop is needed when identity is proven.
+	t.Run("direct push (no PR) via id path — still exempt", func(t *testing.T) {
+		commit := model.Commit{
+			Org: "myorg", Repo: "myrepo", SHA: "direct-id-sha",
+			AuthorID: 900001, AuthorEmail: "svc-bot@example.com",
+			ParentCount: 1, Additions: 40, Deletions: 2,
+		}
+		result := EvaluateCommit(commit, model.EnrichmentResult{}, exempt, nil, nil)
+		assert.True(t, result.IsCompliant, "a non-forgeable id match needs no PR backstop")
+		assert.Equal(t, []string{"exempt: configured author"}, result.Reasons)
+	})
 }
 
 // TestEvaluateCommit_Rule2_EmptyCommit covers Architecture.md §2.

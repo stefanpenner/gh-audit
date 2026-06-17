@@ -249,8 +249,12 @@ func truncSHA8(sha string) string {
 // SynthesizeAction picks a primary failing rule and returns (severity, rule
 // label, prescribed action). Returns ("", "", "") for compliant commits.
 //
-// Priority is chosen so auditors chase hardest-to-fix failures first: no PR
-// > self-approved > required check > missing final approval > stale.
+// Priority is chosen so auditors chase hardest-to-fix failures first:
+// no PR > self-approved > required check > stale > missing final approval
+// > post-merge concern. Stale outranks a plain missing final approval
+// because it is the more specific diagnosis ("reviewed, then code changed"
+// vs. "never reviewed") and both fire together whenever an approval exists
+// on an older SHA. This order is pinned by TestSynthesizeActionPriority.
 func SynthesizeAction(d DetailRow, o RuleOutcomes) (Severity, string, string) {
 	if !o.RequiresAction() {
 		return SeverityNone, "", ""
