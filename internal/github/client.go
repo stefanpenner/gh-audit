@@ -560,6 +560,7 @@ func buildPRModel(org, repo string, pr *gogithub.PullRequest) *model.PullRequest
 		Merged:     true,
 		HeadSHA:    pr.GetHead().GetSHA(),
 		HeadBranch: pr.GetHead().GetRef(),
+		BaseBranch: pr.GetBase().GetRef(),
 		Href:       pr.GetHTMLURL(),
 	}
 	if pr.MergedAt != nil {
@@ -612,6 +613,7 @@ func (c *Client) ListCommitPullRequests(ctx context.Context, org, repo, sha stri
 				Merged:     true,
 				HeadSHA:    pr.GetHead().GetSHA(),
 				HeadBranch: pr.GetHead().GetRef(),
+				BaseBranch: pr.GetBase().GetRef(),
 				MergedAt:   pr.MergedAt.Time,
 				Href:       pr.GetHTMLURL(),
 			}
@@ -759,6 +761,9 @@ func (c *Client) GetPullRequest(ctx context.Context, org, repo string, number in
 	if pr.GetHead() != nil {
 		p.HeadSHA = pr.GetHead().GetSHA()
 		p.HeadBranch = pr.GetHead().GetRef()
+	}
+	if pr.GetBase() != nil {
+		p.BaseBranch = pr.GetBase().GetRef()
 	}
 	if pr.GetMergeCommitSHA() != "" {
 		p.MergeCommitSHA = pr.GetMergeCommitSHA()
@@ -944,6 +949,7 @@ func (c *Client) EnrichCommits(ctx context.Context, org, repo string, shas []str
 				prs[j].HeadSHA = fullPR.HeadSHA
 			}
 			prs[j].HeadBranch = fullPR.HeadBranch
+			prs[j].BaseBranch = fullPR.BaseBranch
 
 			reviews, err := c.ListReviews(ctx, org, repo, pr.Number)
 			if err != nil {

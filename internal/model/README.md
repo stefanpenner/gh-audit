@@ -67,6 +67,7 @@ classDiagram
         Merged bool
         HeadSHA string
         HeadBranch string
+        BaseBranch string
         MergeCommitSHA string
         AuthorLogin string
         AuthorID int64
