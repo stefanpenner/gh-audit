@@ -1,0 +1,36 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "db",
+    srcs = [
+        "appender.go",
+        "audit.go",
+        "commits.go",
+        "cursor.go",
+        "db.go",
+        "org_repos.go",
+        "prs.go",
+        "schema.go",
+    ],
+    importpath = "github.com/stefanpenner/gh-audit/internal/db",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/model",
+        "@com_github_marcboeker_go_duckdb//:go-duckdb",
+    ],
+)
+
+go_test(
+    name = "db_test",
+    srcs = [
+        "db_bench_test.go",
+        "db_fixes_test.go",
+        "db_test.go",
+    ],
+    embed = [":db"],
+    deps = [
+        "//internal/model",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
+)

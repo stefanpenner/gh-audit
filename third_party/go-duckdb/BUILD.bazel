@@ -1,0 +1,2 @@
+# gazelle:ignore
+exports_files(["add-build.patch"])

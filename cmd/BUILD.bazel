@@ -1,0 +1,45 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "cmd",
+    srcs = [
+        "annotate_commits.go",
+        "backfill.go",
+        "config.go",
+        "reaudit.go",
+        "report.go",
+        "root.go",
+        "sync.go",
+    ],
+    importpath = "github.com/stefanpenner/gh-audit/cmd",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//internal/config",
+        "//internal/db",
+        "//internal/github",
+        "//internal/model",
+        "//internal/report",
+        "//internal/sync",
+        "@com_github_spf13_cobra//:cobra",
+        "@in_gopkg_yaml_v3//:yaml_v3",
+        "@org_golang_x_sync//errgroup",
+    ],
+)
+
+go_test(
+    name = "cmd_test",
+    srcs = [
+        "cmd_fixes_test.go",
+        "report_test.go",
+        "sync_test.go",
+    ],
+    embed = [":cmd"],
+    deps = [
+        "//internal/config",
+        "//internal/db",
+        "//internal/model",
+        "//internal/report",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
+)

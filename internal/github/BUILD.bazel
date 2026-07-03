@@ -1,0 +1,45 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "github",
+    srcs = [
+        "caching.go",
+        "client.go",
+        "merge.go",
+        "revert.go",
+        "tokenpool.go",
+    ],
+    importpath = "github.com/stefanpenner/gh-audit/internal/github",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/model",
+        "@com_github_bradleyfalzon_ghinstallation_v2//:ghinstallation",
+        "@com_github_google_go_github_v72//github",
+        "@org_golang_x_sync//errgroup",
+    ],
+)
+
+go_test(
+    name = "github_test",
+    srcs = [
+        "caching_freeze_test.go",
+        "caching_test.go",
+        "client_test.go",
+        "fuzz_test.go",
+        "merge_test.go",
+        "revert_autorevert_diff_test.go",
+        "revert_bench_test.go",
+        "revert_emptypatch_test.go",
+        "revert_test.go",
+        "status_contexts_test.go",
+        "tokenpool_429_test.go",
+        "tokenpool_test.go",
+    ],
+    embed = [":github"],
+    deps = [
+        "//internal/model",
+        "@com_github_google_go_github_v72//github",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
+)
