@@ -20,6 +20,7 @@ type evalCase struct {
 	enrichment           model.EnrichmentResult
 	exemptAuthors        []model.ExemptAuthor
 	requiredChecks       []RequiredCheck
+	auditedBranches      []string // §7 landing-scope; nil = content-scoped
 	wantCompliant        bool
 	wantBot              bool
 	wantExempt           bool
@@ -42,7 +43,7 @@ func runEvalCases(t *testing.T, cases []evalCase) {
 	t.Helper()
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			result := EvaluateCommit(tt.commit, tt.enrichment, tt.exemptAuthors, tt.requiredChecks, nil)
+			result := EvaluateCommit(tt.commit, tt.enrichment, tt.exemptAuthors, tt.requiredChecks, nil, tt.auditedBranches...)
 
 			assert.Equal(t, tt.wantCompliant, result.IsCompliant, "IsCompliant (reasons: %v)", result.Reasons)
 			assert.Equal(t, tt.wantBot, result.IsBot, "IsBot")
@@ -1251,6 +1252,83 @@ func TestEvaluateCommit_Rule7_Verdict(t *testing.T) {
 	runEvalCases(t, cases)
 }
 
+// TestEvaluateCommit_Rule7_LandingScope covers the delivering-PR binding:
+// a §7 approval may confer compliance only when its PR merged into an
+// audited branch. This closes the sibling-branch credit gap where a review
+// scoped to `feat → dev` vouched for an unreviewed landing on `main`.
+// See Architecture.md §7 "Scope of the verdict".
+func TestEvaluateCommit_Rule7_LandingScope(t *testing.T) {
+	f := newAuditBaseline()
+
+	// A commit reviewed+approved on a PR that merged into a SIBLING branch
+	// ("dev"), not the audited branch. The commit reached the audited branch
+	// some other (unreviewed) way.
+	siblingPR := f.pr
+	siblingPR.BaseBranch = "dev"
+	deliveringPR := f.pr
+	deliveringPR.BaseBranch = "main"
+
+	cases := []evalCase{
+		{
+			name:   "landing-scoped: sibling-base approval does NOT confer compliance",
+			commit: f.commit,
+			enrichment: model.EnrichmentResult{
+				PRs:       []model.PullRequest{siblingPR},
+				Reviews:   []model.Review{f.approvedReview},
+				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
+			},
+			requiredChecks:  f.requiredChecks,
+			auditedBranches: []string{"main"},
+			wantCompliant:   false,
+			wantHasPR:       true,
+			wantReasons:     []string{`approval is on PR #42, which merged into "dev", not an audited branch`},
+		},
+		{
+			name:   "landing-scoped: delivering-base approval IS compliant",
+			commit: f.commit,
+			enrichment: model.EnrichmentResult{
+				PRs:       []model.PullRequest{deliveringPR},
+				Reviews:   []model.Review{f.approvedReview},
+				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
+			},
+			requiredChecks:  f.requiredChecks,
+			auditedBranches: []string{"main"},
+			wantCompliant:   true,
+			wantHasPR:       true,
+			wantReasons:     []string{"compliant"},
+		},
+		{
+			name:   "landing-scoped: delivering PR wins over sibling PR on same commit",
+			commit: f.commit,
+			enrichment: model.EnrichmentResult{
+				PRs:       []model.PullRequest{siblingPR, deliveringPR},
+				Reviews:   []model.Review{f.approvedReview},
+				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
+			},
+			requiredChecks:  f.requiredChecks,
+			auditedBranches: []string{"main"},
+			wantCompliant:   true,
+			wantHasPR:       true,
+			wantReasons:     []string{"compliant"},
+		},
+		{
+			name:   "content-scoped (default): sibling-base approval still confers compliance",
+			commit: f.commit,
+			enrichment: model.EnrichmentResult{
+				PRs:       []model.PullRequest{siblingPR},
+				Reviews:   []model.Review{f.approvedReview},
+				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
+			},
+			requiredChecks: f.requiredChecks,
+			// auditedBranches nil → content-scoped: legacy behaviour preserved.
+			wantCompliant: true,
+			wantHasPR:     true,
+			wantReasons:   []string{"compliant"},
+		},
+	}
+	runEvalCases(t, cases)
+}
+
 // TestEvaluateCommit_Rule8_SignalPassThrough covers the informational
 // copy-through of revert signals (IsCleanRevert, RevertVerification,
 // RevertedSHA) from EnrichmentResult to AuditResult. These fields land
@@ -2208,4 +2286,40 @@ func TestEvaluateCommit_ReviewerIdentityBug(t *testing.T) {
 		},
 	}
 	runEvalCases(t, cases)
+}
+
+// TestGlobMatch covers the §7 landing-scope branch matcher: exact names,
+// `*` spanning `/`, `?` single char, and non-matches.
+func TestGlobMatch(t *testing.T) {
+	cases := []struct {
+		pattern, s string
+		want       bool
+	}{
+		{"main", "main", true},
+		{"main", "master", false},
+		{"release/*", "release/1.2", true},
+		{"release/*", "release/1.2/rc1", true}, // '*' spans '/'
+		{"release/*", "main", false},
+		{"HF_BF_*", "HF_BF_2026", true},
+		{"v?", "v1", true},
+		{"v?", "v12", false},
+		{"*", "anything/at/all", true},
+		{"", "", true},
+		{"", "x", false},
+	}
+	for _, c := range cases {
+		assert.Equalf(t, c.want, globMatch(c.pattern, c.s), "globMatch(%q,%q)", c.pattern, c.s)
+	}
+}
+
+// TestPRDelivers_FailsOpenOnUnknownBase pins the missing-data policy: an empty
+// BaseBranch is credited (fail open) so legacy rows without base data don't
+// mass-flip; a KNOWN sibling base outside the audited set is not.
+func TestPRDelivers_FailsOpenOnUnknownBase(t *testing.T) {
+	audited := []string{"main", "release/*"}
+	assert.True(t, prDelivers(&model.PullRequest{BaseBranch: ""}, audited), "unknown base fails open")
+	assert.True(t, prDelivers(&model.PullRequest{BaseBranch: "main"}, audited))
+	assert.True(t, prDelivers(&model.PullRequest{BaseBranch: "release/9"}, audited))
+	assert.False(t, prDelivers(&model.PullRequest{BaseBranch: "dev"}, audited), "known sibling base not credited")
+	assert.True(t, prDelivers(&model.PullRequest{BaseBranch: "dev"}, nil), "content-scoped credits any base")
 }

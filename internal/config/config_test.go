@@ -276,6 +276,17 @@ tokens:
 		return Load(path)
 	}
 
+	t.Run("review_scope: valid values accepted, unknown rejected", func(t *testing.T) {
+		for _, scope := range []string{"", "landing", "content"} {
+			_, err := write(t, base+"audit_rules:\n  review_scope: "+scope+"\n")
+			require.NoError(t, err, "scope %q should be accepted", scope)
+		}
+		_, err := write(t, base+"audit_rules:\n  review_scope: sideways\n")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "review_scope")
+		assert.Contains(t, err.Error(), "landing")
+	})
+
 	t.Run("exempt entry without an id is rejected", func(t *testing.T) {
 		// Matching is id-only; a login-only entry can never match anything,
 		// and accepting one silently produces false flags — the inverse of

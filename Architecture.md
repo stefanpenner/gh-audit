@@ -166,10 +166,24 @@ forgeable signal.
 | §4 carve-out (refresh) | first-parent graph walk to approved SHA | committer timestamp (backdating) | `TestApprovalRefreshable_PositionalNotTemporal` ("LEAK…") |
 | §5 no self-approval | id-only `sameUser` | login, committer, co-authors | `TestEvaluateCommit_Rule5_*` |
 | §6 required checks | check-run conclusion (GitHub) | — (no identity) | `TestEvaluateCommit_Rule6_*` |
+| §7 landing scope | PR `base.ref` ∈ audited branches (`prDelivers`) | sibling-branch review credit | `TestEvaluateCommit_Rule7_LandingScope` |
 | §8 clean revert | diff is exact inverse (`IsCleanRevertDiff`) | revert commit message | `TestClassifyRevert_AutoRevertRequiresDiffVerification` |
 
 If a new waiver is added, it must enter this table with its anchor and a
 forgery-rejection test, or it does not ship.
+
+### Verdict scope — landing vs content
+
+The table certifies that no *forged* input flips a verdict. A separate,
+non-forgery question is *where* the crediting review happened. By default §7 is
+**landing-scoped**: a PR's approval counts only when the PR merged into an
+audited branch (`prDelivers`, base-branch match). A review scoped to a sibling
+branch (gitflow `feat → dev`) is genuine and non-forgeable, but it does not
+vouch for a landing on `main`, so it cannot confer compliance. Operators who
+want the older "reviewed anywhere" semantics set `audit_rules.review_scope:
+content`. See [§7, "Scope of the verdict"](#7-compliance-verdict). Either way the
+scope is a *policy* choice over genuine reviews — never a leap through a
+forgeable node.
 
 ## What gh-audit detects
 
@@ -552,6 +566,44 @@ A commit is **compliant** when at least one associated PR has both:
 If a commit has several PRs, gh-audit reports the one closest to compliant. The
 total PR count is recorded (`pr_count`); commits with `pr_count > 1` appear in
 the "Multiple PRs" report sheet.
+
+**Scope of the verdict — read this.** "Associated PR" is broader than "the PR
+that delivered this commit to the audited branch." `GET /commits/{sha}/pulls`
+returns *every* merged PR whose branch ever contained the commit, on *any* base
+branch (§3 table). To stop a review scoped to one branch from vouching for a
+landing on another, the verdict is **landing-scoped by default**
+(`audit_rules.review_scope: landing`):
+
+> a PR's approval counts for §7 only when the PR merged into an **audited
+> branch** (`pr.base.ref` ∈ `audit_branches`).
+
+The check is `prDelivers` (`internal/sync/audit.go`): the PR's `base_branch` is
+glob-matched against the repo's audited branches. A PR that merged elsewhere
+still shows in reports (it satisfies §3 "has PR") but cannot confer compliance;
+the reason reads `approval is on PR #N, which merged into "<base>", not an
+audited branch`.
+
+What this closes. Gitflow example: commit C is reviewed and merged in a
+`feat → dev` PR, then C reaches `main` with its SHA preserved — via a direct
+push or an unreviewed merge. The `feat → dev` PR (base `dev`) no longer vouches
+for C's landing on `main`; unless a PR that merged into `main` independently
+approved C on its final commit, C reads **non-compliant**. This was previously a
+scope gap (the approval is real — not a forgeable-node leap — but scoped to the
+wrong branch).
+
+`base_branch` is populated on sync from `pull_request.base.ref` and persisted
+(`pull_requests.base_branch`). It **fails open on missing data**: a PR row
+without a base branch (synced before the field existed, or a partial fetch) is
+credited, so an offline re-audit of old rows never flips a legitimate verdict —
+one re-sync populates the field and re-enables the check. The gap only opens on
+POSITIVE evidence (a *known* base outside the audited set).
+
+**Opt-out — content scope.** Set `audit_rules.review_scope: content` to restore
+the legacy behaviour: any associated merged PR's approval counts, wherever it
+merged. Some flows (e.g. reviewed `feat → dev` with automated `dev → main`
+promotion) legitimately want this — the code *was* reviewed, just not at the
+`main` landing. `sync` and `re-audit` honour the same setting, so the two never
+disagree.
 
 ### 8. Clean-revert waiver (standalone)
 

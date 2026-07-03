@@ -96,7 +96,15 @@ type StatsFetcher func(trigger StatsTrigger, org, repo, sha string) (additions, 
 //   - §8 (clean-revert waiver) is standalone: it judges the revert on its own
 //     signals and does not inspect the reverted commit's verdict. See
 //     TODO.md for the stricter cross-commit variant.
-func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor, requiredChecks []RequiredCheck, fetchStats StatsFetcher) model.AuditResult {
+//
+// auditedBranches carries §7's landing-scope. When non-empty the verdict is
+// LANDING-SCOPED: a PR's approval can confer compliance only if the PR merged
+// into one of these branches (pr.BaseBranch match). This closes the delivering-
+// PR gap — a review scoped to a sibling branch (gitflow `feat → dev`) can no
+// longer vouch for a protected-branch landing. When empty (nil) the verdict is
+// CONTENT-SCOPED (legacy behaviour): any associated merged PR's approval counts,
+// regardless of where it merged. See Architecture.md §7 "Scope of the verdict".
+func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor, requiredChecks []RequiredCheck, fetchStats StatsFetcher, auditedBranches ...string) model.AuditResult {
 	// Informational fields shared by every return path (revert/merge
 	// signals, annotations, IsBot). Populated once, before any rule runs.
 	result := initAuditResult(commit, enrichment)
@@ -138,8 +146,8 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	// finalizeNonCompliant can report its reasons.
 	var best prVerdict
 	for i := range enrichment.PRs {
-		v := evaluatePR(commit, enrichment, &enrichment.PRs[i], requiredChecks, fetchStats, exemptAuthors)
-		if v.approvalOnFinal && v.ownerApprovalOK {
+		v := evaluatePR(commit, enrichment, &enrichment.PRs[i], requiredChecks, fetchStats, exemptAuthors, auditedBranches)
+		if v.approvalOnFinal && v.ownerApprovalOK && v.delivers {
 			return finalizeCompliantPR(result, commit, enrichment, v)
 		}
 		if betterVerdict(v, best) {
@@ -333,6 +341,7 @@ type prVerdict struct {
 	// HasFinalApproval without folding the review list a second time.
 	latestOnFinal    map[string]model.Review
 	approvalOnFinal  bool   // §4: non-self APPROVED on pr.HeadSHA
+	delivers         bool   // §7: PR merged into an audited branch (landing-scope)
 	selfApproved     bool   // §5: any APPROVED whose reviewer is a code author
 	staleApproval    bool   // §4: non-self APPROVED on older SHA
 	postMergeConcern bool   // §4 cutoff: post-merge CHANGES_REQUESTED/DISMISSED
@@ -351,8 +360,9 @@ type prVerdict struct {
 //	Phase 3: emit §4 / §5 reasons. selfApproved and staleApproval are
 //	         independent flaws and can both appear for the same PR.
 //	Phase 4: evaluate §6 required status checks and append any failure.
-func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *model.PullRequest, requiredChecks []RequiredCheck, fetchStats StatsFetcher, exemptAuthors []model.ExemptAuthor) prVerdict {
+func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *model.PullRequest, requiredChecks []RequiredCheck, fetchStats StatsFetcher, exemptAuthors []model.ExemptAuthor, auditedBranches []string) prVerdict {
 	v := prVerdict{pr: pr}
+	v.delivers = prDelivers(pr, auditedBranches)
 	v.prBranchCommits = filterNonEmptyContributors(commit.Org, commit.Repo, enrichment.PRBranchCommits[pr.Number], fetchStats)
 
 	// Phase 1 — per-reviewer latest state on pr.HeadSHA with merge-time cutoff.
@@ -425,7 +435,78 @@ func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *mode
 		v.reasons = append(v.reasons, fmt.Sprintf("Owner Approval check missing/failed (PR #%d)", pr.Number))
 	}
 
+	// §7 landing-scope — a PR that WOULD confer compliance (independent approval
+	// on the final commit) but merged into a branch we do not audit cannot vouch
+	// for this commit's landing on the audited branch. Emit the reason only when
+	// the approval is otherwise valid; a PR that already fails §4/§5 doesn't need
+	// a second, confusing reason. Content-scoped runs (no auditedBranches) leave
+	// delivers==true and never reach this branch.
+	if v.approvalOnFinal && !v.delivers {
+		// prDelivers only returns false on a KNOWN base outside the audited
+		// set, so pr.BaseBranch is non-empty here.
+		v.reasons = append(v.reasons, fmt.Sprintf("approval is on PR #%d, which merged into %q, not an audited branch", pr.Number, pr.BaseBranch))
+	}
+
 	return v
+}
+
+// prDelivers reports whether pr merged into a branch that is being audited —
+// the landing-scope predicate for Architecture.md §7. An empty auditedBranches
+// means the run is CONTENT-SCOPED (legacy): every PR "delivers" and the caller
+// credits any associated merged PR's approval. A non-empty set means
+// LANDING-SCOPED: only a PR whose BaseBranch is in the set can confer
+// compliance, closing the sibling-branch credit gap (gitflow `feat → dev`).
+func prDelivers(pr *model.PullRequest, auditedBranches []string) bool {
+	if len(auditedBranches) == 0 {
+		return true // content-scoped
+	}
+	// Fail OPEN on unknown base. A live sync always populates BaseBranch from
+	// pull_request.base.ref, so an empty value means missing data (a legacy row
+	// synced before base branches were persisted, or a mock), NOT a real
+	// sibling-branch merge. Penalising it would mass-flip legitimate compliant
+	// verdicts on upgrade until a re-sync. The gap only opens on POSITIVE
+	// evidence — a KNOWN base outside the audited set — so an empty base is
+	// credited; one re-sync populates it and re-enables the check.
+	if pr.BaseBranch == "" {
+		return true
+	}
+	for _, pattern := range auditedBranches {
+		if globMatch(pattern, pr.BaseBranch) {
+			return true
+		}
+	}
+	return false
+}
+
+// globMatch reports whether s matches a branch glob using the same wildcard
+// vocabulary as the report layer's globsToRegex: `*` matches any run of
+// characters (including `/`, unlike path.Match) and `?` matches exactly one.
+// Concrete branch names (no wildcards) reduce to exact equality — which is
+// what the sync pipeline passes. Allocation-free two-pointer scan so it is
+// cheap to call once per PR per audited commit.
+func globMatch(pattern, s string) bool {
+	var pi, si int
+	star, mark := -1, 0
+	for si < len(s) {
+		if pi < len(pattern) && (pattern[pi] == '?' || pattern[pi] == s[si]) {
+			pi++
+			si++
+		} else if pi < len(pattern) && pattern[pi] == '*' {
+			star = pi
+			mark = si
+			pi++
+		} else if star != -1 {
+			pi = star + 1
+			mark++
+			si = mark
+		} else {
+			return false
+		}
+	}
+	for pi < len(pattern) && pattern[pi] == '*' {
+		pi++
+	}
+	return pi == len(pattern)
 }
 
 // betterVerdict reports whether candidate should replace best in the

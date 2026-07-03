@@ -96,6 +96,24 @@ type SyncConfig struct {
 	InitialLookbackDays    int
 	ExemptAuthors          []model.ExemptAuthor
 	RequiredChecks         []RequiredCheck
+	// ReviewScope selects §7's verdict scope (Architecture.md §7):
+	//   "landing" (default, "") — a PR's approval confers compliance only
+	//                             when the PR merged into an audited branch,
+	//                             so a sibling-branch review can't vouch for a
+	//                             protected-branch landing.
+	//   "content"               — legacy: any associated merged PR's approval
+	//                             counts, regardless of where it merged.
+	// Landing scope needs per-PR base branches, populated on sync at or after
+	// the version that added them; an offline re-audit of older rows without
+	// base branches falls back to content scope for those PRs (fail-open, so
+	// no legitimate verdict flips) — one re-sync populates them.
+	ReviewScope string
+}
+
+// LandingScoped reports whether §7 should run landing-scoped (the default).
+// Only an explicit "content" opts out.
+func (c SyncConfig) LandingScoped() bool {
+	return c.ReviewScope != "content"
 }
 
 // OrgConfig describes an org and its repo include/exclude lists.
@@ -715,7 +733,7 @@ func (p *Pipeline) syncRepo(ctx context.Context, repo model.RepoInfo, orgCfg Org
 	for _, b := range branches {
 		b := b
 		branchEG.Go(func() error {
-			if err := p.syncRepoBranch(branchCtx, repo, b, writer, &auditMu); err != nil {
+			if err := p.syncRepoBranch(branchCtx, repo, b, branches, writer, &auditMu); err != nil {
 				if errors.Is(err, context.Canceled) && branchCtx.Err() != nil {
 					p.logger.Debug("sync branch aborted (cascade)", "org", repo.Org, "repo", repo.Name, "branch", b)
 				} else {
@@ -732,7 +750,7 @@ func (p *Pipeline) syncRepo(ctx context.Context, repo model.RepoInfo, orgCfg Org
 	return errors.Join(errs...)
 }
 
-func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, branch string, writer *DBWriter, auditMu *sync.Mutex) error {
+func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, branch string, auditedBranches []string, writer *DBWriter, auditMu *sync.Mutex) error {
 	p.logger.Info("sync repo branch start", "org", repo.Org, "repo", repo.Name, "branch", branch)
 
 	// Phase timestamps captured per-repo so the "sync repo branch
@@ -872,7 +890,15 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 				c.Additions = enrichment.Commit.Additions
 				c.Deletions = enrichment.Commit.Deletions
 			}
-			result := EvaluateCommit(c, enrichment, p.config.ExemptAuthors, p.config.RequiredChecks, p.statsFetcher)
+			// §7 landing-scope: pass the repo's audited branches so a PR's
+			// approval only counts when it merged into one of them. Content
+			// scope (opt-out) passes nil, restoring the legacy "any associated
+			// merged PR" crediting.
+			var scopeBranches []string
+			if p.config.LandingScoped() {
+				scopeBranches = auditedBranches
+			}
+			result := EvaluateCommit(c, enrichment, p.config.ExemptAuthors, p.config.RequiredChecks, p.statsFetcher, scopeBranches...)
 			result.AuditedAt = time.Now()
 			auditResults[i] = result
 			return nil

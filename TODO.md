@@ -1,5 +1,20 @@
 # TODO
 
+## §7 delivering-PR refinement (base check is live; positional walk is the follow-up)
+
+§7 is now **landing-scoped by default**: a PR's approval counts only when the PR
+merged into an audited branch (`prDelivers`, `base_branch` glob-match). Config
+`audit_rules.review_scope: content` opts out. See Architecture.md §7.
+
+Possible refinement: the base-branch check credits *every* branch commit of a
+PR that merged into an audited branch — including intermediate commits that a
+later commit in the same PR overwrote. A stricter (positional) variant would
+also confirm the commit lies on the first-parent path the PR actually
+introduced onto the branch, using the parent-SHA graph already persisted for the
+§4 carve-out (`postApprovalByGraph`). Low priority — the base check already
+closes the cross-branch credit gap; this only tightens same-PR intermediate
+commits, which were reviewed in that PR anyway.
+
 ## Revert-chain claim detection
 
 Deferred work around revert chains that require cross-commit / cross-PR

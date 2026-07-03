@@ -11,7 +11,7 @@ import (
 )
 
 var prColumns = []string{
-	"org", "repo", "number", "title", "merged", "head_sha", "head_branch",
+	"org", "repo", "number", "title", "merged", "head_sha", "head_branch", "base_branch",
 	"merge_commit_sha", "author_login", "author_id", "merged_by_login", "merged_by_id", "merged_at", "href",
 }
 
@@ -40,7 +40,7 @@ func (d *DB) UpsertPullRequests(ctx context.Context, prs []model.PullRequest) er
 	for i, pr := range prs {
 		rows[i] = []driver.Value{
 			pr.Org, pr.Repo, pr.Number, pr.Title, pr.Merged,
-			pr.HeadSHA, pr.HeadBranch, pr.MergeCommitSHA, pr.AuthorLogin, pr.AuthorID,
+			pr.HeadSHA, pr.HeadBranch, pr.BaseBranch, pr.MergeCommitSHA, pr.AuthorLogin, pr.AuthorID,
 			pr.MergedByLogin, pr.MergedByID, pr.MergedAt, pr.Href,
 		}
 	}
@@ -150,14 +150,14 @@ func (d *DB) UpsertCommitPRs(ctx context.Context, org, repo, sha string, prNumbe
 func (d *DB) GetPullRequest(ctx context.Context, org, repo string, number int) (*model.PullRequest, error) {
 	row := d.DB.QueryRowContext(ctx, `
 		SELECT org, repo, number, title, merged, head_sha,
-		       COALESCE(head_branch, ''), merge_commit_sha, author_login,
+		       COALESCE(head_branch, ''), COALESCE(base_branch, ''), merge_commit_sha, author_login,
 		       COALESCE(author_id, 0), COALESCE(merged_by_login, ''),
 		       COALESCE(merged_by_id, 0), merged_at, href
 		FROM pull_requests
 		WHERE org = ? AND repo = ? AND number = ?`, org, repo, number)
 	var pr model.PullRequest
 	if err := row.Scan(&pr.Org, &pr.Repo, &pr.Number, &pr.Title, &pr.Merged,
-		&pr.HeadSHA, &pr.HeadBranch, &pr.MergeCommitSHA, &pr.AuthorLogin,
+		&pr.HeadSHA, &pr.HeadBranch, &pr.BaseBranch, &pr.MergeCommitSHA, &pr.AuthorLogin,
 		&pr.AuthorID, &pr.MergedByLogin, &pr.MergedByID, &pr.MergedAt, &pr.Href); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -171,7 +171,7 @@ func (d *DB) GetPullRequest(ctx context.Context, org, repo string, number int) (
 func (d *DB) GetPRsForCommit(ctx context.Context, org, repo, sha string) ([]model.PullRequest, error) {
 	rows, err := d.DB.QueryContext(ctx, `
 		SELECT p.org, p.repo, p.number, p.title, p.merged, p.head_sha,
-		       COALESCE(p.head_branch, ''), p.merge_commit_sha, p.author_login,
+		       COALESCE(p.head_branch, ''), COALESCE(p.base_branch, ''), p.merge_commit_sha, p.author_login,
 		       COALESCE(p.author_id, 0), COALESCE(p.merged_by_login, ''),
 		       COALESCE(p.merged_by_id, 0), p.merged_at, p.href
 		FROM pull_requests p
@@ -186,7 +186,7 @@ func (d *DB) GetPRsForCommit(ctx context.Context, org, repo, sha string) ([]mode
 	for rows.Next() {
 		var pr model.PullRequest
 		if err := rows.Scan(&pr.Org, &pr.Repo, &pr.Number, &pr.Title, &pr.Merged,
-			&pr.HeadSHA, &pr.HeadBranch, &pr.MergeCommitSHA, &pr.AuthorLogin,
+			&pr.HeadSHA, &pr.HeadBranch, &pr.BaseBranch, &pr.MergeCommitSHA, &pr.AuthorLogin,
 			&pr.AuthorID, &pr.MergedByLogin, &pr.MergedByID, &pr.MergedAt, &pr.Href); err != nil {
 			return nil, fmt.Errorf("scan PR: %w", err)
 		}

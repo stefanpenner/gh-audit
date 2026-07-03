@@ -157,6 +157,11 @@ type CoAuthor struct {
 // author pushed. MergeCommitSHA is the commit GitHub created on the
 // base branch when merged (merge, squash, or last rebase commit).
 // HeadBranch is the source branch ref (e.g. "feature/xyz").
+// BaseBranch is the target ref the PR merged into (e.g. "main"). It is
+// the delivery destination: §7's landing-scoped verdict credits a PR's
+// approval only when BaseBranch is an audited branch, so a review scoped
+// to a sibling branch (gitflow `feat → dev`) cannot vouch for a
+// protected-branch landing. GitHub sets it from `pull_request.base.ref`.
 //
 //	Commit ──→ PullRequest ──→ Review
 //	                 └──→ EnrichmentResult
@@ -168,6 +173,7 @@ type PullRequest struct {
 	Merged         bool
 	HeadSHA        string
 	HeadBranch     string
+	BaseBranch     string
 	MergeCommitSHA string
 	AuthorLogin    string
 	AuthorID       int64

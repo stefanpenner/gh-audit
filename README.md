@@ -153,6 +153,14 @@ audit_rules:
     - main
     - "release/*"
 
+  # How a PR's approval is credited (Architecture.md §7 "Scope of the verdict"):
+  #   landing (default) — an approval counts only when the PR merged INTO an
+  #                       audited branch, so a review scoped to a sibling branch
+  #                       (gitflow feat -> dev) can't vouch for a main landing.
+  #   content           — legacy: any associated merged PR's approval counts,
+  #                       wherever it merged.
+  review_scope: landing
+
 sync:
   concurrency: 10
   enrich_concurrency: 16

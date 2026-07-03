@@ -62,6 +62,18 @@ type AuditRulesConfig struct {
 	//
 	// Default when unset: ["master", "main"].
 	AuditBranches []string `yaml:"audit_branches"`
+
+	// ReviewScope selects how §7 credits a PR's approval (Architecture.md §7
+	// "Scope of the verdict"):
+	//   "landing" (default, "") — a PR's approval confers compliance only when
+	//                             the PR merged into an audited branch, so a
+	//                             review scoped to a sibling branch (gitflow
+	//                             `feat → dev`) cannot vouch for a
+	//                             protected-branch landing.
+	//   "content"               — legacy: any associated merged PR's approval
+	//                             counts, wherever it merged.
+	// Validated at load; an unknown value is rejected.
+	ReviewScope string `yaml:"review_scope"`
 }
 
 // CheckConfig describes a required status check.
@@ -202,6 +214,12 @@ func (c *Config) applyDefaults() {
 func (c *Config) validate() error {
 	if len(c.Orgs) == 0 {
 		return fmt.Errorf("config: at least one org is required")
+	}
+	switch c.AuditRules.ReviewScope {
+	case "", "landing", "content":
+		// ok — "" resolves to landing scope at the pipeline (the default).
+	default:
+		return fmt.Errorf("config: audit_rules.review_scope %q is invalid — use \"landing\" (default) or \"content\"", c.AuditRules.ReviewScope)
 	}
 	seenOrgs := make(map[string]bool, len(c.Orgs))
 	for i, org := range c.Orgs {
