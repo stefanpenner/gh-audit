@@ -1,0 +1,65 @@
+diff --git a/BUILD.bazel b/BUILD.bazel
+new file mode 100644
+index 0000000..baa723f
+--- /dev/null
++++ b/BUILD.bazel
+@@ -0,0 +1,59 @@
++load("@io_bazel_rules_go//go:def.bzl", "go_library")
++load("@rules_cc//cc:defs.bzl", "cc_import")
++
++# Hand-owned BUILD for go-duckdb (build_file_generation = "off" in MODULE.bazel).
++# Two changes vs. gazelle's default output:
++#   1. arrow.go is dropped — gh-audit uses database/sql, not go-duckdb's Arrow
++#      API. This removes the apache/arrow-go cgo bridge (arrow/cdata), which
++#      otherwise fails to find its vendored headers under Bazel.
++#   2. The prebuilt per-platform libduckdb.a is staged as a cc_import in cdeps,
++#      so the cgo link (cgo_static.go's `#cgo LDFLAGS: -lduckdb
++#      -L${SRCDIR}/deps/<platform>`) finds the archive as a real action input.
++cc_import(
++    name = "libduckdb",
++    static_library = select({
++        "@io_bazel_rules_go//go/platform:darwin_amd64": "deps/darwin_amd64/libduckdb.a",
++        "@io_bazel_rules_go//go/platform:darwin_arm64": "deps/darwin_arm64/libduckdb.a",
++        "@io_bazel_rules_go//go/platform:linux_amd64": "deps/linux_amd64/libduckdb.a",
++        "@io_bazel_rules_go//go/platform:linux_arm64": "deps/linux_arm64/libduckdb.a",
++    }),
++)
++
++go_library(
++    name = "go-duckdb",
++    srcs = [
++        "abi.go",
++        "appender.go",
++        "cgo_static.go",
++        "connection.go",
++        "data_chunk.go",
++        "duckdb.go",
++        "duckdb.h",
++        "errors.go",
++        "profiling.go",
++        "replacement_scan.go",
++        "result.go",
++        "row.go",
++        "rows.go",
++        "scalarUDF.go",
++        "statement.go",
++        "tableUDF.go",
++        "transaction.go",
++        "type.go",
++        "type_info.go",
++        "types.go",
++        "udf_utils.go",
++        "value.go",
++        "vector.go",
++        "vector_getters.go",
++        "vector_setters.go",
++    ],
++    cgo = True,
++    cdeps = [":libduckdb"],
++    importpath = "github.com/marcboeker/go-duckdb",
++    visibility = ["//visibility:public"],
++    deps = [
++        "@com_github_go_viper_mapstructure_v2//:mapstructure",
++        "@com_github_google_uuid//:uuid",
++    ],
++)

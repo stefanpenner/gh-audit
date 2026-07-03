@@ -10,13 +10,21 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - name: Setup Bazel
+        uses: bazel-contrib/setup-bazel@0.14.0
         with:
-          go-version-file: go.mod
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
 
-      - run: go test ./...
+      - name: Test
+        run: bazel test //...
+
+      - name: Build
+        run: bazel build //...
 
   fixtures:
     name: Validate against stefanpenner/gh-audit-test-fixtures
@@ -27,11 +35,15 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - name: Setup Bazel
+        uses: bazel-contrib/setup-bazel@0.14.0
         with:
-          go-version-file: go.mod
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
 
       - name: Install DuckDB CLI
         run: |
@@ -41,7 +53,15 @@ jobs:
           chmod +x "$HOME/.local/bin/duckdb"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      # Build the binary with Bazel (host GCC + the static libduckdb.a)
+      # and hand it to the fixtures script via GH_AUDIT_BIN.
+      - name: Build gh-audit (via Bazel)
+        run: bazel build //:gh-audit
+
       - name: Validate fixtures
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./scripts/test-fixtures.sh
+        run: |
+          GH_AUDIT_BIN="$PWD/$(bazel cquery --output=files //:gh-audit 2>/dev/null | head -1)"
+          export GH_AUDIT_BIN
+          ./scripts/test-fixtures.sh

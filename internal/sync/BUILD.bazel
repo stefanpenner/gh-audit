@@ -1,0 +1,41 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "sync",
+    srcs = [
+        "annotations.go",
+        "audit.go",
+        "dbwriter.go",
+        "pipeline.go",
+        "progress.go",
+    ],
+    importpath = "github.com/stefanpenner/gh-audit/internal/sync",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/db",
+        "//internal/github",
+        "//internal/model",
+        "@org_golang_x_sync//errgroup",
+    ],
+)
+
+go_test(
+    name = "sync_test",
+    srcs = [
+        "audit_bench_test.go",
+        "audit_fixes_test.go",
+        "audit_test.go",
+        "cursor_graph_test.go",
+        "dbwriter_test.go",
+        "pipeline_test.go",
+        "recovery_integration_test.go",
+    ],
+    embed = [":sync"],
+    deps = [
+        "//internal/db",
+        "//internal/github",
+        "//internal/model",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
+)

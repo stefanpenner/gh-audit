@@ -1,0 +1,35 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "report",
+    srcs = [
+        "report.go",
+        "rules.go",
+        "xlsx.go",
+    ],
+    importpath = "github.com/stefanpenner/gh-audit/internal/report",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/model",
+        "@com_github_xuri_excelize_v2//:excelize",
+    ],
+)
+
+go_test(
+    name = "report_test",
+    srcs = [
+        "exempt_flag_test.go",
+        "fuzz_test.go",
+        "report_bench_test.go",
+        "report_test.go",
+        "rules_test.go",
+        "xlsx_test.go",
+    ],
+    embed = [":report"],
+    deps = [
+        "@com_github_marcboeker_go_duckdb//:go-duckdb",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@com_github_xuri_excelize_v2//:excelize",
+    ],
+)

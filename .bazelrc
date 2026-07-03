@@ -1,0 +1,16 @@
+common --enable_platform_specific_config
+
+# Hermetic builds: don't leak host environment into actions, and give the
+# sandbox a stable tmp mount (needed by some cgo/test actions).
+build --incompatible_strict_action_env
+build:linux --sandbox_add_mount_pair=/tmp
+build:macos --sandbox_add_mount_pair=/var/tmp
+
+# gh-audit links the prebuilt static libduckdb.a through cgo, so we do NOT
+# set @rules_go//go/config:pure. The CC toolchain is host-autodetected on
+# every platform (GCC on Linux, Xcode on macOS) — the Linux libduckdb.a is
+# GCC/libstdc++-built, which rules out a hermetic zig/libc++ toolchain. See
+# MODULE.bazel and //third_party/go-duckdb for the go-duckdb wiring (arrow.go
+# is dropped there, not via a build tag).
+
+test --test_output=errors

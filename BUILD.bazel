@@ -1,0 +1,27 @@
+load("@bazel_env.bzl", "bazel_env")
+load("@gazelle//:def.bzl", "gazelle")
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+# gazelle:prefix github.com/stefanpenner/gh-audit
+gazelle(name = "gazelle")
+
+bazel_env(
+    name = "bazel_env",
+    tools = {
+        "go": "@rules_go//go",
+    },
+)
+
+go_library(
+    name = "gh-audit_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/stefanpenner/gh-audit",
+    visibility = ["//visibility:private"],
+    deps = ["//cmd"],
+)
+
+go_binary(
+    name = "gh-audit",
+    embed = [":gh-audit_lib"],
+    visibility = ["//visibility:public"],
+)

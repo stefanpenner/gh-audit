@@ -3,3 +3,6 @@ gh-audit
 examples/audit.db
 examples/audit-report.xlsx
 examples/telemetry.jsonl
+
+# Bazel
+bazel-*

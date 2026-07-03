@@ -1,0 +1,15 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "model",
+    srcs = ["types.go"],
+    importpath = "github.com/stefanpenner/gh-audit/internal/model",
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "model_test",
+    srcs = ["fuzz_test.go"],
+    data = glob(["testdata/**"]),
+    embed = [":model"],
+)

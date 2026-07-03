@@ -25,7 +25,13 @@ if [[ -z "${GITHUB_TOKEN:-}" ]]; then
     exit 2
 fi
 
-for bin in go jq duckdb curl; do
+# A prebuilt binary can be supplied via GH_AUDIT_BIN (e.g. Bazel's
+# bazel-bin/gh-audit in CI); only then is the Go toolchain unnecessary.
+required_bins="jq duckdb curl"
+if [[ -z "${GH_AUDIT_BIN:-}" ]]; then
+    required_bins="go $required_bins"
+fi
+for bin in $required_bins; do
     if ! command -v "$bin" >/dev/null 2>&1; then
         echo "error: required binary '$bin' not found in PATH" >&2
         exit 2
@@ -50,11 +56,16 @@ tokens:
         repos: [${FIXTURES_REPO#*/}]
 EOF
 
-echo "==> Building gh-audit"
-(cd "$REPO_ROOT" && go build -o "$TMPDIR/gh-audit" .)
+if [[ -n "${GH_AUDIT_BIN:-}" ]]; then
+    echo "==> Using prebuilt gh-audit: $GH_AUDIT_BIN"
+else
+    echo "==> Building gh-audit"
+    GH_AUDIT_BIN="$TMPDIR/gh-audit"
+    (cd "$REPO_ROOT" && go build -o "$GH_AUDIT_BIN" .)
+fi
 
 echo "==> Syncing $FIXTURES_REPO"
-"$TMPDIR/gh-audit" --config "$TMPDIR/config.yaml" sync \
+"$GH_AUDIT_BIN" --config "$TMPDIR/config.yaml" sync \
     --repo "$FIXTURES_REPO" \
     --db "$TMPDIR/audit.db" \
     --telemetry-output=- \
@@ -71,7 +82,7 @@ echo "==> Syncing $FIXTURES_REPO"
 # pr_count=2, whose second commit→PR link is written during the second
 # PR's enrichment, after the commit itself was audited.
 echo "==> Re-evaluating commits from DB (bundle path)"
-"$TMPDIR/gh-audit" --config "$TMPDIR/config.yaml" re-evaluate-commits \
+"$GH_AUDIT_BIN" --config "$TMPDIR/config.yaml" re-evaluate-commits \
     --db "$TMPDIR/audit.db" \
     >"$TMPDIR/reaudit.log" 2>&1 || {
         echo "re-evaluate-commits failed; tail of log:" >&2
