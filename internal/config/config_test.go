@@ -231,8 +231,10 @@ tokens:
 }
 
 func TestExpandHomeInPaths(t *testing.T) {
-	home, err := os.UserHomeDir()
-	require.NoError(t, err)
+	// Pin HOME so the test is self-contained: a hermetic sandbox (e.g. Bazel
+	// with --incompatible_strict_action_env) does not pass the ambient $HOME.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
@@ -274,10 +276,21 @@ tokens:
 		return Load(path)
 	}
 
-	t.Run("exempt entry with neither id nor verified_emails is rejected", func(t *testing.T) {
-		// Login-only entries can never match anything (matching is id-or-
-		// verified-emails); accepting one silently produces false flags —
-		// the inverse of the documented "mae" incident.
+	t.Run("review_scope: valid values accepted, unknown rejected", func(t *testing.T) {
+		for _, scope := range []string{"", "landing", "content"} {
+			_, err := write(t, base+"audit_rules:\n  review_scope: "+scope+"\n")
+			require.NoError(t, err, "scope %q should be accepted", scope)
+		}
+		_, err := write(t, base+"audit_rules:\n  review_scope: sideways\n")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "review_scope")
+		assert.Contains(t, err.Error(), "landing")
+	})
+
+	t.Run("exempt entry without an id is rejected", func(t *testing.T) {
+		// Matching is id-only; a login-only entry can never match anything,
+		// and accepting one silently produces false flags — the inverse of
+		// the documented "mae" incident.
 		_, err := write(t, base+`
 exemptions:
   authors:
@@ -285,6 +298,23 @@ exemptions:
 `)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "exemptions")
+		assert.Contains(t, err.Error(), "id")
+	})
+
+	t.Run("retired verified_emails is rejected with a migration message", func(t *testing.T) {
+		// The email path was forgeable; configs that still carry it must fail
+		// loudly rather than have it silently ignored.
+		_, err := write(t, base+`
+exemptions:
+  authors:
+    - login: somebot
+      id: 12345
+      verified_emails:
+        - bot@example.com
+`)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "verified_emails")
+		assert.Contains(t, err.Error(), "no longer supported")
 	})
 
 	t.Run("exempt entry with id passes", func(t *testing.T) {

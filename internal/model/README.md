@@ -67,6 +67,7 @@ classDiagram
         Merged bool
         HeadSHA string
         HeadBranch string
+        BaseBranch string
         MergeCommitSHA string
         AuthorLogin string
         AuthorID int64
@@ -159,6 +160,7 @@ classDiagram
         Comment string
         VerifiedEmails []string
     }
+    note for ExemptAuthor "Matched by ID only.\nVerifiedEmails is retired:\nrejected at config load."
 
     RepoInfo "1" --o "*" Commit : contains
     RepoInfo "1" --o "1" SyncCursor : tracks

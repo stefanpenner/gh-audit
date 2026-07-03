@@ -96,7 +96,15 @@ type StatsFetcher func(trigger StatsTrigger, org, repo, sha string) (additions, 
 //   - §8 (clean-revert waiver) is standalone: it judges the revert on its own
 //     signals and does not inspect the reverted commit's verdict. See
 //     TODO.md for the stricter cross-commit variant.
-func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor, requiredChecks []RequiredCheck, fetchStats StatsFetcher) model.AuditResult {
+//
+// auditedBranches carries §7's landing-scope. When non-empty the verdict is
+// LANDING-SCOPED: a PR's approval can confer compliance only if the PR merged
+// into one of these branches (pr.BaseBranch match). This closes the delivering-
+// PR gap — a review scoped to a sibling branch (gitflow `feat → dev`) can no
+// longer vouch for a protected-branch landing. When empty (nil) the verdict is
+// CONTENT-SCOPED (legacy behaviour): any associated merged PR's approval counts,
+// regardless of where it merged. See Architecture.md §7 "Scope of the verdict".
+func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor, requiredChecks []RequiredCheck, fetchStats StatsFetcher, auditedBranches ...string) model.AuditResult {
 	// Informational fields shared by every return path (revert/merge
 	// signals, annotations, IsBot). Populated once, before any rule runs.
 	result := initAuditResult(commit, enrichment)
@@ -138,8 +146,8 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	// finalizeNonCompliant can report its reasons.
 	var best prVerdict
 	for i := range enrichment.PRs {
-		v := evaluatePR(commit, enrichment, &enrichment.PRs[i], requiredChecks, fetchStats, exemptAuthors)
-		if v.approvalOnFinal && v.ownerApprovalOK {
+		v := evaluatePR(commit, enrichment, &enrichment.PRs[i], requiredChecks, fetchStats, exemptAuthors, auditedBranches)
+		if v.approvalOnFinal && v.ownerApprovalOK && v.delivers {
 			return finalizeCompliantPR(result, commit, enrichment, v)
 		}
 		if betterVerdict(v, best) {
@@ -193,25 +201,14 @@ func initAuditResult(commit model.Commit, enrichment model.EnrichmentResult) mod
 // still marked so reviewers can see the match — and the function returns
 // false so downstream rules audit the human code.
 //
-// Matching prefers the unforgeable numeric account id; for service accounts
-// whose emails GitHub doesn't bind to an account (commit.AuthorID == 0) the
-// rule falls back to the operator-curated `verified_emails` list. See
-// isExemptCommit for the full rationale.
+// Matching is on the unforgeable numeric account id only (see
+// isExemptCommit) — there is no email fallback, so a trusted id is exempt
+// even on a direct push.
 func applyExemptAuthorRule(result *model.AuditResult, commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor, fetchStats StatsFetcher) bool {
-	if !isExemptCommit(commit.AuthorID, commit.AuthorEmail, exemptAuthors) {
+	if !isExemptCommit(commit.AuthorID, exemptAuthors) {
 		return false
 	}
 	result.IsExemptAuthor = true
-	// The match came via the forgeable verified_emails fallback iff the
-	// AuthorID is unresolved (a trusted id would have matched on the
-	// non-forgeable id path). That fallback is only safe when an associated
-	// PR brings the every-contributor backstop (hasNonExemptPRContributors)
-	// into play. On a direct push there is no PR and no backstop, so a
-	// forged git-author email could waive unreviewed code — fail closed.
-	// A non-forgeable id match needs no such backstop and is unaffected.
-	if !model.TrustedID(commit.AuthorID) && len(enrichment.PRs) == 0 {
-		return false
-	}
 	if hasNonExemptPRContributors(commit.Org, commit.Repo, enrichment, exemptAuthors, fetchStats) {
 		return false
 	}
@@ -222,42 +219,24 @@ func applyExemptAuthorRule(result *model.AuditResult, commit model.Commit, enric
 }
 
 // isExemptCommit decides whether a commit's authorship matches the
-// exempt list. The preferred signal is the numeric account id —
-// GitHub-controlled, immutable, never reused, and not forgeable
-// client-side. When the id is unavailable (AuthorID == 0, typical for
-// service accounts whose git-author email isn't bound to a GitHub
-// account) the function falls back to matching the commit's
-// author email against any exempt entry's curated `verified_emails`
-// list. The email path is forgeable in isolation (any local committer
-// can set their git-author email arbitrarily), so callers that want
-// to extend a carve-out beyond the audited commit itself — e.g. to a
-// squash-merged PR's branch contents — must additionally verify every
-// PR-branch commit passes this same check (see
-// hasNonExemptPRContributors). The combination "operator-vetted email
-// list + every contributor passes" recovers the same trust property
-// id-only matching provided.
-func isExemptCommit(authorID int64, authorEmail string, exemptAuthors []model.ExemptAuthor) bool {
-	// The ghost id carries zero identity information (every deleted user
-	// shares it), so it is treated like an unresolved id: fall through to
-	// the operator-curated verified_emails list rather than taking the
-	// id path — a vetted service account whose GitHub user was deleted
-	// keeps its exemption through the email it still commits with.
-	if model.TrustedID(authorID) {
-		for _, e := range exemptAuthors {
-			if e.ID != 0 && e.ID == authorID {
-				return true
-			}
-		}
-		return false
-	}
-	if authorEmail == "" {
+// exempt list. Matching is ID-ONLY: the immutable numeric GitHub
+// account id (commit.AuthorID vs ExemptAuthor.ID). GitHub sets this id
+// from a verified account — it is never reused, never moved by renames,
+// and not forgeable client-side.
+//
+// There is deliberately no email fallback. A git-author email is set by
+// the pushing client and GitHub does not bind it to an account when it
+// can't verify it (AuthorID stays 0), so matching it would let any
+// pusher forge an exemption by setting their email to a curated value.
+// An unresolved id (0) and the shared ghost id (every deleted account)
+// therefore never match — they identify no one.
+func isExemptCommit(authorID int64, exemptAuthors []model.ExemptAuthor) bool {
+	if !model.TrustedID(authorID) {
 		return false
 	}
 	for _, e := range exemptAuthors {
-		for _, em := range e.VerifiedEmails {
-			if strings.EqualFold(em, authorEmail) {
-				return true
-			}
+		if e.ID != 0 && e.ID == authorID {
+			return true
 		}
 	}
 	return false
@@ -310,9 +289,11 @@ func applyEmptyCommitFallback(result *model.AuditResult, commit *model.Commit, f
 }
 
 // evaluateRevertCompliance implements Architecture.md §8. It returns
-// (true, reason) iff the commit is a clean revert — either an AutoRevert
-// (trusted by construction) or a ManualRevert whose diff was verified as
-// the exact inverse of the reverted commit. Returns (false, "") otherwise.
+// (true, reason) iff the commit is a clean revert — an AutoRevert or
+// ManualRevert whose diff the enricher verified as the exact inverse of the
+// reverted commit (RevertVerification == "diff-verified"; IsCleanRevert is
+// set only in that case). A forgeable revert message never waives on its own.
+// Returns (false, "") otherwise.
 //
 // Conflict-resolved GH-UI reverts intentionally do NOT waive here — the
 // diff is no longer a pure inverse, so reviewers should eyeball the
@@ -360,6 +341,7 @@ type prVerdict struct {
 	// HasFinalApproval without folding the review list a second time.
 	latestOnFinal    map[string]model.Review
 	approvalOnFinal  bool   // §4: non-self APPROVED on pr.HeadSHA
+	delivers         bool   // §7: PR merged into an audited branch (landing-scope)
 	selfApproved     bool   // §5: any APPROVED whose reviewer is a code author
 	staleApproval    bool   // §4: non-self APPROVED on older SHA
 	postMergeConcern bool   // §4 cutoff: post-merge CHANGES_REQUESTED/DISMISSED
@@ -378,8 +360,9 @@ type prVerdict struct {
 //	Phase 3: emit §4 / §5 reasons. selfApproved and staleApproval are
 //	         independent flaws and can both appear for the same PR.
 //	Phase 4: evaluate §6 required status checks and append any failure.
-func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *model.PullRequest, requiredChecks []RequiredCheck, fetchStats StatsFetcher, exemptAuthors []model.ExemptAuthor) prVerdict {
+func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *model.PullRequest, requiredChecks []RequiredCheck, fetchStats StatsFetcher, exemptAuthors []model.ExemptAuthor, auditedBranches []string) prVerdict {
 	v := prVerdict{pr: pr}
+	v.delivers = prDelivers(pr, auditedBranches)
 	v.prBranchCommits = filterNonEmptyContributors(commit.Org, commit.Repo, enrichment.PRBranchCommits[pr.Number], fetchStats)
 
 	// Phase 1 — per-reviewer latest state on pr.HeadSHA with merge-time cutoff.
@@ -452,7 +435,78 @@ func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *mode
 		v.reasons = append(v.reasons, fmt.Sprintf("Owner Approval check missing/failed (PR #%d)", pr.Number))
 	}
 
+	// §7 landing-scope — a PR that WOULD confer compliance (independent approval
+	// on the final commit) but merged into a branch we do not audit cannot vouch
+	// for this commit's landing on the audited branch. Emit the reason only when
+	// the approval is otherwise valid; a PR that already fails §4/§5 doesn't need
+	// a second, confusing reason. Content-scoped runs (no auditedBranches) leave
+	// delivers==true and never reach this branch.
+	if v.approvalOnFinal && !v.delivers {
+		// prDelivers only returns false on a KNOWN base outside the audited
+		// set, so pr.BaseBranch is non-empty here.
+		v.reasons = append(v.reasons, fmt.Sprintf("approval is on PR #%d, which merged into %q, not an audited branch", pr.Number, pr.BaseBranch))
+	}
+
 	return v
+}
+
+// prDelivers reports whether pr merged into a branch that is being audited —
+// the landing-scope predicate for Architecture.md §7. An empty auditedBranches
+// means the run is CONTENT-SCOPED (legacy): every PR "delivers" and the caller
+// credits any associated merged PR's approval. A non-empty set means
+// LANDING-SCOPED: only a PR whose BaseBranch is in the set can confer
+// compliance, closing the sibling-branch credit gap (gitflow `feat → dev`).
+func prDelivers(pr *model.PullRequest, auditedBranches []string) bool {
+	if len(auditedBranches) == 0 {
+		return true // content-scoped
+	}
+	// Fail OPEN on unknown base. A live sync always populates BaseBranch from
+	// pull_request.base.ref, so an empty value means missing data (a legacy row
+	// synced before base branches were persisted, or a mock), NOT a real
+	// sibling-branch merge. Penalising it would mass-flip legitimate compliant
+	// verdicts on upgrade until a re-sync. The gap only opens on POSITIVE
+	// evidence — a KNOWN base outside the audited set — so an empty base is
+	// credited; one re-sync populates it and re-enables the check.
+	if pr.BaseBranch == "" {
+		return true
+	}
+	for _, pattern := range auditedBranches {
+		if globMatch(pattern, pr.BaseBranch) {
+			return true
+		}
+	}
+	return false
+}
+
+// globMatch reports whether s matches a branch glob using the same wildcard
+// vocabulary as the report layer's globsToRegex: `*` matches any run of
+// characters (including `/`, unlike path.Match) and `?` matches exactly one.
+// Concrete branch names (no wildcards) reduce to exact equality — which is
+// what the sync pipeline passes. Allocation-free two-pointer scan so it is
+// cheap to call once per PR per audited commit.
+func globMatch(pattern, s string) bool {
+	var pi, si int
+	star, mark := -1, 0
+	for si < len(s) {
+		if pi < len(pattern) && (pattern[pi] == '?' || pattern[pi] == s[si]) {
+			pi++
+			si++
+		} else if pi < len(pattern) && pattern[pi] == '*' {
+			star = pi
+			mark = si
+			pi++
+		} else if star != -1 {
+			pi = star + 1
+			mark++
+			si = mark
+		} else {
+			return false
+		}
+	}
+	for pi < len(pattern) && pattern[pi] == '*' {
+		pi++
+	}
+	return pi == len(pattern)
 }
 
 // betterVerdict reports whether candidate should replace best in the
@@ -757,9 +811,8 @@ func truncateSHA(sha string) string {
 
 // hasNonExemptPRContributors returns true if any PR branch commit author
 // is not in the exempt list. Used to prevent exempt-author early return
-// when a squash merge contains human contributions. Mirrors
-// applyExemptAuthorRule's matching: id when present, falling back to
-// `verified_emails` when AuthorID == 0.
+// when a squash merge contains human contributions. Matching is id-only,
+// mirroring applyExemptAuthorRule (see isExemptCommit).
 //
 // A non-exempt author's commit is ignored only when it is VERIFIABLY
 // empty (zero additions and deletions confirmed via fetchStats): empty
@@ -773,21 +826,16 @@ func truncateSHA(sha string) string {
 // fetchStats in offline re-audit, or a fetch error) the function fails
 // closed and treats the commit as a contribution.
 //
-// PR-branch commits come from /pulls/{n}/commits; like every ingestion
-// path they go through resolveAuthor, which keeps the row and leaves
-// AuthorID == 0 when GitHub can't bind the git-author email to an
-// account — so a zero AuthorID is normal here. The verified_emails
-// fallback lets the
-// operator vet service accounts whose emails GitHub doesn't bind to a
-// verified account; without a match (or with no email at all) we fail
-// closed, treating the contributor as non-exempt.
+// PR-branch commits come from /pulls/{n}/commits; an unresolved AuthorID
+// (0, when GitHub can't bind the git-author email to an account) is never
+// exempt, so such a contributor always counts — fail closed.
 func hasNonExemptPRContributors(org, repo string, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor, fetchStats StatsFetcher) bool {
 	if len(enrichment.PRBranchCommits) == 0 {
 		return false
 	}
 	for _, commits := range enrichment.PRBranchCommits {
 		for _, c := range commits {
-			if isExemptCommit(c.AuthorID, c.AuthorEmail, exemptAuthors) {
+			if isExemptCommit(c.AuthorID, exemptAuthors) {
 				continue
 			}
 			adds, dels, files := c.Additions, c.Deletions, c.FilesChanged
@@ -864,15 +912,15 @@ func filterNonEmptyContributors(org, repo string, commits []model.Commit, fetchS
 // approved CommitID is not reachable (force-push rewrote history, or
 // the walk leaves the known commit set), no promotion happens.
 //
-// Rows synced before parent SHAs were persisted carry no parent data;
-// for those the check degrades to the historical committer-timestamp
-// comparison, which a backdated GIT_COMMITTER_DATE can evade — one
-// online re-sync upgrades the rows and closes the hole.
+// Rows synced before parent SHAs were persisted carry no parent data.
+// There is no non-forgeable fallback for them — a committer-timestamp
+// comparison is evadable by a backdated GIT_COMMITTER_DATE — so the
+// check FAILS CLOSED (no promotion) until one online re-sync persists
+// parent SHAs and re-enables the positional walk.
 //
-// The trust boundary is the exempt-author match (id, or curated
-// verified_emails for unbound service accounts — see isExemptCommit).
-// One non-exempt commit in the post-approval set means real
-// human-authored code shipped that the reviewer never saw — the
+// The trust boundary is the exempt-author match (id-only — see
+// isExemptCommit). One non-exempt commit in the post-approval set means
+// real human-authored code shipped that the reviewer never saw — the
 // original §4 stale verdict stands.
 //
 // `mergeCommitSHA` is the PR's `merge_commit_sha`. The PR-branch list is
@@ -887,36 +935,29 @@ func isApprovalRefreshable(approval model.Review, prBranchCommits []model.Commit
 		return false
 	}
 
-	if post, ok := postApprovalByGraph(approval.CommitID, headSHA, prBranchCommits); ok {
-		if len(post) == 0 {
-			return false // approved snapshot IS the head — nothing to refresh
-		}
-		for _, c := range post {
-			if mergeCommitSHA != "" && c.SHA == mergeCommitSHA {
-				continue
-			}
-			if !isExemptCommit(c.AuthorID, c.AuthorEmail, exemptAuthors) {
-				return false
-			}
-		}
-		return true
+	post, ok := postApprovalByGraph(approval.CommitID, headSHA, prBranchCommits)
+	if !ok {
+		// No non-forgeable ordering available (legacy rows without parent
+		// SHAs, force-pushed history, or an unreachable approved SHA). The
+		// only other signal is the committer timestamp, which a backdated
+		// GIT_COMMITTER_DATE forges trivially — trusting it would let an
+		// unreviewed post-approval commit hide before the approval and be
+		// laundered into compliance. Fail closed: no promotion. One online
+		// re-sync persists parent SHAs and re-enables the positional walk.
+		return false
 	}
-
-	// Temporal fallback for rows without parent data (pre-upgrade syncs).
-	postApprovalCount := 0
-	for _, c := range prBranchCommits {
+	if len(post) == 0 {
+		return false // approved snapshot IS the head — nothing to refresh
+	}
+	for _, c := range post {
 		if mergeCommitSHA != "" && c.SHA == mergeCommitSHA {
 			continue
 		}
-		if !c.CommittedAt.After(approval.SubmittedAt) {
-			continue
-		}
-		postApprovalCount++
-		if !isExemptCommit(c.AuthorID, c.AuthorEmail, exemptAuthors) {
+		if !isExemptCommit(c.AuthorID, exemptAuthors) {
 			return false
 		}
 	}
-	return postApprovalCount > 0
+	return true
 }
 
 // postApprovalByGraph walks first parents from headSHA down to

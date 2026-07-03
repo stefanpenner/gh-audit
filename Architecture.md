@@ -4,6 +4,58 @@ This is the design reference: how gh-audit decides, and why those decisions
 can be trusted. For how to install, run, and configure it, see
 [README.md](README.md).
 
+## GitHub's data model
+
+Every verdict names a person. GitHub records several different "people" on one
+merged commit, and they are not the same person — nor equally trustworthy. This
+section pins down each role once, so the rules below can just say "author id"
+and mean something exact.
+
+### The five roles
+
+| Role | What it means | GitHub field | Trustworthy id? |
+|---|---|---|:---:|
+| **Author** | Who wrote the code | `commit.author` | **Yes** — `author.id`, when GitHub binds the commit's email to an account |
+| **Committer** | Who created the commit object | `commit.committer` | **No id exposed** — login only (e.g. `web-flow` for web merges) |
+| **PR author** | Who opened the pull request | `pull_request.user` | **Yes** — `user.id` |
+| **Reviewer** | Who submitted a review | `review.user` | **Yes** — `user.id` |
+| **Merger (actor)** | Who clicked merge | `pull_request.merged_by` | **Yes** — `user.id`, informational only |
+
+### Two layers, one commit
+
+A commit carries two layers of identity, and they differ in trust:
+
+- **Git layer** — `author.name`, `author.email`, `committer.*`, and the message.
+  These are set by the pushing client. They are **forgeable**: anyone can set
+  any name, email, or date locally. The exception is content itself — SHAs and
+  parent SHAs are content-addressed, so they can't be changed without changing
+  the commit.
+- **GitHub layer** — the numeric account ids GitHub adds when it recognises the
+  git email (`author.id`, `committer.id` where present). GitHub sets these from
+  a verified account. They are **immutable, never reused, and not forgeable by a
+  client**. An unrecognised email yields `id == 0`; a deleted account collapses
+  to the shared ghost sentinel `10137`.
+
+The whole audit keys on the GitHub layer. The git layer is used only as a hint,
+and only after a GitHub-set fact confirms it (see [Trust model](#trust-model)).
+
+### Author vs committer — the trap
+
+These two are different people far more often than they look:
+
+- **Squash / rebase merges** — GitHub replays your commits. The **author** is
+  preserved (the human who wrote the code); the **committer** becomes `web-flow`
+  (GitHub's merge identity).
+- **Merge-commit button** — `web-flow` is the committer; the merge commit has no
+  meaningful single author.
+- **Direct push** — author and committer are usually the same local user.
+
+So "who wrote this" (author) and "who landed it" (committer/merger) are separate
+questions. gh-audit answers the first with `author.id`, never with the
+committer. GitHub exposes **no committer id** on the commit object — committer is
+a login string only — which is exactly why committer login and `Co-authored-by`
+trailers are excluded from compliance entirely (see §5).
+
 ## Trust model
 
 A verdict is only as trustworthy as the data under it. This section is the one
@@ -29,9 +81,10 @@ Three things, and nothing else:
      commit's own SHA),
    - check-run conclusions,
    - the `web-flow` verified signature (only GitHub holds the signing key).
-3. **The operator-curated exempt list** (`exemptions.authors`: ids plus
-   `verified_emails`). This is a deliberate trust root. The operator vets which
-   bot and service accounts may ship without human review.
+3. **The operator-curated exempt list** (`exemptions.authors`: account **ids**
+   only). This is a deliberate trust root. The operator vets which bot and
+   service accounts may ship without human review. Matching is id-only — there
+   is no email path, because a git-author email is forgeable (see §1).
 
 The GitHub token is **read-only** (see [Required permissions](README.md#required-permissions)).
 gh-audit never writes, so it cannot perturb its own evidence.
@@ -47,18 +100,19 @@ gh-audit never writes, so it cannot perturb its own evidence.
 | `pr.merge_commit_sha` | `/pulls/{n}` | No | GitHub sets it atomically at merge time | §3 recovery, §8 manual-revert target |
 | check-run conclusions | `/commits/{ref}/check-runs`, `/status` | No | GitHub/CI-reported | §6 |
 | `web-flow` committer + `verification.verified` | commit detail | No | Only GitHub holds the web-flow signing key (CleanMerge) | §5 author-skip |
-| ManualRevert diff | `GetCommitFiles` | No | Actual patch multiset-compared against the reverted commit | §8 |
-| exempt list (id, `verified_emails`) | operator config | n/a (trust root) | Operator-curated and vetted | §1, §4 carve-out |
+| revert diff (Auto + Manual) | `GetCommitFiles` | No | Actual patch multiset-compared against the reverted commit | §8 |
+| exempt list (account **ids** only) | operator config | n/a (trust root) | Operator-curated, vetted, id-only (no email path) | §1, §4 carve-out |
 | `(#N)` squash-message token | commit message | **Yes** | **Verified before trust** — see below | §3 recovery |
-| git-author `email` (§1 fallback) | commit detail | **Yes** | Backstopped by a PR + every-contributor check — see below | §1 |
-| AutoRevert message prefix | commit message | **Yes** | **Not backstopped** — see below | §8 |
+| revert-message prefix (Auto + Manual) | commit message | **Yes** | **Verified before trust** — only picks the SHA to diff against; see below | §8 |
 
 ### Leaps through forgeable nodes
 
 A "leap" is trusting a forgeable signal to reach a verdict without first
-anchoring it to something non-forgeable. The design is to verify a forgeable
-hint against a canonical fact before trusting it. Three inputs are forgeable.
-Here is how each is handled.
+anchoring it to something non-forgeable. The rule is absolute: **a forgeable
+signal can flip a verdict to non-compliant, or stay advisory, but it can never
+flip a verdict to compliant on its own.** Every forgeable hint that feeds a
+waiver is first anchored to a canonical fact. Two forgeable inputs remain in the
+pipeline; here is how each is handled.
 
 - **§3 squash `(#N)` token — verified, no leap.** The `(#N)` in a message is a
   forgeable hint. It is accepted only when `pr.merged && pr.merge_commit_sha ==
@@ -66,32 +120,70 @@ Here is how each is handled.
   `pulls/1234.merge_commit_sha` equal this commit's SHA. Forgeable hint →
   non-forgeable check.
 
-- **§1 `verified_emails` fallback — backstopped, no leap.** When `author_id` is
-  0, §1 may match the forgeable git-author email against the operator's curated
-  list. It is trusted only with an **associated PR**, so the every-contributor
-  backstop applies (`hasNonExemptPRContributors`: each PR-branch commit must
-  pass the same id-or-email check). A direct push has no PR and no backstop, so
-  the email path **fails closed** there (`applyExemptAuthorRule`). The id path
-  is unaffected and needs no PR. The residual trust is the operator's curation
-  of the list — a declared trust root, not a forged input.
+- **§1 exempt match — id-only, no forgeable input.** Exemption matches the
+  immutable numeric `author_id` against the curated list and nothing else. The
+  git-author email is **never** consulted: it is client-set and GitHub leaves
+  `author_id == 0` when it can't bind it, so an email path would let any pusher
+  forge an exemption. The retired `verified_emails` config key is rejected at
+  load time (`config.go`). An unresolved id (0) or the shared ghost id is never
+  exempt.
 
-- **§8 AutoRevert — message-only, an accepted leap (documented).** A commit
-  whose message matches `^Automatic revert of <sha>..<sha>` is waived compliant
-  with **no** identity, signature, or diff check (`caching.go`,
-  `RevertVerification = "message-only"`). The message is forgeable, so this is
-  a leap through a forgeable node. It is kept by operator decision, on the
-  rationale "trust bot-generated auto-reverts" — accepting that nothing proves
-  the bot authored it. Contrast `ManualRevert`, which is diff-verified. Tracked
-  in `TODO.md` ("AutoRevert waiver rests on a forgeable commit message") with
-  two closure options: gate on a trusted author id, or require diff
-  verification.
+- **§8 reverts (Auto + Manual) — diff-verified, no leap.** A revert message
+  (`^Automatic revert of <new>..<old>` or `Revert "…"` + `This reverts commit
+  <sha>`) is a forgeable hint: it only names *which* commit is claimed to be
+  reverted. The waiver fires only when `IsCleanRevertDiff` confirms the revert
+  commit's own patch is the exact inverse of that commit's patch
+  (`RevertVerification = "diff-verified"`, `verifyRevertDiff` in `caching.go`).
+  A commit whose bytes are the exact inverse of `<sha>` *is* a clean revert of
+  it — whoever authored it, whatever the message claims. Any unresolved or
+  mismatched diff stays `message-only` / `diff-mismatch`, sets no waiver, and
+  falls through to the normal PR-approval rules (so it can land non-compliant).
+  AutoRevert used to be waived on the message alone; that leap is now closed —
+  it carries the reverted SHA directly but is verified like any other revert.
 
 Everything else that could be forged — committer login, `Co-authored-by`
 trailers — is **excluded from compliance entirely** (see §5, "Excluded identity
 sources"). The §4 graph carve-out replaced a forgeable committer timestamp with
-positional graph ancestry. The timestamp path survives only as a transitional
-fallback for rows synced before parent SHAs were persisted; one online re-sync
-upgrades them.
+positional graph ancestry. There is **no** timestamp fallback: rows synced
+before parent SHAs were persisted have no non-forgeable ordering, so the
+carve-out fails closed (no promotion) until one online re-sync persists parent
+SHAs. A backdated `GIT_COMMITTER_DATE` can therefore never launder an
+unreviewed post-approval commit into compliance.
+
+### Chain-of-custody checklist
+
+Every way a commit can become **compliant**, the non-forgeable fact that guards
+it, and the regression test that proves a forged input is rejected. A human
+auditor can walk this table top to bottom to confirm no waiver rests on a
+forgeable signal.
+
+| Path to compliant | Non-forgeable anchor | Forged input it rejects | Proving test |
+|---|---|---|---|
+| §1 exempt author | `author_id` == curated id (`TrustedID`, id-only) | git-author email / login | `TestEvaluateCommit_Rule1_IDOnlyExemption` ("FORGERY…"), `TestExemptCommit_IDOnly` |
+| §2 empty commit | GitHub diff stats == 0/0/0 | — (no identity) | `TestEvaluateCommit_Rule2_EmptyCommit` |
+| §3 PR recovery | `pr.merge_commit_sha == sha` | `(#N)` message token | `TestRecoverPRFromMergeMessage_MismatchRejected` |
+| §4 approval on final | reviewer `id` (`TrustedID`), review on head SHA | reviewer login | `TestEvaluateCommit_Rule4_*` |
+| §4 carve-out (refresh) | first-parent graph walk to approved SHA | committer timestamp (backdating) | `TestApprovalRefreshable_PositionalNotTemporal` ("LEAK…") |
+| §5 no self-approval | id-only `sameUser` | login, committer, co-authors | `TestEvaluateCommit_Rule5_*` |
+| §6 required checks | check-run conclusion (GitHub) | — (no identity) | `TestEvaluateCommit_Rule6_*` |
+| §7 landing scope | PR `base.ref` ∈ audited branches (`prDelivers`) | sibling-branch review credit | `TestEvaluateCommit_Rule7_LandingScope` |
+| §8 clean revert | diff is exact inverse (`IsCleanRevertDiff`) | revert commit message | `TestClassifyRevert_AutoRevertRequiresDiffVerification` |
+
+If a new waiver is added, it must enter this table with its anchor and a
+forgery-rejection test, or it does not ship.
+
+### Verdict scope — landing vs content
+
+The table certifies that no *forged* input flips a verdict. A separate,
+non-forgery question is *where* the crediting review happened. By default §7 is
+**landing-scoped**: a PR's approval counts only when the PR merged into an
+audited branch (`prDelivers`, base-branch match). A review scoped to a sibling
+branch (gitflow `feat → dev`) is genuine and non-forgeable, but it does not
+vouch for a landing on `main`, so it cannot confer compliance. Operators who
+want the older "reviewed anywhere" semantics set `audit_rules.review_scope:
+content`. See [§7, "Scope of the verdict"](#7-compliance-verdict). Either way the
+scope is a *policy* choice over genuine reviews — never a leap through a
+forgeable node.
 
 ## What gh-audit detects
 
@@ -108,12 +200,16 @@ For every commit on a protected branch, gh-audit runs a decision tree in order.
 If the commit author is on the exempt list, the commit is **compliant** at
 once. No further rules run.
 
-The match prefers the **numeric account id** (`commit.author_id` vs
-`ExemptAuthor.id`). GitHub sets this id from a verified account. It is
-immutable, never reused, and not forgeable by a client.
+The match is **id-only** (`commit.author_id` vs `ExemptAuthor.id`). GitHub sets
+this id from a verified account. It is immutable, never reused, and not
+forgeable by a client. There is no email or login path: a git-author email is
+client-set and GitHub leaves `author_id == 0` when it can't bind it, so matching
+it would let any pusher forge an exemption. An unresolved id (0) and the shared
+ghost id never match. A trusted id is exempt even on a direct push — no PR
+needed, because the identity itself is proven.
 
 **Squash backstop.** A bot can squash human code into one commit. So the
-exemption holds only when every PR-branch commit is also exempt
+exemption holds only when every PR-branch commit is also exempt by id
 (`hasNonExemptPRContributors`). One non-exempt contributor voids it:
 `IsExemptAuthor` is still set for visibility, but the squash content is audited
 normally.
@@ -127,37 +223,30 @@ marker, no fetcher, or a fetch error — it **fails closed** and voids the
 carve-out. Trusting locally-zero stats would skip every branch commit and waive
 unreviewed code.
 
-**Email fallback.** Some service accounts push with an email GitHub doesn't
-bind to an account, so `author_id` arrives as 0. The rule then matches
-`commit.author_email` against the entry's curated `verified_emails` list. This
-email is forgeable on its own, so it is honored only **when the commit has a
-PR** (so the squash backstop applies). A direct push matched only by email
-**fails closed** and drops through to §3. The id path is unaffected — a trusted
-id is exempt even on a direct push. See the [Trust model](#trust-model).
+**Retired email path.** Earlier versions matched `commit.author_email` against a
+curated `verified_emails` list when `author_id` was 0. That email is forgeable,
+so the path was removed: `verified_emails` in config is now rejected at load
+time with a migration message. Service accounts must be exempted by their
+GitHub account id.
 
 ```
-config.yaml: exemptions.authors[]    ← SOT: operator-curated list (id, verified_emails)
+config.yaml: exemptions.authors[]    ← SOT: operator-curated list (account ids only)
       │
       ▼
 GET /repos/{o}/{r}/commits/{sha}
-      → commit.author_id              ← preferred, set by GitHub from verified email binding
-      → commit.author_email           ← fallback when author_id == 0
+      → commit.author_id              ← set by GitHub from verified email binding
       │
       ▼
 EvaluateCommit (audit.go)
-      isExemptCommit(id, email):
-        author_id matches exempt.id?         → exempt (even on a direct push)
-        author_id == 0 AND email ∈ verified_emails? → exempt ONLY if a PR
-                                                exists (subject to the
-                                                PR-branch check below);
-                                                direct push → fail closed
-        else                                 → not exempt, continue to rule 2
+      isExemptCommit(id):
+        author_id is trusted AND matches an exempt.id? → exempt (even on a direct push)
+        else (incl. id==0 or ghost)                    → not exempt, continue to rule 2
       │
-      ▼ (when exempt and PR exists)
+      ▼ (when exempt)
       hasNonExemptPRContributors():
-        any branch commit fails isExemptCommit? → grant IsExemptAuthor flag for visibility,
-                                                  but audit the squash content normally
-        all branch commits exempt?              → IsCompliant=true, reason="exempt: configured author"
+        any branch commit not exempt by id? → grant IsExemptAuthor flag for visibility,
+                                              but audit the squash content normally
+        all branch commits exempt?          → IsCompliant=true, reason="exempt: configured author"
 ```
 
 ### 2. Empty commit
@@ -330,8 +419,8 @@ stale-approval against any PR whose reviewer approved before the bot ran.
 
 The carve-out (`isApprovalRefreshable` in `internal/sync/audit.go`) promotes
 such an approval to `approvalOnFinal` when **every** PR-branch commit after the
-approval passes the **same `isExemptCommit` check §1 uses** (numeric id, with
-the curated `verified_emails` fallback when the id is unresolved). The PR's own
+approval passes the **same `isExemptCommit` check §1 uses** (numeric id only —
+no email path). The PR's own
 `merge_commit_sha` is skipped first: `commit_prs ⨝ commits` pulls the
 squash-merge commit on master into the per-PR list, and a human-authored squash
 commit (the normal case) would otherwise always void the carve-out.
@@ -349,9 +438,10 @@ walk from the PR's head down to the approval's `commit_id` (parent SHAs are
 persisted at ingestion). Graph ancestry can't be forged by backdating
 `GIT_COMMITTER_DATE` — a commit between the approved SHA and the head is on that
 walk no matter what its timestamps claim. The walk fails closed: an unreachable
-approved SHA (force-push) means no promotion. Rows synced before parent
-persistence fall back to the committer-timestamp comparison until one online
-re-sync upgrades them.
+approved SHA (force-push), a missing head, or rows with no parent data at all
+(pre-upgrade syncs) all mean no promotion. There is no committer-timestamp
+fallback — a forgeable timestamp must never decide compliance. One online
+re-sync persists parent SHAs and re-enables the carve-out for legacy rows.
 
 If any post-approval commit is by a non-exempt account, the original §4
 stale-approval verdict stands. The carve-out never weakens compliance when real
@@ -477,6 +567,44 @@ If a commit has several PRs, gh-audit reports the one closest to compliant. The
 total PR count is recorded (`pr_count`); commits with `pr_count > 1` appear in
 the "Multiple PRs" report sheet.
 
+**Scope of the verdict — read this.** "Associated PR" is broader than "the PR
+that delivered this commit to the audited branch." `GET /commits/{sha}/pulls`
+returns *every* merged PR whose branch ever contained the commit, on *any* base
+branch (§3 table). To stop a review scoped to one branch from vouching for a
+landing on another, the verdict is **landing-scoped by default**
+(`audit_rules.review_scope: landing`):
+
+> a PR's approval counts for §7 only when the PR merged into an **audited
+> branch** (`pr.base.ref` ∈ `audit_branches`).
+
+The check is `prDelivers` (`internal/sync/audit.go`): the PR's `base_branch` is
+glob-matched against the repo's audited branches. A PR that merged elsewhere
+still shows in reports (it satisfies §3 "has PR") but cannot confer compliance;
+the reason reads `approval is on PR #N, which merged into "<base>", not an
+audited branch`.
+
+What this closes. Gitflow example: commit C is reviewed and merged in a
+`feat → dev` PR, then C reaches `main` with its SHA preserved — via a direct
+push or an unreviewed merge. The `feat → dev` PR (base `dev`) no longer vouches
+for C's landing on `main`; unless a PR that merged into `main` independently
+approved C on its final commit, C reads **non-compliant**. This was previously a
+scope gap (the approval is real — not a forgeable-node leap — but scoped to the
+wrong branch).
+
+`base_branch` is populated on sync from `pull_request.base.ref` and persisted
+(`pull_requests.base_branch`). It **fails open on missing data**: a PR row
+without a base branch (synced before the field existed, or a partial fetch) is
+credited, so an offline re-audit of old rows never flips a legitimate verdict —
+one re-sync populates the field and re-enables the check. The gap only opens on
+POSITIVE evidence (a *known* base outside the audited set).
+
+**Opt-out — content scope.** Set `audit_rules.review_scope: content` to restore
+the legacy behaviour: any associated merged PR's approval counts, wherever it
+merged. Some flows (e.g. reviewed `feat → dev` with automated `dev → main`
+promotion) legitimately want this — the code *was* reviewed, just not at the
+`main` landing. `sync` and `re-audit` honour the same setting, so the two never
+disagree.
+
 ### 8. Clean-revert waiver (standalone)
 
 If the verdict so far is **non-compliant**, one last check runs. It runs even on
@@ -484,12 +612,11 @@ the §3 no-PR path, so a diff-verified clean revert pushed straight to the branc
 is waived too. It is per-commit: it does not look at the reverted commit's own
 verdict (see `TODO.md` for the deferred cross-commit variant).
 
-A `IsCleanRevert=true` commit is **compliant**. That signal means one of:
-
-- `AutoRevert` — bot-generated, trusted by construction (message-only; see the
-  [Trust model](#trust-model) for the forgeability caveat).
-- `ManualRevert` whose diff was verified as the exact inverse of the reverted
-  commit (`revert_verification = "diff-verified"`).
+A `IsCleanRevert=true` commit is **compliant**. The signal is set only by
+`revert_verification = "diff-verified"` — for both `AutoRevert` and
+`ManualRevert`, the revert commit's diff was confirmed to be the exact inverse
+of the reverted commit. The revert message merely names which commit to diff
+against; it never waives on its own (see the [Trust model](#trust-model)).
 
 Every other revert shape — conflict-resolved (`diff-mismatch`), message-only,
 revert-of-revert, hand-crafted — falls through to the normal PR-approval rules.
@@ -639,7 +766,7 @@ commit SHA
   │      → distinct PR-branch commit authors
   │
   └──▶ GET /repos/{o}/{r}/commits/{sha}              (only for revert classification)
-         → file diffs for clean-revert verification (ManualRevert only)
+         → file diffs for clean-revert verification (Auto + Manual reverts)
 ```
 
 Enrichment runs in parallel batches: 25 commits per batch, bounded by
@@ -671,9 +798,9 @@ Two ordering rules are load-bearing:
   permanently reporting "no approval on final commit." With the PR last, a crash
   leaves orphan sub-rows that the next run re-fetches.
 - **PR-branch commits insert-if-absent, never upsert.** `/pulls/{n}/commits`
-  rows lack `author_email`, `href`, `is_verified`, and diff stats. A blind
-  upsert replaced rich phase-1 rows with gutted copies, breaking the §1
-  `verified_emails` fallback and merge classification on later DB reads.
+  rows lack `href`, `is_verified`, and diff stats. A blind upsert replaced rich
+  phase-1 rows with gutted copies, breaking merge classification and the §5
+  empty-contribution check on later DB reads.
 
 ### Phase 3: Audit
 
@@ -813,8 +940,9 @@ Key design points:
 - **Fan-out bounds.** `enrichCommitFanout = 10` (per batch) and `enrichPRFanout
   = 5` (per commit) cap goroutine growth without flooding the token pool.
 - **Revert-verification telemetry.** `GetCommitFiles` calls made to diff-verify
-  manual reverts are tracked separately in `APIStats.RevertVerification` — the
-  most expensive per-commit call, worth watching on its own.
+  reverts (auto and manual) are tracked separately in
+  `APIStats.RevertVerification` — the most expensive per-commit call, worth
+  watching on its own.
 
 ## Revert & merge classification
 
@@ -825,17 +953,18 @@ Two small classifiers feed the audit tree and the XLSX report.
 | Kind | Trigger | Clean? |
 |---|---|---|
 | `NotRevert` | Message has no recognised revert prefix | — |
-| `AutoRevert` | `Automatic revert of <new>..<old>` | **Yes** (trusted by construction) |
+| `AutoRevert` | `Automatic revert of <new>..<old>`; the first SHA is the reverted commit | **Only if** `IsCleanRevertDiff` confirms the diff is the exact inverse of that commit (the message alone never waives) |
 | `ManualRevert` | `Revert "..."` prefix; the reverted SHA comes from the `This reverts commit <sha>.` trailer, or — for GitHub's "Revert" button, which omits the trailer — from the reverted PR's `merge_commit_sha` via the `revert-<N>-<base-branch>` head-branch convention (`ResolveRevertedSHA`) | **Only if** `IsCleanRevertDiff` confirms the diff is the exact inverse of the reverted commit |
 | `RevertOfRevert` | Revert-of-revert (re-application) | No — treated as fresh code |
 
 `IsCleanRevertDiff` compares file patches as multisets of added/removed lines;
 order is ignored. Parsing is hunk-aware: `+++ `/`--- ` count as file headers
 only before the first `@@`, so content lines that begin with `++` or `--`
-(C-style increments, diff-in-diff) are compared as real lines, not dropped. A
-`ManualRevert` that fails the diff check becomes `revert_verification =
-"diff-mismatch"` (or `"message-only"` when no trailer SHA was found). It does
-**not** qualify for rule 8 — it falls through to the normal PR-approval rules.
+(C-style increments, diff-in-diff) are compared as real lines, not dropped. An
+`AutoRevert` or `ManualRevert` that fails the diff check becomes
+`revert_verification = "diff-mismatch"` (or `"message-only"` when the reverted
+SHA could not be resolved or its files could not be fetched). It does **not**
+qualify for rule 8 — it falls through to the normal PR-approval rules.
 
 `GetCommitFiles` paginates `files[]` to GitHub's 3,000-file ceiling. A commit
 that hits the ceiling returns `ErrCommitFilesTruncated` and classifies as

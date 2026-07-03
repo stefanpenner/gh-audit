@@ -404,6 +404,7 @@ func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until stri
 		InitialLookbackDays:    cfg.Sync.InitialLookbackDays,
 		OrgReposCacheFreshness: cfg.Sync.OrgReposCacheFreshness,
 		ExemptAuthors:          cfg.Exemptions.Authors,
+		ReviewScope:            cfg.AuditRules.ReviewScope,
 	}
 
 	for _, rc := range cfg.AuditRules.RequiredChecks {

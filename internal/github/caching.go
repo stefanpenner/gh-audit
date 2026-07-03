@@ -734,9 +734,9 @@ func (ce *CachingEnricher) enrichOneCommit(ctx context.Context, org, repo, sha s
 	}
 
 	// Classify & verify clean-revert and clean-merge status. Both may need
-	// this commit's file patches (revert verification for manual reverts,
-	// merge verification to detect conflict-resolution edits). We fetch
-	// those files at most once per commit and share between classifiers.
+	// this commit's file patches (revert verification for auto and manual
+	// reverts, merge verification to detect conflict-resolution edits). We
+	// fetch those files at most once per commit and share between classifiers.
 	ce.classifyRevertAndMerge(ctx, org, repo, sha, detail.ParentCount, &result)
 
 	return result, nil
@@ -746,7 +746,7 @@ func (ce *CachingEnricher) enrichOneCommit(ctx context.Context, org, repo, sha s
 // merge-classification fields on the enrichment. The two checks share the
 // same GetCommitFiles(current commit) call when both need it, so the total
 // cost is at most one extra API call for merge classification plus one more
-// for a diff-verified manual revert.
+// to diff-verify a revert (auto or manual).
 func (ce *CachingEnricher) classifyRevertAndMerge(
 	ctx context.Context,
 	org, repo, sha string,
@@ -775,12 +775,16 @@ func (ce *CachingEnricher) classifyRevertAndMerge(
 	case NotRevert, RevertOfRevert:
 		result.RevertVerification = "none"
 	case AutoRevert:
-		// AutoRevert's two SHAs come straight from the message; no
-		// branch-name fallback needed.
-		_, sha := ParseRevert(result.Commit.Message)
-		result.IsCleanRevert = true
-		result.RevertVerification = "message-only"
-		result.RevertedSHA = sha
+		// The "Automatic revert of <new>..<old>" message is a forgeable hint
+		// like any other commit message — nothing proves a bot wrote it. So
+		// AutoRevert is NOT trusted on its own. Its only privilege over a
+		// ManualRevert is that it carries the reverted SHA directly (no
+		// trailer or branch-name fallback needed). The waiver still requires
+		// the diff to verify as the exact inverse; otherwise it falls through
+		// to the normal review rules (and may end up non-compliant).
+		_, revertedSHA := ParseRevert(result.Commit.Message)
+		result.RevertedSHA = revertedSHA
+		ce.verifyRevertDiff(ctx, org, repo, revertedSHA, fetchOwn, result)
 	case ManualRevert:
 		// Prefer the `This reverts commit <sha>` trailer (what `git revert`
 		// emits). Fall back to GitHub's `revert-<N>-<base-branch>` head-
@@ -796,29 +800,7 @@ func (ce *CachingEnricher) classifyRevertAndMerge(
 			break
 		}
 		result.RevertedSHA = revertedSHA
-		if revertedSHA == "" {
-			result.RevertVerification = "message-only"
-			break
-		}
-		revertFiles, err := fetchOwn()
-		if err != nil {
-			result.RevertVerification = "message-only"
-			break
-		}
-		ce.Stats.RevertVerification.Add(1)
-		startRevertVerify2 := time.Now()
-		revertedFiles, err := ce.client.GetCommitFiles(ctx, org, repo, revertedSHA)
-		ce.Stats.RevertVerificationNanos.Add(time.Since(startRevertVerify2).Nanoseconds())
-		if err != nil {
-			result.RevertVerification = "message-only"
-			break
-		}
-		if IsCleanRevertDiff(revertFiles, revertedFiles) {
-			result.IsCleanRevert = true
-			result.RevertVerification = "diff-verified"
-		} else {
-			result.RevertVerification = "diff-mismatch"
-		}
+		ce.verifyRevertDiff(ctx, org, repo, revertedSHA, fetchOwn, result)
 	}
 
 	// --- Merge classification ---
@@ -829,5 +811,47 @@ func (ce *CachingEnricher) classifyRevertAndMerge(
 	result.MergeVerification = MergeKindVerification(mk)
 	if mk == CleanMerge {
 		result.IsCleanMerge = true
+	}
+}
+
+// verifyRevertDiff is the one path that can promote a revert to a clean-revert
+// waiver. It compares the revert commit's own patch against the reverted
+// commit's patch and sets IsCleanRevert only on an exact inverse. The reverted
+// SHA is chosen from a forgeable commit message upstream, but the diff check
+// here is not forgeable: a commit whose bytes are the exact inverse of <sha>
+// IS a clean revert of it, whoever authored it and whatever the message claims.
+//
+// Any failure to verify — no reverted SHA, a fetch error, or a diff mismatch —
+// leaves IsCleanRevert false and records why. The commit then falls through to
+// the normal PR-approval rules and may end up non-compliant. We never flip to
+// compliant on an unverified hint.
+func (ce *CachingEnricher) verifyRevertDiff(
+	ctx context.Context,
+	org, repo, revertedSHA string,
+	fetchOwn func() ([]model.FileDiff, error),
+	result *model.EnrichmentResult,
+) {
+	if revertedSHA == "" {
+		result.RevertVerification = "message-only"
+		return
+	}
+	revertFiles, err := fetchOwn()
+	if err != nil {
+		result.RevertVerification = "message-only"
+		return
+	}
+	ce.Stats.RevertVerification.Add(1)
+	start := time.Now()
+	revertedFiles, err := ce.client.GetCommitFiles(ctx, org, repo, revertedSHA)
+	ce.Stats.RevertVerificationNanos.Add(time.Since(start).Nanoseconds())
+	if err != nil {
+		result.RevertVerification = "message-only"
+		return
+	}
+	if IsCleanRevertDiff(revertFiles, revertedFiles) {
+		result.IsCleanRevert = true
+		result.RevertVerification = "diff-verified"
+	} else {
+		result.RevertVerification = "diff-mismatch"
 	}
 }

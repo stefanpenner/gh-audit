@@ -1,31 +1,19 @@
 # TODO
 
-## AutoRevert waiver rests on a forgeable commit message
+## §7 delivering-PR refinement (base check is live; positional walk is the follow-up)
 
-`§8` grants `IsCleanRevert=true` (→ compliant) to any commit whose message
-matches `^Automatic revert of <sha>..<sha>` with **no** verification —
-`revert.go` classifies `AutoRevert` from the message alone and `caching.go`
-sets `RevertVerification = "message-only"` (the field name admits it). The
-commit message is forgeable by anyone who can push, so an insider can land
-unreviewed code directly on a protected branch under that prefix and have it
-auto-waived. This is the one place a *compliance waiver* (not an
-informational flag) rests on a forgeable node with no non-forgeable backstop
-— see the "Trust model" section of `Architecture.md`.
+§7 is now **landing-scoped by default**: a PR's approval counts only when the PR
+merged into an audited branch (`prDelivers`, `base_branch` glob-match). Config
+`audit_rules.review_scope: content` opts out. See Architecture.md §7.
 
-Rationale for the current behaviour: "trust bot-generated auto-reverts." The
-gap is that nothing proves the bot authored it. Two ways to close it (deferred
-by decision, tracked here):
-
-- **Gate on a trusted author/committer id.** Only waive when the commit's
-  `AuthorID` matches an exempt/trusted account — ties the "trust the bot"
-  intent to a non-forgeable id. Cheap (no extra API call).
-- **Require diff verification.** Treat `AutoRevert` like `ManualRevert`:
-  verify the diff is the exact inverse via `IsCleanRevertDiff`. Strongest,
-  costs one `GetCommitFiles` per auto-revert.
-
-Until then the risk is accepted as an operator decision and documented in the
-trust model. Contrast `ManualRevert`, which is already diff-verified, and the
-`§1` email path, which now requires an associated PR backstop.
+Possible refinement: the base-branch check credits *every* branch commit of a
+PR that merged into an audited branch — including intermediate commits that a
+later commit in the same PR overwrote. A stricter (positional) variant would
+also confirm the commit lies on the first-parent path the PR actually
+introduced onto the branch, using the parent-SHA graph already persisted for the
+§4 carve-out (`postApprovalByGraph`). Low priority — the base check already
+closes the cross-branch credit gap; this only tightens same-PR intermediate
+commits, which were reviewed in that PR anyway.
 
 ## Revert-chain claim detection
 

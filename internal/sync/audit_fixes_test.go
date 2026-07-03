@@ -342,11 +342,17 @@ func TestDismissedReview_SupersededOrUnmergedStaysQuiet(t *testing.T) {
 // with AuthorID == ghost. The ghost id carries no identity, so the §1
 // match must fall through to the operator-curated verified_emails list —
 // the account's exemption survives account deletion.
-func TestExemptCommit_GhostAuthorFallsBackToVerifiedEmails(t *testing.T) {
-	exempt := []model.ExemptAuthor{{Login: "svc", VerifiedEmails: []string{"svc@corp.example"}}}
-	assert.True(t, isExemptCommit(model.GhostUserID, "svc@corp.example", exempt),
-		"ghost id must not block the email fallback")
-	assert.False(t, isExemptCommit(model.GhostUserID, "other@corp.example", exempt))
+func TestExemptCommit_IDOnly(t *testing.T) {
+	exempt := []model.ExemptAuthor{{Login: "svc", ID: 4242}}
+
+	assert.True(t, isExemptCommit(4242, exempt),
+		"a trusted id match is the only way to be exempt")
+	assert.False(t, isExemptCommit(0, exempt),
+		"an unresolved id (0) can never be exempt — no forgeable email fallback")
+	assert.False(t, isExemptCommit(model.GhostUserID, exempt),
+		"the shared ghost id identifies no one and is never exempt")
+	assert.False(t, isExemptCommit(9999, exempt),
+		"a non-matching trusted id is not exempt")
 }
 
 // With the dismissal time resolved from timeline events, the §4 verdict
@@ -477,15 +483,36 @@ func TestApprovalRefreshable_PositionalNotTemporal(t *testing.T) {
 			"an unreachable approved SHA means history was rewritten — no promotion")
 	})
 
-	t.Run("legacy rows without parents use the temporal fallback", func(t *testing.T) {
+	t.Run("legacy rows without parents fail closed — no temporal trust", func(t *testing.T) {
+		// Without parent data there is no non-forgeable way to order commits,
+		// so the carve-out must NOT promote the approval. The commit shows as
+		// non-compliant (recoverable) until a re-sync supplies parent SHAs.
 		commits := branch(at.Add(30 * time.Minute))
 		for i := range commits {
 			commits[i].ParentSHAs = nil
 		}
-		commits[1].AuthorID = 99 // post-approval (by time) commits all exempt
+		commits[1].AuthorID = 99 // even all-exempt-by-time post-approval commits
 		commits[1].AuthorLogin = "ci-bot"
 		result := evaluate(commits)
-		assert.True(t, result.IsCompliant,
-			"pre-upgrade rows keep the historical temporal behaviour until re-synced")
+		assert.False(t, result.IsCompliant,
+			"no parent data → fail closed, never trust forgeable committer timestamps")
+		assert.True(t, result.HasStaleApproval)
+	})
+
+	t.Run("LEAK: backdated unreviewed commit cannot ride in via the timestamp path", func(t *testing.T) {
+		// The attack the temporal fallback enabled: push unreviewed human code
+		// AFTER the approval, set GIT_COMMITTER_DATE to before the approval so
+		// the timestamp check skips it, and let an exempt bot commit be the
+		// only "post-approval" commit by time. With no parent data the old code
+		// promoted the stale approval and waived the 30 unreviewed additions.
+		commits := branch(at.Add(-30 * time.Minute)) // human commit backdated
+		for i := range commits {
+			commits[i].ParentSHAs = nil // legacy row: no graph data
+		}
+		// commits[1] stays AuthorID=7 (human, non-exempt) with 30 additions.
+		result := evaluate(commits)
+		assert.False(t, result.IsCompliant,
+			"a backdated non-exempt commit must never be laundered into compliance")
+		assert.True(t, result.HasStaleApproval)
 	})
 }

@@ -72,7 +72,15 @@ func newReAuditCmd() *cobra.Command {
 				})
 			}
 
-			return runReAudit(cmd.Context(), dbConn, logger, exemptAuthors, requiredChecks, reAuditFilter{
+			// §7 landing-scope must match sync, or a re-audit would silently
+			// revert landing-scoped verdicts to content-scoped. "content" opts
+			// out; "" / "landing" pass the audited branches (globs allowed).
+			var auditedBranches []string
+			if cfg.AuditRules.ReviewScope != "content" {
+				auditedBranches = cfg.AuditRules.AuditBranches
+			}
+
+			return runReAudit(cmd.Context(), dbConn, logger, exemptAuthors, requiredChecks, auditedBranches, reAuditFilter{
 				onlyFailures: onlyFailures,
 				repos:        repoFilter,
 				concurrency:  concurrency,
@@ -95,8 +103,8 @@ type reAuditFilter struct {
 	concurrency  int
 }
 
-func runReAudit(ctx context.Context, dbConn *db.DB, logger *slog.Logger, exemptAuthors []model.ExemptAuthor, requiredChecks []syncer.RequiredCheck, filter reAuditFilter) error {
-	flipped, total, err := runReAuditPass(ctx, dbConn, logger, exemptAuthors, requiredChecks, filter)
+func runReAudit(ctx context.Context, dbConn *db.DB, logger *slog.Logger, exemptAuthors []model.ExemptAuthor, requiredChecks []syncer.RequiredCheck, auditedBranches []string, filter reAuditFilter) error {
+	flipped, total, err := runReAuditPass(ctx, dbConn, logger, exemptAuthors, requiredChecks, auditedBranches, filter)
 	if err != nil {
 		return err
 	}
@@ -121,6 +129,7 @@ func runReAuditPass(
 	logger *slog.Logger,
 	exemptAuthors []model.ExemptAuthor,
 	requiredChecks []syncer.RequiredCheck,
+	auditedBranches []string,
 	filter reAuditFilter,
 ) (flipped, total int, err error) {
 	rows, err := dbConn.DB.QueryContext(ctx, "SELECT DISTINCT org, repo FROM commits ORDER BY org, repo")
@@ -189,7 +198,7 @@ func runReAuditPass(
 			repoFlipped := 0
 			for _, c := range commits {
 				enrichment := buildEnrichmentFromBundle(c, bundle)
-				result := syncer.EvaluateCommit(c, enrichment, exemptAuthors, requiredChecks, nil)
+				result := syncer.EvaluateCommit(c, enrichment, exemptAuthors, requiredChecks, nil, auditedBranches...)
 				result.AuditedAt = time.Now()
 				results = append(results, result)
 				if prior, had := bundle.priorCompliance[c.SHA]; had {

@@ -62,6 +62,18 @@ type AuditRulesConfig struct {
 	//
 	// Default when unset: ["master", "main"].
 	AuditBranches []string `yaml:"audit_branches"`
+
+	// ReviewScope selects how §7 credits a PR's approval (Architecture.md §7
+	// "Scope of the verdict"):
+	//   "landing" (default, "") — a PR's approval confers compliance only when
+	//                             the PR merged into an audited branch, so a
+	//                             review scoped to a sibling branch (gitflow
+	//                             `feat → dev`) cannot vouch for a
+	//                             protected-branch landing.
+	//   "content"               — legacy: any associated merged PR's approval
+	//                             counts, wherever it merged.
+	// Validated at load; an unknown value is rejected.
+	ReviewScope string `yaml:"review_scope"`
 }
 
 // CheckConfig describes a required status check.
@@ -203,6 +215,12 @@ func (c *Config) validate() error {
 	if len(c.Orgs) == 0 {
 		return fmt.Errorf("config: at least one org is required")
 	}
+	switch c.AuditRules.ReviewScope {
+	case "", "landing", "content":
+		// ok — "" resolves to landing scope at the pipeline (the default).
+	default:
+		return fmt.Errorf("config: audit_rules.review_scope %q is invalid — use \"landing\" (default) or \"content\"", c.AuditRules.ReviewScope)
+	}
 	seenOrgs := make(map[string]bool, len(c.Orgs))
 	for i, org := range c.Orgs {
 		if strings.TrimSpace(org.Name) == "" {
@@ -256,13 +274,21 @@ func (c *Config) validate() error {
 		}
 	}
 
-	// Exemption matching is id-or-verified-emails only (logins are
-	// display-only — mutable and forgery-prone). An entry with neither is
-	// silently inert: it never matches, and the operator believes the
-	// account is exempt while every one of its commits gets flagged.
+	// Exemption matching is id-only (logins are display-only — mutable and
+	// forgery-prone; emails are client-set and unverifiable when GitHub
+	// can't bind them). An entry without an id is silently inert: it never
+	// matches, and the operator believes the account is exempt while every
+	// one of its commits gets flagged.
 	for i, e := range c.Exemptions.Authors {
-		if e.ID == 0 && len(e.VerifiedEmails) == 0 {
-			return fmt.Errorf("config: exemptions.authors[%d] (%q) needs 'id' or 'verified_emails' — login alone never matches", i, e.Login)
+		if len(e.VerifiedEmails) > 0 {
+			// Removed 2026-06: a git-author email is forgeable (any pusher
+			// can set it) and GitHub doesn't bind it to an account when it
+			// can't verify it, so matching it let a forged email waive
+			// unreviewed code. Reject loudly rather than silently ignore.
+			return fmt.Errorf("config: exemptions.authors[%d] (%q) sets 'verified_emails', which is no longer supported — it was forgeable. Exempt by immutable account 'id' instead", i, e.Login)
+		}
+		if e.ID == 0 {
+			return fmt.Errorf("config: exemptions.authors[%d] (%q) needs 'id' — login and email never match (forgeable)", i, e.Login)
 		}
 		if e.ID == model.GhostUserID {
 			// Every deleted account shares the ghost id; exempting it

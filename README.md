@@ -153,6 +153,14 @@ audit_rules:
     - main
     - "release/*"
 
+  # How a PR's approval is credited (Architecture.md §7 "Scope of the verdict"):
+  #   landing (default) — an approval counts only when the PR merged INTO an
+  #                       audited branch, so a review scoped to a sibling branch
+  #                       (gitflow feat -> dev) can't vouch for a main landing.
+  #   content           — legacy: any associated merged PR's approval counts,
+  #                       wherever it merged.
+  review_scope: landing
+
 sync:
   concurrency: 10
   enrich_concurrency: 16
@@ -160,9 +168,11 @@ sync:
   org_repos_cache_freshness: 24h   # "0s" disables the cache
 
 exemptions:
-  # Matched by immutable numeric account id. `login` is display only.
-  # `verified_emails` is a fallback for service accounts whose email
-  # GitHub does not bind to an account. See Architecture.md §1.
+  # Matched by immutable numeric account id ONLY. `login` is display only.
+  # There is no email path — a git-author email is forgeable, so matching it
+  # would let any pusher forge an exemption. Service accounts must have a
+  # GitHub account id. (The old `verified_emails` key is now rejected at load
+  # time.) See Architecture.md §1.
   authors:
     - login: "dependabot[bot]"
       id: 49699333

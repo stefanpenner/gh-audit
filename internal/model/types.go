@@ -96,10 +96,11 @@ type Commit struct {
 	// fix-it warning and keeps the row, so zero-ID rows do reach the
 	// audit. The ID is the only forgery-resistant author identity
 	// GitHub exposes (logins can be renamed and reclaimed; numeric
-	// IDs are immutable per account and never reused), so it's the
-	// preferred signal for §1 (exempt author) and the sole signal for
-	// §5 (self-approval) matching; §1 falls back to the operator-
-	// curated verified_emails list only when the ID is zero.
+	// IDs are immutable per account and never reused), so it is the
+	// SOLE matching signal for both §1 (exempt author) and §5
+	// (self-approval). A zero ID never matches — there is no email or
+	// login fallback (both are forgeable). AuthorEmail below is
+	// informational/display only.
 	AuthorID       int64
 	AuthorEmail    string
 	CommitterLogin string
@@ -156,6 +157,11 @@ type CoAuthor struct {
 // author pushed. MergeCommitSHA is the commit GitHub created on the
 // base branch when merged (merge, squash, or last rebase commit).
 // HeadBranch is the source branch ref (e.g. "feature/xyz").
+// BaseBranch is the target ref the PR merged into (e.g. "main"). It is
+// the delivery destination: §7's landing-scoped verdict credits a PR's
+// approval only when BaseBranch is an audited branch, so a review scoped
+// to a sibling branch (gitflow `feat → dev`) cannot vouch for a
+// protected-branch landing. GitHub sets it from `pull_request.base.ref`.
 //
 //	Commit ──→ PullRequest ──→ Review
 //	                 └──→ EnrichmentResult
@@ -167,6 +173,7 @@ type PullRequest struct {
 	Merged         bool
 	HeadSHA        string
 	HeadBranch     string
+	BaseBranch     string
 	MergeCommitSHA string
 	AuthorLogin    string
 	AuthorID       int64
@@ -260,17 +267,18 @@ type AuditResult struct {
 	// (compliance is evaluated point-in-time at merge).
 	HasPostMergeConcern bool
 	// IsCleanRevert is true when the commit is a clean revert of a prior
-	// commit. For bot auto-reverts this is trusted by message pattern; for
-	// manual reverts it is set only when RevertVerification == "diff-verified".
+	// commit. Both bot auto-reverts and manual reverts must be diff-verified:
+	// it is set only when RevertVerification == "diff-verified". A forgeable
+	// revert message never sets it on its own.
 	// Compliance-bearing: rule §8 (clean-revert waiver) flips an otherwise
 	// non-compliant verdict to compliant when this is true.
 	IsCleanRevert bool
 	// RevertVerification records how IsCleanRevert was determined.
-	// One of: "" / "none" (not a revert), "message-only" (bot auto-revert
-	// trusted by pattern, or manual revert whose referenced commit could not
-	// be fetched), "diff-verified" (manual revert whose diff is the exact
-	// inverse of the referenced commit), "diff-mismatch" (manual revert whose
-	// diff is not a clean inverse).
+	// One of: "" / "none" (not a revert), "message-only" (a revert — auto or
+	// manual — whose referenced commit could not be resolved or fetched, so
+	// the diff was never compared), "diff-verified" (the revert's diff is the
+	// exact inverse of the referenced commit), "diff-mismatch" (the diff is
+	// not a clean inverse). Only "diff-verified" waives.
 	RevertVerification string
 	// RevertedSHA is the SHA of the commit being reverted, extracted from
 	// the revert commit's message. Empty if not a revert.
@@ -377,13 +385,9 @@ type EnrichmentResult struct {
 //
 // The matching contract:
 //
-//   - ID, when non-zero, is the canonical key. It's the immutable
-//     numeric GitHub account ID — never reused across deletions,
-//     never transferred by renames, not forgeable.
-//   - VerifiedEmails is the fallback for commits whose author.id
-//     couldn't be resolved (commit's git author email isn't bound to
-//     a verified GH user; service accounts often hit this). See the
-//     field comment below for the trust contract.
+//   - ID is the ONLY matching key. It's the immutable numeric GitHub
+//     account ID — never reused across deletions, never transferred by
+//     renames, not forgeable. An entry without an id never matches.
 //   - Login, Type, and Name are display-only metadata captured at
 //     resolution time. Login is never used for matching — renames +
 //     90-day cooldown can transfer a username to a different account.
@@ -402,15 +406,11 @@ type ExemptAuthor struct {
 	Type    string `yaml:"type,omitempty"`
 	Name    string `yaml:"name,omitempty"`
 	Comment string `yaml:"comment,omitempty"`
-	// VerifiedEmails enumerates git-author emails that the operator has
-	// vetted as belonging to this exempt account. Used as a fallback for
-	// service accounts whose emails GitHub does not bind to a verified
-	// account (so commit.AuthorID stays 0). The list is consulted only
-	// when AuthorID is unavailable; an id match always wins. Forgeable
-	// in the abstract — anyone can set a git-author email locally — so
-	// callers must additionally enforce that every contributor on the
-	// PR's branch passes the same id-or-email check before extending
-	// the carve-out to a squash merge. See isExemptCommit and
-	// hasNonExemptPRContributors.
+	// VerifiedEmails is RETIRED (2026-06). A git-author email is set by
+	// the pushing client and GitHub does not bind it to an account when it
+	// can't verify it, so matching it let a forged email waive unreviewed
+	// code. The field is kept only so config validation can DETECT it in
+	// existing configs and reject loudly with a migration message — it is
+	// never consulted for matching. Exempt by immutable account id.
 	VerifiedEmails []string `yaml:"verified_emails,omitempty"`
 }

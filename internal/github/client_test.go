@@ -1015,11 +1015,12 @@ func TestGetBranchHead(t *testing.T) {
 	assert.Equal(t, "tipsha123", head)
 }
 
-// /pulls/{n}/commits returns full commit objects; the audit's §1
-// verified_emails fallback and §4 refresh carve-out key on AuthorEmail of
-// PR-branch commits, and squash-merged PRs' branch commits exist ONLY via
-// this endpoint. A hand-rolled mapping that drops the email (and
-// co-authors / verification) silently disables those rules.
+// /pulls/{n}/commits returns full commit objects. Squash-merged PRs'
+// branch commits exist ONLY via this endpoint, and the §1 squash backstop,
+// §4 refresh carve-out, and merge classification key on their author id,
+// parent SHAs, and verification. A hand-rolled mapping that drops fields
+// (id, parents, verification, email, co-authors) silently disables those
+// rules, so we assert the full shape round-trips.
 func TestListPRCommits_PopulatesFullCommitShape(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode([]map[string]any{{
@@ -1046,7 +1047,7 @@ func TestListPRCommits_PopulatesFullCommitShape(t *testing.T) {
 	require.Len(t, commits, 1)
 	c := commits[0]
 	assert.Equal(t, "svc-account@corp.example", c.AuthorEmail,
-		"§1 verified_emails fallback needs the git-header email")
+		"git-header email must round-trip (informational/display; not used for exemption)")
 	assert.Equal(t, int64(77), c.AuthorID)
 	assert.True(t, c.IsVerified)
 	assert.Equal(t, "https://github.com/testorg/repo/commit/bc1", c.Href)

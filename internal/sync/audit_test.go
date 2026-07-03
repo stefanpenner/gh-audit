@@ -20,6 +20,7 @@ type evalCase struct {
 	enrichment           model.EnrichmentResult
 	exemptAuthors        []model.ExemptAuthor
 	requiredChecks       []RequiredCheck
+	auditedBranches      []string // §7 landing-scope; nil = content-scoped
 	wantCompliant        bool
 	wantBot              bool
 	wantExempt           bool
@@ -42,7 +43,7 @@ func runEvalCases(t *testing.T, cases []evalCase) {
 	t.Helper()
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			result := EvaluateCommit(tt.commit, tt.enrichment, tt.exemptAuthors, tt.requiredChecks, nil)
+			result := EvaluateCommit(tt.commit, tt.enrichment, tt.exemptAuthors, tt.requiredChecks, nil, tt.auditedBranches...)
 
 			assert.Equal(t, tt.wantCompliant, result.IsCompliant, "IsCompliant (reasons: %v)", result.Reasons)
 			assert.Equal(t, tt.wantBot, result.IsBot, "IsBot")
@@ -187,71 +188,68 @@ func TestEvaluateCommit_Rule1_ExemptAuthor(t *testing.T) {
 // strict id-only matching the merge commit looks non-exempt despite
 // being the bot's work.
 //
-// The carve-out: when commit.AuthorID is 0, fall back to matching
-// commit.AuthorEmail against the exempt entry's `verified_emails`
-// list. The list is operator-curated (same trust class as the rest of
-// the exempt config), and is only consulted when GitHub couldn't
-// supply a forgery-resistant id. To prevent a squash from absorbing
-// non-exempt code, EVERY PR-branch commit must independently pass the
-// same test (id OR email match), or the exemption is denied.
-func TestEvaluateCommit_Rule1_VerifiedEmailFallback(t *testing.T) {
+// Exemption is ID-ONLY. A git-author email is forgeable (any pusher can
+// set it) and GitHub doesn't bind it to an account when it can't verify
+// it (AuthorID stays 0), so it is never consulted. To prevent a squash
+// from absorbing non-exempt code, EVERY PR-branch commit must also match
+// an exempt id, or the exemption is denied.
+func TestEvaluateCommit_Rule1_IDOnlyExemption(t *testing.T) {
 	exempt := []model.ExemptAuthor{
-		{
-			Login:          "svc-bot-account",
-			ID:             900001,
-			Type:           "User",
-			Name:           "svc-bot",
-			VerifiedEmails: []string{"svc-bot@example.com"},
-		},
+		{Login: "svc-bot-account", ID: 900001, Type: "User", Name: "svc-bot"},
 	}
 
-	t.Run("squash-merge by exempt service account whose email isn't id-bound — exempt", func(t *testing.T) {
+	t.Run("squash-merge by exempt id, all branch commits same id — exempt", func(t *testing.T) {
 		mergeCommit := model.Commit{
 			Org: "myorg", Repo: "myrepo", SHA: "merge-sha",
-			AuthorLogin: "", AuthorID: 0,
-			AuthorEmail:    "svc-bot@example.com",
-			CommitterLogin: "web-flow",
-			ParentCount:    1, Additions: 5, Deletions: 3,
+			AuthorID: 900001, CommitterLogin: "web-flow",
+			ParentCount: 1, Additions: 5, Deletions: 3,
 		}
 		pr := model.PullRequest{
 			Org: "myorg", Repo: "myrepo", Number: 42,
-			MergeCommitSHA: "merge-sha",
-			AuthorLogin:    "svc-bot-account",
-			Merged:         true,
+			MergeCommitSHA: "merge-sha", AuthorLogin: "svc-bot-account", Merged: true,
 		}
 		enrichment := model.EnrichmentResult{
 			PRs: []model.PullRequest{pr},
 			PRBranchCommits: map[int][]model.Commit{
-				42: {
-					{Org: "myorg", Repo: "myrepo", SHA: "branch1", AuthorID: 0, AuthorEmail: "svc-bot@example.com", ParentCount: 1, Additions: 5, Deletions: 3},
-				},
+				42: {{Org: "myorg", Repo: "myrepo", SHA: "branch1", AuthorID: 900001, ParentCount: 1, Additions: 5, Deletions: 3}},
 			},
 		}
 		result := EvaluateCommit(mergeCommit, enrichment, exempt, nil, nil)
-		assert.True(t, result.IsCompliant, "merge commit by id-less but email-verified exempt account should be compliant. reasons=%v", result.Reasons)
-		assert.True(t, result.IsExemptAuthor, "IsExemptAuthor should be set when verified_emails matches")
+		assert.True(t, result.IsCompliant, "merge by exempt id with all-exempt branch should be compliant. reasons=%v", result.Reasons)
+		assert.True(t, result.IsExemptAuthor)
 		assert.Equal(t, []string{"exempt: configured author"}, result.Reasons)
+	})
+
+	t.Run("FORGERY: id-less author with a 'curated' email — NOT exempt", func(t *testing.T) {
+		// The attack id-only matching defeats: a pusher sets their git-author
+		// email to a value the operator once trusted, but GitHub can't bind it
+		// so AuthorID==0. There is no email path, so it can never be exempt.
+		commit := model.Commit{
+			Org: "myorg", Repo: "myrepo", SHA: "merge-sha",
+			AuthorID: 0, AuthorEmail: "svc-bot@example.com",
+			ParentCount: 1, Additions: 5, Deletions: 3,
+		}
+		result := EvaluateCommit(commit, model.EnrichmentResult{}, exempt, nil, nil)
+		assert.False(t, result.IsCompliant, "a forgeable email must never waive a commit")
+		assert.False(t, result.IsExemptAuthor)
 	})
 
 	t.Run("squash-merge: PR-branch contains a non-exempt commit — NOT exempt", func(t *testing.T) {
 		mergeCommit := model.Commit{
 			Org: "myorg", Repo: "myrepo", SHA: "merge-sha",
-			AuthorID: 0, AuthorEmail: "svc-bot@example.com",
-			ParentCount: 1, Additions: 50, Deletions: 5,
+			AuthorID: 900001, ParentCount: 1, Additions: 50, Deletions: 5,
 		}
 		pr := model.PullRequest{
 			Org: "myorg", Repo: "myrepo", Number: 42,
-			MergeCommitSHA: "merge-sha",
-			AuthorLogin:    "svc-bot-account",
-			Merged:         true,
+			MergeCommitSHA: "merge-sha", AuthorLogin: "svc-bot-account", Merged: true,
 		}
 		enrichment := model.EnrichmentResult{
 			PRs: []model.PullRequest{pr},
 			PRBranchCommits: map[int][]model.Commit{
 				42: {
-					{Org: "myorg", Repo: "myrepo", SHA: "branch1", AuthorID: 0, AuthorEmail: "svc-bot@example.com"},
-					// Human collaborator pushed onto the bot's PR — not on the verified_emails list.
-					{Org: "myorg", Repo: "myrepo", SHA: "branch2", AuthorID: 555111, AuthorLogin: "human-contributor", AuthorEmail: "human@example.com", Additions: 30, Deletions: 2},
+					{Org: "myorg", Repo: "myrepo", SHA: "branch1", AuthorID: 900001},
+					// Human collaborator pushed onto the bot's PR — not exempt.
+					{Org: "myorg", Repo: "myrepo", SHA: "branch2", AuthorID: 555111, AuthorLogin: "human-contributor", Additions: 30, Deletions: 2},
 				},
 			},
 		}
@@ -260,55 +258,20 @@ func TestEvaluateCommit_Rule1_VerifiedEmailFallback(t *testing.T) {
 		assert.True(t, result.IsExemptAuthor, "the audited commit's author still matches; IsExemptAuthor stays informational")
 	})
 
-	t.Run("commit email not on verified_emails list — NOT exempt", func(t *testing.T) {
+	t.Run("non-matching id — NOT exempt", func(t *testing.T) {
 		commit := model.Commit{
 			Org: "myorg", Repo: "myrepo", SHA: "abc",
-			AuthorID: 0, AuthorEmail: "someone-else@example.com",
-			Additions: 5, Deletions: 3,
+			AuthorID: 123456, Additions: 5, Deletions: 3,
 		}
 		result := EvaluateCommit(commit, model.EnrichmentResult{}, exempt, nil, nil)
 		assert.False(t, result.IsCompliant)
 		assert.False(t, result.IsExemptAuthor)
 	})
 
-	t.Run("commit has author_id matching exempt entry — id wins, email path not consulted", func(t *testing.T) {
-		commit := model.Commit{
-			Org: "myorg", Repo: "myrepo", SHA: "abc",
-			AuthorLogin: "svc-bot-account",
-			AuthorID:    900001,
-			AuthorEmail: "completely-unrelated@example.com", // ignored when ID matches
-			Additions:   5, Deletions: 3,
-		}
-		result := EvaluateCommit(commit, model.EnrichmentResult{}, exempt, nil, nil)
-		assert.True(t, result.IsCompliant)
-		assert.True(t, result.IsExemptAuthor)
-	})
-
-	// The email path is forgeable in isolation (any local committer can set
-	// their git-author email). It is only trustworthy when an associated PR
-	// brings the every-contributor backstop (hasNonExemptPRContributors) into
-	// play. On a direct push there is no PR and no backstop, so a forged
-	// git-author email would otherwise waive unreviewed code as "exempt".
-	// Fail closed: the email-path exemption requires a PR.
-	t.Run("direct push (no PR) via email path — NOT exempt, fails closed", func(t *testing.T) {
-		commit := model.Commit{
-			Org: "myorg", Repo: "myrepo", SHA: "direct-sha",
-			AuthorID: 0, AuthorEmail: "svc-bot@example.com",
-			ParentCount: 1, Additions: 40, Deletions: 2,
-		}
-		result := EvaluateCommit(commit, model.EnrichmentResult{}, exempt, nil, nil)
-		assert.False(t, result.IsCompliant, "a forgeable email match must not waive a direct push with no PR backstop")
-		assert.True(t, result.IsExemptAuthor, "the email still matched; IsExemptAuthor stays informational")
-		assert.Equal(t, []string{"no associated pull request"}, result.Reasons)
-	})
-
-	// Contrast: the same direct push authored by the non-forgeable exempt
-	// ID stays exempt — no PR backstop is needed when identity is proven.
-	t.Run("direct push (no PR) via id path — still exempt", func(t *testing.T) {
+	t.Run("direct push (no PR) by exempt id — still exempt, no PR backstop needed", func(t *testing.T) {
 		commit := model.Commit{
 			Org: "myorg", Repo: "myrepo", SHA: "direct-id-sha",
-			AuthorID: 900001, AuthorEmail: "svc-bot@example.com",
-			ParentCount: 1, Additions: 40, Deletions: 2,
+			AuthorID: 900001, ParentCount: 1, Additions: 40, Deletions: 2,
 		}
 		result := EvaluateCommit(commit, model.EnrichmentResult{}, exempt, nil, nil)
 		assert.True(t, result.IsCompliant, "a non-forgeable id match needs no PR backstop")
@@ -704,8 +667,8 @@ func TestEvaluateCommit_Rule4_AutomatedSyncMergeRefresh(t *testing.T) {
 			CheckRuns: checks,
 			PRBranchCommits: map[int][]model.Commit{
 				42: {
-					{Org: "myorg", Repo: "myrepo", SHA: "approval-target", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: approvalAt.Add(-time.Hour), ParentCount: 1, Additions: 50, Deletions: 5},
-					{Org: "myorg", Repo: "myrepo", SHA: "head-sync", AuthorLogin: "ci-bot[bot]", AuthorID: 127780896, CommittedAt: freshAt, ParentCount: 2, Message: "Merge branch 'master' into 'feature' to keep PR fresh."},
+					{Org: "myorg", Repo: "myrepo", SHA: "approval-target", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: approvalAt.Add(-time.Hour), ParentCount: 1, Additions: 50, Deletions: 5, ParentSHAs: []string{"base"}},
+					{Org: "myorg", Repo: "myrepo", SHA: "head-sync", AuthorLogin: "ci-bot[bot]", AuthorID: 127780896, CommittedAt: freshAt, ParentCount: 2, Message: "Merge branch 'master' into 'feature' to keep PR fresh.", ParentSHAs: []string{"approval-target", "master-x"}},
 				},
 			},
 		}
@@ -722,9 +685,9 @@ func TestEvaluateCommit_Rule4_AutomatedSyncMergeRefresh(t *testing.T) {
 			CheckRuns: checks,
 			PRBranchCommits: map[int][]model.Commit{
 				42: {
-					{Org: "myorg", Repo: "myrepo", SHA: "approval-target", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: approvalAt.Add(-time.Hour), ParentCount: 1, Additions: 50, Deletions: 5},
+					{Org: "myorg", Repo: "myrepo", SHA: "approval-target", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: approvalAt.Add(-time.Hour), ParentCount: 1, Additions: 50, Deletions: 5, ParentSHAs: []string{"base"}},
 					// Same structural shape, but author is the human PR author (not exempt). Trust boundary blocks the carve-out.
-					{Org: "myorg", Repo: "myrepo", SHA: "head-sync", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: freshAt, ParentCount: 2, Message: "Merge branch 'master' into 'feature' to keep PR fresh."},
+					{Org: "myorg", Repo: "myrepo", SHA: "head-sync", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: freshAt, ParentCount: 2, Message: "Merge branch 'master' into 'feature' to keep PR fresh.", ParentSHAs: []string{"approval-target", "master-x"}},
 				},
 			},
 		}
@@ -741,10 +704,10 @@ func TestEvaluateCommit_Rule4_AutomatedSyncMergeRefresh(t *testing.T) {
 			CheckRuns: checks,
 			PRBranchCommits: map[int][]model.Commit{
 				42: {
-					{Org: "myorg", Repo: "myrepo", SHA: "approval-target", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: approvalAt.Add(-time.Hour), ParentCount: 1, Additions: 50, Deletions: 5},
-					{Org: "myorg", Repo: "myrepo", SHA: "sync1", AuthorLogin: "ci-bot[bot]", AuthorID: 127780896, CommittedAt: freshAt.Add(-30 * time.Minute), ParentCount: 2, Message: "Merge branch 'master' into 'feature' to keep PR fresh."},
+					{Org: "myorg", Repo: "myrepo", SHA: "approval-target", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: approvalAt.Add(-time.Hour), ParentCount: 1, Additions: 50, Deletions: 5, ParentSHAs: []string{"base"}},
+					{Org: "myorg", Repo: "myrepo", SHA: "sync1", AuthorLogin: "ci-bot[bot]", AuthorID: 127780896, CommittedAt: freshAt.Add(-30 * time.Minute), ParentCount: 2, Message: "Merge branch 'master' into 'feature' to keep PR fresh.", ParentSHAs: []string{"approval-target", "master-x"}},
 					// Author pushed real code AFTER approval — invalidates carve-out.
-					{Org: "myorg", Repo: "myrepo", SHA: "head-real", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: freshAt, ParentCount: 1, Additions: 12, Deletions: 0, Message: "tighten error handling"},
+					{Org: "myorg", Repo: "myrepo", SHA: "head-real", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: freshAt, ParentCount: 1, Additions: 12, Deletions: 0, Message: "tighten error handling", ParentSHAs: []string{"sync1"}},
 				},
 			},
 		}
@@ -782,12 +745,13 @@ func TestEvaluateCommit_Rule4_AutomatedSyncMergeRefresh(t *testing.T) {
 			CheckRuns: checks,
 			PRBranchCommits: map[int][]model.Commit{
 				42: {
-					{Org: "myorg", Repo: "myrepo", SHA: "approval-target", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: approvalAt.Add(-time.Hour), ParentCount: 1, Additions: 50, Deletions: 5},
-					{Org: "myorg", Repo: "myrepo", SHA: "head-bot", AuthorLogin: "ci-bot[bot]", AuthorID: 127780896, CommittedAt: freshAt, ParentCount: 2, Message: "Merge branch 'master' into 'feature' to keep PR fresh."},
+					{Org: "myorg", Repo: "myrepo", SHA: "approval-target", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: approvalAt.Add(-time.Hour), ParentCount: 1, Additions: 50, Deletions: 5, ParentSHAs: []string{"base"}},
+					{Org: "myorg", Repo: "myrepo", SHA: "head-bot", AuthorLogin: "ci-bot[bot]", AuthorID: 127780896, CommittedAt: freshAt, ParentCount: 2, Message: "Merge branch 'master' into 'feature' to keep PR fresh.", ParentSHAs: []string{"approval-target", "master-x"}},
 					// The squash-merge commit on master, ALSO linked to the
-					// PR via commit_prs. Must be skipped: it's not a branch
-					// contribution.
-					{Org: "myorg", Repo: "myrepo", SHA: "merge-sha", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: freshAt.Add(time.Hour), ParentCount: 1, Additions: 200, Deletions: 50},
+					// PR via commit_prs. Off the first-parent walk from head to
+					// the approval, so it is naturally excluded (belt: the SHA
+					// is also skipped explicitly).
+					{Org: "myorg", Repo: "myrepo", SHA: "merge-sha", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: freshAt.Add(time.Hour), ParentCount: 1, Additions: 200, Deletions: 50, ParentSHAs: []string{"base"}},
 				},
 			},
 		}
@@ -812,8 +776,8 @@ func TestEvaluateCommit_Rule4_AutomatedSyncMergeRefresh(t *testing.T) {
 			CheckRuns: checks,
 			PRBranchCommits: map[int][]model.Commit{
 				42: {
-					{Org: "myorg", Repo: "myrepo", SHA: "approval-target", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: approvalAt.Add(-time.Hour), ParentCount: 1, Additions: 50, Deletions: 5},
-					{Org: "myorg", Repo: "myrepo", SHA: "head-bot", AuthorLogin: "ci-bot[bot]", AuthorID: 127780896, CommittedAt: freshAt, ParentCount: 1, Message: "Apply patch from upstream"},
+					{Org: "myorg", Repo: "myrepo", SHA: "approval-target", AuthorLogin: "human-author", AuthorID: 555111, CommittedAt: approvalAt.Add(-time.Hour), ParentCount: 1, Additions: 50, Deletions: 5, ParentSHAs: []string{"base"}},
+					{Org: "myorg", Repo: "myrepo", SHA: "head-bot", AuthorLogin: "ci-bot[bot]", AuthorID: 127780896, CommittedAt: freshAt, ParentCount: 1, Message: "Apply patch from upstream", ParentSHAs: []string{"approval-target"}},
 				},
 			},
 		}
@@ -1288,6 +1252,83 @@ func TestEvaluateCommit_Rule7_Verdict(t *testing.T) {
 	runEvalCases(t, cases)
 }
 
+// TestEvaluateCommit_Rule7_LandingScope covers the delivering-PR binding:
+// a §7 approval may confer compliance only when its PR merged into an
+// audited branch. This closes the sibling-branch credit gap where a review
+// scoped to `feat → dev` vouched for an unreviewed landing on `main`.
+// See Architecture.md §7 "Scope of the verdict".
+func TestEvaluateCommit_Rule7_LandingScope(t *testing.T) {
+	f := newAuditBaseline()
+
+	// A commit reviewed+approved on a PR that merged into a SIBLING branch
+	// ("dev"), not the audited branch. The commit reached the audited branch
+	// some other (unreviewed) way.
+	siblingPR := f.pr
+	siblingPR.BaseBranch = "dev"
+	deliveringPR := f.pr
+	deliveringPR.BaseBranch = "main"
+
+	cases := []evalCase{
+		{
+			name:   "landing-scoped: sibling-base approval does NOT confer compliance",
+			commit: f.commit,
+			enrichment: model.EnrichmentResult{
+				PRs:       []model.PullRequest{siblingPR},
+				Reviews:   []model.Review{f.approvedReview},
+				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
+			},
+			requiredChecks:  f.requiredChecks,
+			auditedBranches: []string{"main"},
+			wantCompliant:   false,
+			wantHasPR:       true,
+			wantReasons:     []string{`approval is on PR #42, which merged into "dev", not an audited branch`},
+		},
+		{
+			name:   "landing-scoped: delivering-base approval IS compliant",
+			commit: f.commit,
+			enrichment: model.EnrichmentResult{
+				PRs:       []model.PullRequest{deliveringPR},
+				Reviews:   []model.Review{f.approvedReview},
+				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
+			},
+			requiredChecks:  f.requiredChecks,
+			auditedBranches: []string{"main"},
+			wantCompliant:   true,
+			wantHasPR:       true,
+			wantReasons:     []string{"compliant"},
+		},
+		{
+			name:   "landing-scoped: delivering PR wins over sibling PR on same commit",
+			commit: f.commit,
+			enrichment: model.EnrichmentResult{
+				PRs:       []model.PullRequest{siblingPR, deliveringPR},
+				Reviews:   []model.Review{f.approvedReview},
+				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
+			},
+			requiredChecks:  f.requiredChecks,
+			auditedBranches: []string{"main"},
+			wantCompliant:   true,
+			wantHasPR:       true,
+			wantReasons:     []string{"compliant"},
+		},
+		{
+			name:   "content-scoped (default): sibling-base approval still confers compliance",
+			commit: f.commit,
+			enrichment: model.EnrichmentResult{
+				PRs:       []model.PullRequest{siblingPR},
+				Reviews:   []model.Review{f.approvedReview},
+				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
+			},
+			requiredChecks: f.requiredChecks,
+			// auditedBranches nil → content-scoped: legacy behaviour preserved.
+			wantCompliant: true,
+			wantHasPR:     true,
+			wantReasons:   []string{"compliant"},
+		},
+	}
+	runEvalCases(t, cases)
+}
+
 // TestEvaluateCommit_Rule8_SignalPassThrough covers the informational
 // copy-through of revert signals (IsCleanRevert, RevertVerification,
 // RevertedSHA) from EnrichmentResult to AuditResult. These fields land
@@ -1301,7 +1342,7 @@ func TestEvaluateCommit_Rule8_SignalPassThrough(t *testing.T) {
 	f := newAuditBaseline()
 	cases := []evalCase{
 		{
-			name:   "enrichment marks auto-revert clean — result carries the flag",
+			name:   "enrichment marks diff-verified auto-revert — result carries the flag",
 			commit: f.commit,
 			enrichment: model.EnrichmentResult{
 				PRs:       []model.PullRequest{f.pr},
@@ -1309,7 +1350,7 @@ func TestEvaluateCommit_Rule8_SignalPassThrough(t *testing.T) {
 				CheckRuns: []model.CheckRun{f.ownerApprovalCheck},
 
 				IsCleanRevert:      true,
-				RevertVerification: "message-only",
+				RevertVerification: "diff-verified",
 				RevertedSHA:        "abcdef1234567890abcdef1234567890abcdef12",
 			},
 			requiredChecks: f.requiredChecks,
@@ -2007,14 +2048,18 @@ func TestEvaluateCommit_RevertWaivers(t *testing.T) {
 		assert.Contains(t, result.Reasons[0], "a1b2c3d4e5f6", "reason cites the reverted sha prefix")
 	})
 
-	t.Run("auto-revert without a reverted SHA is still compliant", func(t *testing.T) {
+	t.Run("message-only auto-revert does NOT waive", func(t *testing.T) {
+		// AutoRevert is no longer trusted on its message alone. When the diff
+		// could not be verified the enricher leaves IsCleanRevert false
+		// (message-only), so §8 must not fire — the commit falls through to
+		// the PR-approval path (which has no approval here).
+		commit := baseCommit
+		commit.Message = "Automatic revert of 921197f96e12b6e4f5c82104af0d83b7627ed99d..4eca5c7c3b6d1f9563e877a9484c87be6633b647"
 		enrichment := baseEnrichment
-		enrichment.IsCleanRevert = true
+		enrichment.IsCleanRevert = false
 		enrichment.RevertVerification = "message-only"
-		enrichment.RevertedSHA = "" // trusted-by-construction auto-revert
-		result := EvaluateCommit(baseCommit, enrichment, nil, nil, nil)
-		assert.True(t, result.IsCompliant)
-		assert.Contains(t, result.Reasons[0], "clean revert")
+		result := EvaluateCommit(commit, enrichment, nil, nil, nil)
+		assert.False(t, result.IsCompliant, "a forgeable auto-revert message must not waive")
 	})
 
 	t.Run("message-only / diff-mismatch manual revert does NOT waive", func(t *testing.T) {
@@ -2092,7 +2137,10 @@ func TestEvaluateRevertCompliance(t *testing.T) {
 			reasonHint: "clean revert of",
 		},
 		{
-			name:       "fires on IsCleanRevert=true without reverted SHA (auto-revert)",
+			// Defensive: IsCleanRevert is only ever set alongside a
+			// diff-verified non-empty SHA, but the helper still waives if a
+			// future enricher bug leaves the SHA empty.
+			name:       "fires on IsCleanRevert=true even if reverted SHA missing (defensive)",
 			commit:     model.Commit{Message: "Automatic revert of abc..def"},
 			enrichment: model.EnrichmentResult{IsCleanRevert: true},
 			want:       true,
@@ -2238,4 +2286,40 @@ func TestEvaluateCommit_ReviewerIdentityBug(t *testing.T) {
 		},
 	}
 	runEvalCases(t, cases)
+}
+
+// TestGlobMatch covers the §7 landing-scope branch matcher: exact names,
+// `*` spanning `/`, `?` single char, and non-matches.
+func TestGlobMatch(t *testing.T) {
+	cases := []struct {
+		pattern, s string
+		want       bool
+	}{
+		{"main", "main", true},
+		{"main", "master", false},
+		{"release/*", "release/1.2", true},
+		{"release/*", "release/1.2/rc1", true}, // '*' spans '/'
+		{"release/*", "main", false},
+		{"HF_BF_*", "HF_BF_2026", true},
+		{"v?", "v1", true},
+		{"v?", "v12", false},
+		{"*", "anything/at/all", true},
+		{"", "", true},
+		{"", "x", false},
+	}
+	for _, c := range cases {
+		assert.Equalf(t, c.want, globMatch(c.pattern, c.s), "globMatch(%q,%q)", c.pattern, c.s)
+	}
+}
+
+// TestPRDelivers_FailsOpenOnUnknownBase pins the missing-data policy: an empty
+// BaseBranch is credited (fail open) so legacy rows without base data don't
+// mass-flip; a KNOWN sibling base outside the audited set is not.
+func TestPRDelivers_FailsOpenOnUnknownBase(t *testing.T) {
+	audited := []string{"main", "release/*"}
+	assert.True(t, prDelivers(&model.PullRequest{BaseBranch: ""}, audited), "unknown base fails open")
+	assert.True(t, prDelivers(&model.PullRequest{BaseBranch: "main"}, audited))
+	assert.True(t, prDelivers(&model.PullRequest{BaseBranch: "release/9"}, audited))
+	assert.False(t, prDelivers(&model.PullRequest{BaseBranch: "dev"}, audited), "known sibling base not credited")
+	assert.True(t, prDelivers(&model.PullRequest{BaseBranch: "dev"}, nil), "content-scoped credits any base")
 }
