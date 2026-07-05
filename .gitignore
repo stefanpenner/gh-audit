@@ -6,3 +6,7 @@ examples/telemetry.jsonl
 
 # Bazel
 bazel-*
+
+# TLA+ tooling (fetched by tla/run.sh)
+tla/.tools/
+states/

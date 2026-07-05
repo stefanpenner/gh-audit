@@ -172,6 +172,31 @@ forgeable signal.
 If a new waiver is added, it must enter this table with its anchor and a
 forgery-rejection test, or it does not ship.
 
+Every waiver row is additionally **model-checked**. The TLA+ specs in
+[`tla/`](tla/README.md) each play every interleaving of attacker moves
+against the verdict logic and prove the soundness invariant — compliant
+implies truly authorized/safe — over a bounded state space:
+
+| Rule | Spec | Attack the red config rediscovers |
+|---|---|---|
+| §1 exempt | `Exempt.tla` | forged git-author email (retired `verified_emails` path) |
+| §2 empty | `EmptyCommit.tla` | rename-only commit laundered by a lines-only check |
+| §4/§5 approval | `Approval.tla` | backdated `GIT_COMMITTER_DATE` (retired timestamp carve-out) |
+| §6 checks | `Checks.tla` | stale green run masking a red re-run |
+| §7 landing | `Verdict.tla` | sibling-branch review credited for a protected-branch landing |
+| §8 revert | `Revert.tla` | forged revert message (retired message-only AutoRevert) |
+
+Each retired/naive rule is kept as a red config so TLC rediscovers its
+attack — the machine-checked record of why each shipped rule is shaped
+the way it is. `Verdict_amber.cfg` additionally runs the *shipped*
+fail-open-on-unknown-base rule and surfaces its one residual assumption
+(an unknown base must never be attacker-suppressible) as a documented
+tradeoff. Run `./tla/run.sh`.
+
+The specs prove the rules we thought of. The `formal-gap-hunt` skill
+hunts for the rest — real GitHub behaviour or orderings the specs cannot
+yet express — and is meant to be rerun periodically (`tla/gaps/`).
+
 ### Verdict scope — landing vs content
 
 The table certifies that no *forged* input flips a verdict. A separate,
