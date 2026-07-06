@@ -115,6 +115,10 @@ TrulySafe == merged /\ (\A c \in DomIds : empty[c] \/ realAuthor[c] = Bot)
 
 Sound == Compliant => TrulySafe
 
+\* Bait: claims no compliant state is reachable. TLC must VIOLATE this
+\* and print a witness trace — proof Sound is not holding vacuously.
+Bait == ~Compliant
+
 TypeOK ==
     /\ nextId \in 1..(MaxCommits + 1)
     /\ merged \in BOOLEAN

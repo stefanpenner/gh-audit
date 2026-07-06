@@ -191,7 +191,13 @@ attack — the machine-checked record of why each shipped rule is shaped
 the way it is. `Verdict_amber.cfg` additionally runs the *shipped*
 fail-open-on-unknown-base rule and surfaces its one residual assumption
 (an unknown base must never be attacker-suppressible) as a documented
-tradeoff. Run `./tla/run.sh`.
+tradeoff. Bait configs (`*_bait.cfg`) prove every green verdict is
+non-vacuous: a compliant state must be reachable. Run `./tla/run.sh`;
+CI runs it on every PR.
+
+The spec↔code link for §6 is machine-checked without a JVM:
+`internal/sync/checks_spec_test.go` replays the spec's full bounded
+state space against the real `evaluateRequiredChecks`.
 
 The specs prove the rules we thought of. The `formal-gap-hunt` skill
 hunts for the rest — real GitHub behaviour or orderings the specs cannot

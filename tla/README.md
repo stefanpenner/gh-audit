@@ -18,7 +18,8 @@ proves one hand-written forgery per row, TLC proves the rule against
 ```
 
 Needs a JRE (>= 11). First run downloads `tla2tools.jar` into
-`tla/.tools/` (gitignored).
+`tla/.tools/` (gitignored). CI runs the full suite on every PR
+(`tla` job in `.github/workflows/test.yml`).
 
 ## Modules
 
@@ -49,6 +50,29 @@ enough to find that class of bug. `run.sh` asserts green **holds** and
 red **is violated** — a red config that stops finding its attack fails
 the run just as loudly as a green that breaks.
 
+## Bait configs — greens can't pass vacuously
+
+`Sound == Compliant => TrulySafe` holds trivially if `Compliant` is
+never reachable. Each `*_bait.cfg` runs the green bounds with the
+invariant `Bait == ~Compliant`, which claims no compliant state
+exists. TLC must **violate** it — the witness trace is a reachable
+compliant state, proof the green verdict has content. `run.sh` treats
+a bait that stops violating as a failure.
+
+## Bounds checked
+
+Green TLC at these bounds is a strong bug hunt, **not** a proof.
+Counts from a full run (2026-07-05); `run.sh` prints them live.
+
+| Module | Bounds (green) | Distinct states |
+|---|---|---|
+| `Approval` | MaxCommits=4, MaxTime=2, MaxReviews=2 | 953 |
+| `Checks` | MaxRuns=3, MaxTime=2 | 1,640 |
+| `EmptyCommit` | MaxCount=2 | 55 |
+| `Exempt` | MaxCommits=3 | 2,221 |
+| `Revert` | (booleans only) | 9 |
+| `Verdict` | NPRs=2 | 129 |
+
 ## The amber config — a documented tradeoff, machine-checked
 
 `Verdict_amber.cfg` runs the **actually-shipped** `prDelivers`, which
@@ -77,6 +101,14 @@ rule that needs no such assumption.
   design. That link is the Go test suite (the checklist's "Proving
   test" column). Keep each module's `Compliant` in sync with the
   corresponding Go predicate when the rule changes:
+
+  For `Checks` that link is machine-checked, no JVM needed:
+  `internal/sync/checks_spec_test.go` enumerates the spec's full
+  green-bounds state space (820 run sequences) and asserts the real
+  `evaluateRequiredChecks` matches the spec's `Compliant` on every
+  state, plus a mutation subtest proving the harness still catches
+  the retired any-run rule. Use it as the template when bridging the
+  other modules.
 
   | Module | Go predicate |
   |---|---|
