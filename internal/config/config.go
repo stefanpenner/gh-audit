@@ -74,6 +74,27 @@ type AuditRulesConfig struct {
 	//                             counts, wherever it merged.
 	// Validated at load; an unknown value is rejected.
 	ReviewScope string `yaml:"review_scope"`
+
+	// SigningPolicy selects how §1 anchors an author exemption
+	// (Architecture.md §1 "author is a hint" trust model):
+	//   "optional" (default, "") — progressive enhancement. A verified
+	//                              signer on the exempt list is the sound
+	//                              path; an unsigned commit merely CLAIMING
+	//                              exempt authorship is still waived but
+	//                              flagged forgeable so a team can see the
+	//                              weakness before locking it down.
+	//   "required"               — fail the forgeable path closed: only a
+	//                              verified signer can be exempt. Teams that
+	//                              enforce commit signing opt into this for a
+	//                              provably sound §1.
+	// Validated at load; an unknown value is rejected.
+	SigningPolicy string `yaml:"signing_policy"`
+}
+
+// SigningRequired reports whether §1 must fail the forgeable author-id
+// path closed (only a verified signer is exempt). Default is optional.
+func (a AuditRulesConfig) SigningRequired() bool {
+	return a.SigningPolicy == "required"
 }
 
 // CheckConfig describes a required status check.
@@ -220,6 +241,12 @@ func (c *Config) validate() error {
 		// ok — "" resolves to landing scope at the pipeline (the default).
 	default:
 		return fmt.Errorf("config: audit_rules.review_scope %q is invalid — use \"landing\" (default) or \"content\"", c.AuditRules.ReviewScope)
+	}
+	switch c.AuditRules.SigningPolicy {
+	case "", "optional", "required":
+		// ok — "" resolves to optional (progressive enhancement).
+	default:
+		return fmt.Errorf("config: audit_rules.signing_policy %q is invalid — use \"optional\" (default) or \"required\"", c.AuditRules.SigningPolicy)
 	}
 	seenOrgs := make(map[string]bool, len(c.Orgs))
 	for i, org := range c.Orgs {

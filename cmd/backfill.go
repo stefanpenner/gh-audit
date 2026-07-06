@@ -91,7 +91,7 @@ PR attribution, which on a typical sweep is well under 1% of in-scope commits.`,
 					return err
 				}
 				if verifyReverts {
-					return runVerifyReverts(cmd.Context(), dbConn, client, logger, dryRun, repoFilter, exemptAuthors, requiredChecks, auditedBranches)
+					return runVerifyReverts(cmd.Context(), dbConn, client, logger, dryRun, repoFilter, exemptAuthors, requiredChecks, auditedBranches, cfg.AuditRules.SigningRequired())
 				}
 				return nil
 			}
@@ -108,7 +108,7 @@ PR attribution, which on a typical sweep is well under 1% of in-scope commits.`,
 			// to be honoured only alongside --reclassify-only and was
 			// silently ignored otherwise.
 			if verifyReverts {
-				return runVerifyReverts(cmd.Context(), dbConn, client, logger, dryRun, repoFilter, exemptAuthors, requiredChecks, auditedBranches)
+				return runVerifyReverts(cmd.Context(), dbConn, client, logger, dryRun, repoFilter, exemptAuthors, requiredChecks, auditedBranches, cfg.AuditRules.SigningRequired())
 			}
 			return nil
 		},
@@ -308,7 +308,7 @@ func runBackfill(
 			// The old order deleted the row first, evaluated with zeroed
 			// classification, and pasted the flags back afterwards — storing
 			// verdicts inconsistent with their own classification.
-			newResults, err := reauditSingleCommit(ctx, dbConn, c.org, c.repo, c.sha, exemptAuthors, requiredChecks, auditedBranches)
+			newResults, err := reauditSingleCommit(ctx, dbConn, c.org, c.repo, c.sha, exemptAuthors, requiredChecks, auditedBranches, cfg.AuditRules.SigningRequired())
 			if err != nil {
 				logger.Error("re-audit failed", "error", err)
 				writeFailed++
@@ -456,6 +456,7 @@ func reauditSingleCommit(
 	exemptAuthors []model.ExemptAuthor,
 	requiredChecks []syncer.RequiredCheck,
 	auditedBranches []string,
+	requireSigning bool,
 ) ([]model.AuditResult, error) {
 	commits, err := dbConn.GetCommitsBySHA(ctx, org, repo, []string{sha})
 	if err != nil || len(commits) == 0 {
@@ -467,7 +468,8 @@ func reauditSingleCommit(
 		return nil, err
 	}
 	enrichment.Commit = c
-	result := syncer.EvaluateCommit(c, enrichment, exemptAuthors, requiredChecks, nil, auditedBranches...)
+	result := syncer.EvaluateCommit(c, enrichment, exemptAuthors, requiredChecks, nil,
+		syncer.WithAuditedBranches(auditedBranches...), syncer.RequireSigning(requireSigning))
 	result.AuditedAt = time.Now()
 	return []model.AuditResult{result}, nil
 }
@@ -615,6 +617,7 @@ func runVerifyReverts(
 	exemptAuthors []model.ExemptAuthor,
 	requiredChecks []syncer.RequiredCheck,
 	auditedBranches []string,
+	requireSigning bool,
 ) error {
 	args := []any{}
 	sql := `
@@ -701,7 +704,7 @@ WHERE org = ? AND repo = ? AND sha = ?`,
 		// A verification upgrade can flip the §8 waiver — re-audit so the
 		// stored verdict matches the new classification.
 		if isClean {
-			newResults, err := reauditSingleCommit(ctx, dbConn, r.org, r.repo, r.sha, exemptAuthors, requiredChecks, auditedBranches)
+			newResults, err := reauditSingleCommit(ctx, dbConn, r.org, r.repo, r.sha, exemptAuthors, requiredChecks, auditedBranches, requireSigning)
 			if err != nil {
 				logger.Warn("post-verification re-audit failed", "sha", r.sha[:12], "error", err)
 				continue

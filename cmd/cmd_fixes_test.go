@@ -247,7 +247,7 @@ func TestRunReAuditPass_PreservesReviewIdentityIDs(t *testing.T) {
 		CommitID: "headsha", SubmittedAt: committed.Add(30 * time.Minute),
 	}}))
 
-	require.NoError(t, runReAudit(ctx, dbConn, discardLogger(), nil, nil, nil,
+	require.NoError(t, runReAudit(ctx, dbConn, discardLogger(), nil, nil, nil, false,
 		reAuditFilter{concurrency: 1}))
 
 	var compliant bool
@@ -277,7 +277,7 @@ func TestRunReAuditPass_PreservesReviewIdentityIDs(t *testing.T) {
 		CommitID: "headsha2", SubmittedAt: committed.Add(30 * time.Minute),
 	}}))
 
-	require.NoError(t, runReAudit(ctx, dbConn, discardLogger(), nil, nil, nil,
+	require.NoError(t, runReAudit(ctx, dbConn, discardLogger(), nil, nil, nil, false,
 		reAuditFilter{concurrency: 1}))
 
 	var selfCompliant, selfApproved bool
@@ -353,7 +353,7 @@ func TestRunVerifyReverts_SkipsAutoReverts(t *testing.T) {
 
 	// nil client: if the auto-revert were treated as a candidate, the
 	// GetCommitFiles call would panic — filtering must happen first.
-	require.NoError(t, runVerifyReverts(ctx, dbConn, nil, discardLogger(), false, nil, nil, nil, nil))
+	require.NoError(t, runVerifyReverts(ctx, dbConn, nil, discardLogger(), false, nil, nil, nil, nil, false))
 
 	var cleanRevert bool
 	var rv string

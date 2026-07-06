@@ -80,7 +80,7 @@ func newReAuditCmd() *cobra.Command {
 				auditedBranches = cfg.AuditRules.AuditBranches
 			}
 
-			return runReAudit(cmd.Context(), dbConn, logger, exemptAuthors, requiredChecks, auditedBranches, reAuditFilter{
+			return runReAudit(cmd.Context(), dbConn, logger, exemptAuthors, requiredChecks, auditedBranches, cfg.AuditRules.SigningRequired(), reAuditFilter{
 				onlyFailures: onlyFailures,
 				repos:        repoFilter,
 				concurrency:  concurrency,
@@ -103,8 +103,8 @@ type reAuditFilter struct {
 	concurrency  int
 }
 
-func runReAudit(ctx context.Context, dbConn *db.DB, logger *slog.Logger, exemptAuthors []model.ExemptAuthor, requiredChecks []syncer.RequiredCheck, auditedBranches []string, filter reAuditFilter) error {
-	flipped, total, err := runReAuditPass(ctx, dbConn, logger, exemptAuthors, requiredChecks, auditedBranches, filter)
+func runReAudit(ctx context.Context, dbConn *db.DB, logger *slog.Logger, exemptAuthors []model.ExemptAuthor, requiredChecks []syncer.RequiredCheck, auditedBranches []string, requireSigning bool, filter reAuditFilter) error {
+	flipped, total, err := runReAuditPass(ctx, dbConn, logger, exemptAuthors, requiredChecks, auditedBranches, requireSigning, filter)
 	if err != nil {
 		return err
 	}
@@ -130,6 +130,7 @@ func runReAuditPass(
 	exemptAuthors []model.ExemptAuthor,
 	requiredChecks []syncer.RequiredCheck,
 	auditedBranches []string,
+	requireSigning bool,
 	filter reAuditFilter,
 ) (flipped, total int, err error) {
 	rows, err := dbConn.DB.QueryContext(ctx, "SELECT DISTINCT org, repo FROM commits ORDER BY org, repo")
@@ -198,7 +199,8 @@ func runReAuditPass(
 			repoFlipped := 0
 			for _, c := range commits {
 				enrichment := buildEnrichmentFromBundle(c, bundle)
-				result := syncer.EvaluateCommit(c, enrichment, exemptAuthors, requiredChecks, nil, auditedBranches...)
+				result := syncer.EvaluateCommit(c, enrichment, exemptAuthors, requiredChecks, nil,
+					syncer.WithAuditedBranches(auditedBranches...), syncer.RequireSigning(requireSigning))
 				result.AuditedAt = time.Now()
 				results = append(results, result)
 				if prior, had := bundle.priorCompliance[c.SHA]; had {
@@ -254,8 +256,8 @@ func loadCandidateCommits(ctx context.Context, dbConn *db.DB, org, repo string, 
 		return dbConn.GetAllCommits(ctx, org, repo)
 	}
 	rows, err := dbConn.DB.QueryContext(ctx, `
-SELECT c.org, c.repo, c.sha, COALESCE(c.author_login, ''), COALESCE(c.author_email, ''),
-       COALESCE(c.committer_login, ''), c.committed_at, COALESCE(c.message, ''),
+SELECT c.org, c.repo, c.sha, COALESCE(c.author_login, ''), c.author_id, COALESCE(c.author_email, ''),
+       COALESCE(c.committer_login, ''), c.committer_id, c.is_verified, c.committed_at, COALESCE(c.message, ''),
        COALESCE(c.parent_count, 0), COALESCE(c.additions, 0), COALESCE(c.deletions, 0),
        COALESCE(c.href, '')
 FROM commits c
@@ -269,10 +271,17 @@ ORDER BY c.committed_at`, org, repo)
 	var out []model.Commit
 	for rows.Next() {
 		var c model.Commit
-		if err := rows.Scan(&c.Org, &c.Repo, &c.SHA, &c.AuthorLogin, &c.AuthorEmail,
-			&c.CommitterLogin, &c.CommittedAt, &c.Message,
+		var authorID, committerID sql.NullInt64
+		if err := rows.Scan(&c.Org, &c.Repo, &c.SHA, &c.AuthorLogin, &authorID, &c.AuthorEmail,
+			&c.CommitterLogin, &committerID, &c.IsVerified, &c.CommittedAt, &c.Message,
 			&c.ParentCount, &c.Additions, &c.Deletions, &c.Href); err != nil {
 			return nil, err
+		}
+		if authorID.Valid {
+			c.AuthorID = authorID.Int64
+		}
+		if committerID.Valid {
+			c.CommitterID = committerID.Int64
 		}
 		out = append(out, c)
 	}
@@ -403,7 +412,7 @@ func loadRepoEnrichmentBundle(ctx context.Context, dbConn *db.DB, org, repo stri
 	cbRows, err := dbConn.DB.QueryContext(ctx, `
 		SELECT cp.pr_number,
 		       c.org, c.repo, c.sha, COALESCE(c.author_login, ''), c.author_id,
-		       COALESCE(c.author_email, ''), COALESCE(c.committer_login, ''),
+		       COALESCE(c.author_email, ''), COALESCE(c.committer_login, ''), c.committer_id,
 		       c.committed_at, COALESCE(c.message, ''), COALESCE(c.parent_count, 0),
 		       COALESCE(c.parent_shas, ''),
 		       COALESCE(c.additions, 0), COALESCE(c.deletions, 0),
@@ -419,10 +428,10 @@ func loadRepoEnrichmentBundle(ctx context.Context, dbConn *db.DB, org, repo stri
 	for cbRows.Next() {
 		var prNumber int
 		var c model.Commit
-		var authorID sql.NullInt64
+		var authorID, committerID sql.NullInt64
 		var parentSHAs string
 		if err := cbRows.Scan(&prNumber,
-			&c.Org, &c.Repo, &c.SHA, &c.AuthorLogin, &authorID, &c.AuthorEmail, &c.CommitterLogin,
+			&c.Org, &c.Repo, &c.SHA, &c.AuthorLogin, &authorID, &c.AuthorEmail, &c.CommitterLogin, &committerID,
 			&c.CommittedAt, &c.Message, &c.ParentCount, &parentSHAs,
 			&c.Additions, &c.Deletions, &c.FilesChanged, &c.StatsVerified,
 			&c.IsVerified, &c.Href); err != nil {
@@ -431,6 +440,9 @@ func loadRepoEnrichmentBundle(ctx context.Context, dbConn *db.DB, org, repo stri
 		}
 		if authorID.Valid {
 			c.AuthorID = authorID.Int64
+		}
+		if committerID.Valid {
+			c.CommitterID = committerID.Int64
 		}
 		if parentSHAs != "" {
 			c.ParentSHAs = strings.Split(parentSHAs, ",")

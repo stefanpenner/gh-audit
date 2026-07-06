@@ -26,6 +26,7 @@ go_test(
         "audit_fixes_test.go",
         "audit_test.go",
         "checks_spec_test.go",
+        "exempt_signing_test.go",
         "cursor_graph_test.go",
         "dbwriter_test.go",
         "pipeline_test.go",

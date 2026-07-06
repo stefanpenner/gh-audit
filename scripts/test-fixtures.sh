@@ -43,8 +43,16 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-cat > "$TMPDIR/config.yaml" <<EOF
-database: $TMPDIR/audit.db
+# write_config DB CONFIGFILE [SIGNING_POLICY] [EXEMPT_ID]
+# The §1 signing scenarios (6.x) need an exempt account. Every commit in
+# THIS repo was authored by stefanpenner (id 1377), so exempting 1377
+# globally would waive every fixture — which is exactly the point of 6.x
+# but wrong for the 1.x–5.x scenarios. So the main validation runs with
+# NO exemptions, and the signing section below runs dedicated syncs that
+# exempt 1377.
+write_config() { # $1=db  $2=file  $3=signing_policy(optional)  $4=exempt_id(none)
+    cat > "$2" <<EOF
+database: $1
 orgs:
   - name: ${FIXTURES_REPO%%/*}
     repos: [${FIXTURES_REPO#*/}]
@@ -55,6 +63,14 @@ tokens:
       - org: ${FIXTURES_REPO%%/*}
         repos: [${FIXTURES_REPO#*/}]
 EOF
+    if [[ -n "${3:-}" ]]; then
+        printf 'audit_rules:\n  signing_policy: %s\n' "$3" >> "$2"
+    fi
+    if [[ -n "${4:-}" ]]; then
+        printf 'exemptions:\n  authors:\n    - login: exempt\n      id: %s\n' "$4" >> "$2"
+    fi
+}
+write_config "$TMPDIR/audit.db" "$TMPDIR/config.yaml"
 
 if [[ -n "${GH_AUDIT_BIN:-}" ]]; then
     echo "==> Using prebuilt gh-audit: $GH_AUDIT_BIN"
@@ -194,11 +210,55 @@ done < <(jq -c '
     | to_entries
     | sort_by(.key | split(".") | map(tonumber? // 0))
     | .[]
+    | select(.key | startswith("6.") | not)   # series 6 = §1 signing, checked separately below
     | .key as $id
     | .value.title as $title
     | (.value.assertions // [])[]
     | . + {id: $id, title: $title}
 ' "$TMPDIR/scenarios.json")
+
+# ── 6.x: §1 signing policy ──
+# Runs its own syncs (not the offline re-evaluate) because these commits'
+# diff stats are only lazily fetched when the audit would otherwise flag
+# them — the offline bundle path would treat 6.2's unfetched 0/0 stats as
+# an "empty commit" and waive it. A real sync fetches the stats.
+#
+# Exempts account 1377 (stefanpenner). That waives EVERY fixture (all are
+# 1377-authored), so this uses throwaway DBs and only asserts on 6.x.
+SHA_61="1b9b3917689f370c6adf8defcc722349bf7fdfd0"   # verified signer, exempt id
+SHA_62="ae9e372beb9111f5b9fdef4cf1a4a956382f453e"   # unsigned, forged exempt author
+
+SDB="$TMPDIR/sign.db"
+sig_get() { duckdb -noheader -csv "$SDB" \
+    "SELECT COALESCE(is_compliant,false)||','||COALESCE(is_exempt_author,false)||','||COALESCE(list_contains(annotations,'trust:forgeable-exemption'),false) FROM audit_results WHERE sha='$1';" | tr -d '"'; }
+assert_sig() { # id want got desc
+    total=$((total + 1))
+    if [[ "$3" == "$2" ]]; then
+        printf '  OK    %s — %s\n        (compliant,exempt,forgeable)=%s\n' "$1" "$4" "$3"
+    else
+        printf '  FAIL  %s — %s\n        want (compliant,exempt,forgeable)=%s got=%s\n' "$1" "$4" "$2" "$3"
+        fails=$((fails + 1))
+    fi
+}
+
+# One sync under REQUIRED (fetches 6.2's diff stats, since it's non-compliant
+# there and the audit resolves them lazily), then an offline re-evaluate under
+# OPTIONAL. Because the stats are now in the DB, the optional pass no longer
+# mistakes 6.2's 0/0 for an empty commit. Two policies, one API sync.
+write_config "$SDB" "$SDB.req.yaml" required 1377
+write_config "$SDB" "$SDB.opt.yaml" optional 1377
+
+printf '\n  ── 6.x: §1 signing policy (required — lock-down) ──\n\n'
+"$GH_AUDIT_BIN" --config "$SDB.req.yaml" sync --repo "$FIXTURES_REPO" --db "$SDB" \
+    --telemetry-output=- >"$SDB.req.log" 2>&1 || { echo "signing sync failed; tail:" >&2; tail -n 40 "$SDB.req.log" >&2; exit 1; }
+assert_sig "6.1" "true,true,false"   "$(sig_get "$SHA_61")" "verified signer stays exempt"
+assert_sig "6.2" "false,false,false" "$(sig_get "$SHA_62")" "unsigned forged author fails closed"
+
+printf '\n  ── 6.x: §1 signing policy (optional — progressive enhancement) ──\n\n'
+"$GH_AUDIT_BIN" --config "$SDB.opt.yaml" re-evaluate-commits --db "$SDB" \
+    >"$SDB.opt.log" 2>&1 || { echo "signing re-evaluate failed; tail:" >&2; tail -n 40 "$SDB.opt.log" >&2; exit 1; }
+assert_sig "6.1" "true,true,false" "$(sig_get "$SHA_61")" "verified signer — sound exemption"
+assert_sig "6.2" "true,true,true"  "$(sig_get "$SHA_62")" "unsigned forged author — waived but flagged forgeable"
 
 echo
 echo "────────────────────────────────────"

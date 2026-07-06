@@ -23,6 +23,7 @@ go_library(
 go_test(
     name = "db_test",
     srcs = [
+        "committer_id_test.go",
         "db_bench_test.go",
         "db_fixes_test.go",
         "db_test.go",

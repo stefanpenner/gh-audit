@@ -43,7 +43,7 @@ func runEvalCases(t *testing.T, cases []evalCase) {
 	t.Helper()
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			result := EvaluateCommit(tt.commit, tt.enrichment, tt.exemptAuthors, tt.requiredChecks, nil, tt.auditedBranches...)
+			result := EvaluateCommit(tt.commit, tt.enrichment, tt.exemptAuthors, tt.requiredChecks, nil, WithAuditedBranches(tt.auditedBranches...))
 
 			assert.Equal(t, tt.wantCompliant, result.IsCompliant, "IsCompliant (reasons: %v)", result.Reasons)
 			assert.Equal(t, tt.wantBot, result.IsBot, "IsBot")

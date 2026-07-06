@@ -108,6 +108,13 @@ type SyncConfig struct {
 	// base branches falls back to content scope for those PRs (fail-open, so
 	// no legitimate verdict flips) — one re-sync populates them.
 	ReviewScope string
+	// RequireSigning selects the §1 signing policy (Architecture.md §1
+	// trust model). false (default) is progressive-enhancement: a
+	// verified signer on the exempt list is the sound path, and an
+	// unsigned commit merely claiming exempt authorship is still waived
+	// but flagged forgeable (AuditResult.ExemptionForgeable). true fails
+	// that forgeable path closed — only a verified signer is exempt.
+	RequireSigning bool
 }
 
 // LandingScoped reports whether §7 should run landing-scoped (the default).
@@ -898,7 +905,8 @@ func (p *Pipeline) syncRepoBranch(ctx context.Context, repo model.RepoInfo, bran
 			if p.config.LandingScoped() {
 				scopeBranches = auditedBranches
 			}
-			result := EvaluateCommit(c, enrichment, p.config.ExemptAuthors, p.config.RequiredChecks, p.statsFetcher, scopeBranches...)
+			result := EvaluateCommit(c, enrichment, p.config.ExemptAuthors, p.config.RequiredChecks, p.statsFetcher,
+				WithAuditedBranches(scopeBranches...), RequireSigning(p.config.RequireSigning))
 			result.AuditedAt = time.Now()
 			auditResults[i] = result
 			return nil

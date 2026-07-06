@@ -1035,8 +1035,9 @@ func TestListPRCommits_PopulatesFullCommitShape(t *testing.T) {
 				"committer":    map[string]any{"date": "2026-06-01T10:00:00Z"},
 				"verification": map[string]any{"verified": true},
 			},
-			"author":  map[string]any{"login": "svc", "id": 77},
-			"parents": []map[string]any{{"sha": "p1"}},
+			"author":    map[string]any{"login": "svc", "id": 77},
+			"committer": map[string]any{"login": "svc-signer", "id": 88},
+			"parents":   []map[string]any{{"sha": "p1"}},
 		}})
 	}))
 	defer srv.Close()
@@ -1049,6 +1050,8 @@ func TestListPRCommits_PopulatesFullCommitShape(t *testing.T) {
 	assert.Equal(t, "svc-account@corp.example", c.AuthorEmail,
 		"git-header email must round-trip (informational/display; not used for exemption)")
 	assert.Equal(t, int64(77), c.AuthorID)
+	assert.Equal(t, int64(88), c.CommitterID,
+		"committer account id must round-trip — §1 anchors the exempt waiver on the verified signer")
 	assert.True(t, c.IsVerified)
 	assert.Equal(t, "https://github.com/testorg/repo/commit/bc1", c.Href)
 	require.Len(t, c.CoAuthors, 1)
