@@ -131,6 +131,20 @@ func TestDeriveRuleOutcomes(t *testing.T) {
 	}
 }
 
+// A §1 exemption that fired on the forgeable author-id hint (signing_policy
+// optional, tagged trust:forgeable-exemption) is surfaced as a WEAK waiver —
+// it would not survive signing_policy: required.
+func TestDeriveRuleOutcomes_ForgeableExemptionIsWeak(t *testing.T) {
+	sound := DetailRow{IsExemptAuthor: true, IsCompliant: true, Reasons: "exempt: configured author"}
+	assert.Equal(t, OutcomeWaived, DeriveRuleOutcomes(sound).R1Exempt,
+		"verified-signer exemption is a full waiver")
+
+	weak := sound
+	weak.Annotations = "automation:depex,trust:forgeable-exemption"
+	assert.Equal(t, OutcomeWaivedWeak, DeriveRuleOutcomes(weak).R1Exempt,
+		"forgeable exemption is a weak waiver")
+}
+
 func TestRequiresAction(t *testing.T) {
 	cases := []struct {
 		name string

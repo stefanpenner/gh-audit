@@ -44,13 +44,17 @@ type ReportOpts struct {
 //   - per-rule fires: R3..R6 count how many commits tripped each rule
 //   - derived aggregates: ActionQueueCount, WaivedCount, CompliancePct
 type SummaryRow struct {
-	Org                   string  `json:"org"`
-	Repo                  string  `json:"repo"`
-	TotalCommits          int     `json:"total_commits"`
-	CompliantCount        int     `json:"compliant_count"`
-	NonCompliantCount     int     `json:"non_compliant_count"`
-	BotCount              int     `json:"bot_count"`
-	ExemptCount           int     `json:"exempt_count"`
+	Org               string `json:"org"`
+	Repo              string `json:"repo"`
+	TotalCommits      int    `json:"total_commits"`
+	CompliantCount    int    `json:"compliant_count"`
+	NonCompliantCount int    `json:"non_compliant_count"`
+	BotCount          int    `json:"bot_count"`
+	ExemptCount       int    `json:"exempt_count"`
+	// ForgeableExemptCount is the subset of exempt waivers that rest on the
+	// forgeable author-id hint (signing_policy: optional). A WEAK signal:
+	// these would fail under signing_policy: required. Always ≤ ExemptCount.
+	ForgeableExemptCount  int     `json:"forgeable_exempt_count"`
 	EmptyCount            int     `json:"empty_count"`
 	SelfApprovedCount     int     `json:"self_approved_count"`
 	StaleApprovalCount    int     `json:"stale_approval_count"`
@@ -239,6 +243,10 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 			COUNT(*) FILTER (WHERE a.is_compliant = false) AS non_compliant_count,
 			COUNT(*) FILTER (WHERE a.is_bot = true) AS bot_count,
 			COUNT(*) FILTER (WHERE a.is_exempt_author = true) AS exempt_count,
+			-- WEAK exemptions: waived on the forgeable author-id hint
+			-- (signing_policy: optional). Would fail under required.
+			COUNT(*) FILTER (WHERE a.is_compliant = true
+			                   AND COALESCE(list_contains(a.annotations, 'trust:forgeable-exemption'), false)) AS forgeable_exempt_count,
 			COUNT(*) FILTER (WHERE a.is_empty_commit = true) AS empty_count,
 			COUNT(*) FILTER (WHERE a.is_self_approved = true) AS self_approved_count,
 			COUNT(*) FILTER (WHERE COALESCE(a.has_stale_approval, false) = true) AS stale_approval_count,
@@ -299,7 +307,7 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 	for rows.Next() {
 		var s SummaryRow
 		if err := rows.Scan(&s.Org, &s.Repo, &s.TotalCommits,
-			&s.CompliantCount, &s.NonCompliantCount, &s.BotCount, &s.ExemptCount, &s.EmptyCount,
+			&s.CompliantCount, &s.NonCompliantCount, &s.BotCount, &s.ExemptCount, &s.ForgeableExemptCount, &s.EmptyCount,
 			&s.SelfApprovedCount, &s.StaleApprovalCount, &s.PostMergeConcernCount, &s.CleanRevertCount, &s.CleanMergeCount, &s.MultiplePRCount,
 			&s.ActionQueueCount, &s.WaivedCount, &s.R3NoPRCount, &s.R4NoFinalCount, &s.R6OwnerFailCount); err != nil {
 			return nil, fmt.Errorf("scan summary: %w", err)
@@ -441,11 +449,11 @@ func (r *Reporter) FormatTable(w io.Writer, summary []SummaryRow, details []Deta
 
 	// Summary section
 	fmt.Fprintln(tw, "=== SUMMARY ===")
-	fmt.Fprintln(tw, "Org\tRepo\tTotal\tCompliant\tNon-Compliant\tCompliance %\tBots\tExempt\tEmpty\tSelf-Approved\tStale Approvals\tPost-Merge Concerns\tClean Reverts\tClean Merges\tMultiple PRs")
+	fmt.Fprintln(tw, "Org\tRepo\tTotal\tCompliant\tNon-Compliant\tCompliance %\tBots\tExempt\tWeak Exempt\tEmpty\tSelf-Approved\tStale Approvals\tPost-Merge Concerns\tClean Reverts\tClean Merges\tMultiple PRs")
 	for _, s := range summary {
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%.1f%%\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%.1f%%\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
 			s.Org, s.Repo, s.TotalCommits, s.CompliantCount, s.NonCompliantCount,
-			s.CompliancePct, s.BotCount, s.ExemptCount, s.EmptyCount, s.SelfApprovedCount,
+			s.CompliancePct, s.BotCount, s.ExemptCount, s.ForgeableExemptCount, s.EmptyCount, s.SelfApprovedCount,
 			s.StaleApprovalCount, s.PostMergeConcernCount, s.CleanRevertCount, s.CleanMergeCount, s.MultiplePRCount)
 	}
 	fmt.Fprintln(tw)

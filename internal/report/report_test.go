@@ -173,6 +173,7 @@ type auditResultOpts struct {
 	prNumber, prCount                                                                           int
 	approvers                                                                                   []string
 	reasons                                                                                     []string
+	annotations                                                                                 []string
 }
 
 func insertAuditResult(t *testing.T, db *sql.DB, org, repo, sha string, isBot, isEmpty, hasPR, hasApproval, isCompliant bool, prNumber int, approvers []string, reasons []string) {
@@ -205,8 +206,17 @@ func insertAuditResultFull(t *testing.T, db *sql.DB, org, repo, sha string, opts
 		reasonExpr = fmt.Sprintf("list_value(%s)", strings.Join(quoted, ", "))
 	}
 
-	q := fmt.Sprintf(`INSERT INTO audit_results (org, repo, sha, is_empty_commit, is_bot, is_exempt_author, has_pr, pr_number, pr_count, has_final_approval, has_stale_approval, is_clean_revert, is_clean_merge, approver_logins, owner_approval_check, is_compliant, reasons, commit_href, pr_href, is_self_approved)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, %s, ?, ?, %s, ?, ?, ?)`, approverExpr, reasonExpr)
+	annotationExpr := "NULL"
+	if len(opts.annotations) > 0 {
+		quoted := make([]string, len(opts.annotations))
+		for i, a := range opts.annotations {
+			quoted[i] = fmt.Sprintf("'%s'", a)
+		}
+		annotationExpr = fmt.Sprintf("list_value(%s)", strings.Join(quoted, ", "))
+	}
+
+	q := fmt.Sprintf(`INSERT INTO audit_results (org, repo, sha, is_empty_commit, is_bot, is_exempt_author, has_pr, pr_number, pr_count, has_final_approval, has_stale_approval, is_clean_revert, is_clean_merge, approver_logins, owner_approval_check, is_compliant, reasons, commit_href, pr_href, is_self_approved, annotations)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, %s, ?, ?, %s, ?, ?, ?, %s)`, approverExpr, reasonExpr, annotationExpr)
 
 	_, err := db.Exec(q,
 		org, repo, sha, opts.isEmpty, opts.isBot, opts.isExempt, opts.hasPR, opts.prNumber, opts.prCount, opts.hasApproval, opts.hasStaleApproval,
@@ -303,8 +313,31 @@ func TestGetSummaryPartitionInvariant(t *testing.T) {
 	// Annotation counts overlap with primary partition
 	assert.Equal(t, 2, s.BotCount, "bots (one compliant, one not)")
 	assert.Equal(t, 1, s.ExemptCount, "exempt")
+	assert.Equal(t, 0, s.ForgeableExemptCount, "the exemption is sound (no forgeable tag)")
 	assert.Equal(t, 1, s.EmptyCount, "empty")
 	assert.Equal(t, 1, s.SelfApprovedCount, "self_approved")
+}
+
+// A forgeable exemption (signing_policy: optional, tagged
+// trust:forgeable-exemption) counts toward ForgeableExemptCount — the WEAK
+// subset of exemptions — while a verified-signer exemption does not.
+func TestGetSummary_ForgeableExemptCount(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now()
+	insertCommit(t, db, "org1", "repo1", "signed", "bot", now, 1, 0)
+	insertCommit(t, db, "org1", "repo1", "forged", "bot", now, 1, 0)
+
+	insertAuditResultFull(t, db, "org1", "repo1", "signed", auditResultOpts{
+		isExempt: true, isCompliant: true, reasons: []string{"exempt: configured author"}})
+	insertAuditResultFull(t, db, "org1", "repo1", "forged", auditResultOpts{
+		isExempt: true, isCompliant: true, reasons: []string{"exempt: configured author"},
+		annotations: []string{"trust:forgeable-exemption"}})
+
+	summary, err := New(db).GetSummary(context.Background(), ReportOpts{})
+	require.NoError(t, err)
+	require.Len(t, summary, 1)
+	assert.Equal(t, 2, summary[0].ExemptCount, "both are exempt")
+	assert.Equal(t, 1, summary[0].ForgeableExemptCount, "only the forged one is weak")
 }
 
 func TestGetSummaryRespectsSinceUntil(t *testing.T) {
