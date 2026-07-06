@@ -167,6 +167,18 @@ func short(s string) string {
 	return s
 }
 
+// VerifyResultsDigest recomputes the results digest over the given scope
+// and reports whether it matches the claimed digest — the independent
+// tamper check an external auditor runs against a report's manifest.
+// Returns (match, recomputed digest, error).
+func (r *Reporter) VerifyResultsDigest(ctx context.Context, opts ReportOpts, claimed string) (bool, string, error) {
+	actual, err := r.resultsDigest(ctx, opts)
+	if err != nil {
+		return false, "", err
+	}
+	return actual == claimed, actual, nil
+}
+
 // scopedRepos returns the distinct "org/repo" list in scope, sorted.
 func (r *Reporter) scopedRepos(ctx context.Context, opts ReportOpts) ([]string, error) {
 	q := `SELECT DISTINCT a.org || '/' || a.repo AS repo
