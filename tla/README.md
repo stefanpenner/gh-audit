@@ -43,6 +43,7 @@ Sound == Compliant => TrulySafe / TrulyAuthorized
 | `EmptyCommit` | §2 empty commit | zero lines **and** files | lines-only → **rename-only laundering** | GitHub file count |
 | `Checks` | §6 required checks | latest run per check wins | any-run-passed → **stale green masks red re-run** | GitHub check-run conclusion |
 | `Verdict` | §7 landing scope | base.ref ∈ audited branches | content scope → **sibling-branch credit** | GitHub-set `base.ref` |
+| `History` | force-push detection | recorded prior head reachable from current | snapshot-only → **rewrite launders commits unseen** | content-addressed ancestry |
 
 Every red config is kept on purpose: it is the machine-checked record
 of a hole the shipped rule closed, and it proves each model is strong
@@ -69,9 +70,10 @@ Counts from a full run (2026-07-06); `run.sh` prints them live.
 | `Approval` | MaxCommits=4, MaxTime=2, MaxReviews=2 | 953 |
 | `Checks` | MaxRuns=3, MaxTime=2 | 1,640 |
 | `EmptyCommit` | MaxCount=2 | 55 |
-| `Exempt` | MaxCommits=3 | 36,557 |
+| `Exempt` | MaxCommits=3 | 55,861 |
 | `Revert` | (booleans only) | 9 |
 | `Verdict` | NPRs=2 | 129 |
+| `History` | Commits={c1,c2,c3}, MaxHeads=4 | 585 |
 
 ## The amber configs — documented tradeoffs, machine-checked
 
@@ -124,20 +126,24 @@ rule that needs no such assumption.
   - `internal/sync/checks_spec_test.go` — 820 run sequences vs
     `evaluateRequiredChecks` (catches the any-run leak).
   - `internal/sync/exempt_spec_test.go` — all (authorId, committerId,
-    verified) states vs `exemptStatus` for both signing policies (catches
-    the forged-author waiver; asserts `required` waives only unforgeable
-    verified signers).
+    verified, webflow) states vs `exemptStatus` for both signing policies
+    (catches the forged-author waiver; asserts `required` waives only
+    unforgeable verified signers, own-key or web-flow).
+  - `internal/sync/history_spec_test.go` — GitHub compare statuses vs
+    `classifyHeadMove` (catches the snapshot-blind rule that misses a
+    rewrite).
 
-  Use either as the template when bridging the other modules.
+  Use any of these as the template when bridging the other modules.
 
   | Module | Go predicate |
   |---|---|
   | `Approval` | `evaluatePR`, `isApprovalRefreshable`, `postApprovalByGraph` |
-  | `Exempt` | `exemptStatus`, `hasNonExemptPRContributors` |
+  | `Exempt` | `exemptStatus`, `verifiedExemptSigner`, `hasNonExemptPRContributors` |
   | `Revert` | `evaluateRevertCompliance`, `verifyRevertDiff` |
   | `EmptyCommit` | `applyEmptyCommitFallback` |
   | `Checks` | `evaluateRequiredChecks` |
   | `Verdict` | `prDelivers`, `EvaluateCommit` PR loop |
+  | `History` | `classifyHeadMove`, `Pipeline.recordIfRewritten` |
 
 ## Finding NEW gaps
 

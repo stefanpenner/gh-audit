@@ -398,7 +398,7 @@ func (b *xlsxBuilder) writeSummary(summary []SummaryRow, opts ReportOpts) error 
 		"Action Queue", "Waived",
 		"R3 NoPR", "R4 NoFinal", "R6 OwnerFail",
 		"Self-Approved", "Stale", "Post-Merge", "Clean Reverts", "Clean Merges",
-		"Bots", "Exempt", "Weak Exempt", "Empty", "Multiple PRs",
+		"Bots", "Exempt", "Weak Exempt", "Empty", "Multiple PRs", "History Rewrites",
 	}
 
 	subtitleStyle, _ := f.NewStyle(&excelize.Style{
@@ -438,6 +438,7 @@ func (b *xlsxBuilder) writeSummary(summary []SummaryRow, opts ReportOpts) error 
 			s.SelfApprovedCount, s.StaleApprovalCount, s.PostMergeConcernCount,
 			s.CleanRevertCount, s.CleanMergeCount,
 			s.BotCount, s.ExemptCount, s.ForgeableExemptCount, s.EmptyCount, s.MultiplePRCount,
+			s.HistoryRewriteCount,
 		}
 		for c, v := range vals {
 			f.SetCellValue(sheet, cellName(c+1, row), v)

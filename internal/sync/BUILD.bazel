@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "annotations.go",
         "audit.go",
+        "history.go",
         "dbwriter.go",
         "pipeline.go",
         "progress.go",
@@ -28,6 +29,8 @@ go_test(
         "checks_spec_test.go",
         "exempt_signing_test.go",
         "exempt_spec_test.go",
+        "history_spec_test.go",
+        "history_test.go",
         "cursor_graph_test.go",
         "dbwriter_test.go",
         "pipeline_test.go",

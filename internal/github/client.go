@@ -278,28 +278,36 @@ const compareCommitsCeiling = 250
 // date-filtered list endpoint, the result is immune to committer-date
 // backdating, which makes it the trustworthy primitive for incremental
 // sync. The branch parameter only labels the returned commits.
-func (c *Client) CompareCommits(ctx context.Context, org, repo, base, head, branch string) ([]model.Commit, error) {
+func (c *Client) CompareCommits(ctx context.Context, org, repo, base, head, branch string) ([]model.Commit, string, error) {
 	var all []model.Commit
+	// GitHub's compare status ("identical"/"ahead"/"behind"/"diverged")
+	// is the same across pages for a given base...head; captured from the
+	// first page. "behind"/"diverged" means base is not an ancestor of
+	// head — a force-push / history rewrite (see sync.classifyHeadMove).
+	status := ""
 	opts := &gogithub.ListOptions{PerPage: 100}
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		gh, err := c.ghClient(ctx, org, repo)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		comp, resp, err := gh.Repositories.CompareCommits(ctx, org, repo, base, head, opts)
 		if err != nil {
 			var ghErr *gogithub.ErrorResponse
 			if errors.As(err, &ghErr) && ghErr.Response != nil &&
 				(ghErr.Response.StatusCode == http.StatusNotFound || ghErr.Response.StatusCode == http.StatusUnprocessableEntity) {
-				return nil, fmt.Errorf("%w: %s/%s %s...%s: %v", ErrCompareUnavailable, org, repo, base, head, err)
+				return nil, "", fmt.Errorf("%w: %s/%s %s...%s: %v", ErrCompareUnavailable, org, repo, base, head, err)
 			}
-			return nil, fmt.Errorf("comparing %s/%s %s...%s page %d: %w", org, repo, base, head, opts.Page, err)
+			return nil, "", fmt.Errorf("comparing %s/%s %s...%s page %d: %w", org, repo, base, head, opts.Page, err)
+		}
+		if status == "" {
+			status = comp.GetStatus()
 		}
 		if comp.GetTotalCommits() > compareCommitsCeiling {
-			return nil, fmt.Errorf("%w: %s/%s %s...%s spans %d commits (> %d ceiling)",
+			return nil, "", fmt.Errorf("%w: %s/%s %s...%s spans %d commits (> %d ceiling)",
 				ErrCompareUnavailable, org, repo, base, head, comp.GetTotalCommits(), compareCommitsCeiling)
 		}
 		for _, rc := range comp.Commits {
@@ -310,7 +318,7 @@ func (c *Client) CompareCommits(ctx context.Context, org, repo, base, head, bran
 		}
 		opts.Page = resp.NextPage
 	}
-	return all, nil
+	return all, status, nil
 }
 
 // GetCommitDetail fetches a single commit with addition/deletion stats.

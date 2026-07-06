@@ -66,6 +66,48 @@ func TestGraphCursor_IngestsBackdatedCommit(t *testing.T) {
 	assert.Equal(t, lastDate, cur.LastDate, "date watermark must not regress to the backdated commit")
 }
 
+// A force-push that GitHub compare reports as "diverged" (the prior head
+// is no longer an ancestor of the new head) must be recorded as a history
+// rewrite, while a normal fast-forward ("ahead") must not.
+func TestGraphCursor_RecordsHistoryRewriteOnDiverge(t *testing.T) {
+	lastDate := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	source, store, enricher, cfg := graphTestFixtures("oldhead", lastDate)
+	source.branchHeads["o/r/main"] = "newhead"
+	source.compareStatus = "diverged" // force-push
+	source.compareCommits["o/r/main oldhead...newhead"] = []model.Commit{
+		{Org: "o", Repo: "r", SHA: "injected", AuthorID: 1, CommittedAt: lastDate, ParentCount: 1, Additions: 1},
+	}
+
+	p := NewPipeline(source, enricher, store, cfg, slog.Default())
+	require.NoError(t, p.Run(context.Background()))
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	require.Len(t, store.historyRewrites, 1, "diverged compare must record a rewrite")
+	rw := store.historyRewrites[0]
+	assert.Equal(t, "main", rw.Branch)
+	assert.Equal(t, "oldhead", rw.PriorSHA)
+	assert.Equal(t, "newhead", rw.NewSHA)
+	assert.Equal(t, "diverged", rw.CompareStatus)
+}
+
+func TestGraphCursor_NoRewriteOnFastForward(t *testing.T) {
+	lastDate := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	source, store, enricher, cfg := graphTestFixtures("oldhead", lastDate)
+	source.branchHeads["o/r/main"] = "newhead"
+	source.compareStatus = "ahead" // normal fast-forward
+	source.compareCommits["o/r/main oldhead...newhead"] = []model.Commit{
+		{Org: "o", Repo: "r", SHA: "normal", AuthorID: 1, CommittedAt: lastDate, ParentCount: 1, Additions: 1},
+	}
+
+	p := NewPipeline(source, enricher, store, cfg, slog.Default())
+	require.NoError(t, p.Run(context.Background()))
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	assert.Empty(t, store.historyRewrites, "fast-forward must not record a rewrite")
+}
+
 // head == last_sha short-circuits to zero fetched commits — but the
 // unaudited mop-up must still run.
 func TestGraphCursor_UnchangedHeadSkipsFetchButMopsUp(t *testing.T) {

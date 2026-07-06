@@ -73,6 +73,40 @@ func TestExemptStatus_SigningPolicy(t *testing.T) {
 	}
 }
 
+// A GitHub web-flow commit (verified, committer login "web-flow") had its
+// AUTHOR id set by GitHub from an authenticated action — the exempt bot
+// committing via the API/web UI. Only GitHub holds the web-flow signing
+// key, so an attacker cannot forge (verified web-flow + author=bot). This
+// is a SOUND path: exempt even under signing_policy: required, not flagged
+// forgeable.
+func TestExemptStatus_WebFlowAttestedAuthor(t *testing.T) {
+	const bot, atk = int64(500), int64(999)
+	exempt := []model.ExemptAuthor{{Login: "bot", ID: bot}}
+
+	webflowBot := model.Commit{
+		AuthorID: bot, CommitterID: 0, IsVerified: true, CommitterLogin: "web-flow",
+	}
+	for _, requireSigning := range []bool{false, true} {
+		ex, forgeable := exemptStatus(webflowBot, exempt, requireSigning)
+		assert.True(t, ex, "verified web-flow commit authored by the bot is exempt (requireSigning=%v)", requireSigning)
+		assert.False(t, forgeable, "web-flow attestation is sound, not forgeable (requireSigning=%v)", requireSigning)
+	}
+
+	// Attacker cannot ride the web-flow path: their web-flow author id is
+	// their own (GitHub sets it from THEIR session), never the bot's.
+	webflowAtk := model.Commit{AuthorID: atk, IsVerified: true, CommitterLogin: "web-flow"}
+	ex, _ := exemptStatus(webflowAtk, exempt, true)
+	assert.False(t, ex, "attacker's web-flow commit is not exempt")
+
+	// Web-flow claim without a verified signature is NOT sound — the
+	// committer login is a forgeable string absent the signature.
+	unverifiedWebflow := model.Commit{AuthorID: bot, IsVerified: false, CommitterLogin: "web-flow"}
+	exReq, _ := exemptStatus(unverifiedWebflow, exempt, true)
+	assert.False(t, exReq, "unverified web-flow is not the sound path under required")
+	exOpt, forgeable := exemptStatus(unverifiedWebflow, exempt, false)
+	assert.True(t, exOpt && forgeable, "unverified falls to the forgeable author path under optional")
+}
+
 // A forgeable-path exemption (unsigned commit claiming the bot) is still
 // compliant under the default optional policy, but must carry both the
 // ExemptionForgeable flag and a trust:forgeable-exemption annotation so

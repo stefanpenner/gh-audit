@@ -6,6 +6,7 @@ go_library(
         "appender.go",
         "audit.go",
         "commits.go",
+        "history.go",
         "cursor.go",
         "db.go",
         "org_repos.go",
@@ -24,6 +25,7 @@ go_test(
     name = "db_test",
     srcs = [
         "committer_id_test.go",
+        "history_test.go",
         "db_bench_test.go",
         "db_fixes_test.go",
         "db_test.go",

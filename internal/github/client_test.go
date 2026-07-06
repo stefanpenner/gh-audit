@@ -958,6 +958,7 @@ func TestCompareCommits_PaginatesAndMapsFields(t *testing.T) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{
+			"status":        "ahead",
 			"total_commits": 3,
 			"commits":       []map[string]any{commit("c3")},
 		})
@@ -965,7 +966,7 @@ func TestCompareCommits_PaginatesAndMapsFields(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(mockTokenPool(t, srv.URL), testLogger())
-	commits, err := client.CompareCommits(context.Background(), "testorg", "repo", "base", "head", "main")
+	commits, status, err := client.CompareCommits(context.Background(), "testorg", "repo", "base", "head", "main")
 	require.NoError(t, err)
 	require.Len(t, commits, 3)
 	assert.Equal(t, "c1", commits[0].SHA)
@@ -973,6 +974,24 @@ func TestCompareCommits_PaginatesAndMapsFields(t *testing.T) {
 	assert.Equal(t, "main", commits[0].Branch)
 	assert.Equal(t, 2020, commits[0].CommittedAt.Year(), "committer date mapped (backdated commits flow through)")
 	assert.Equal(t, int64(1), commits[0].AuthorID)
+	assert.Equal(t, "ahead", status, "compare status surfaces for force-push detection")
+}
+
+// A diverged/behind compare status is the force-push signal: base is not an
+// ancestor of head. CompareCommits must surface it so sync can flag a
+// history rewrite (see sync.classifyHeadMove, tla/History.tla).
+func TestCompareCommits_SurfacesDivergedStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "diverged", "total_commits": 0, "commits": []any{},
+		})
+	}))
+	defer srv.Close()
+
+	client := NewClient(mockTokenPool(t, srv.URL), testLogger())
+	_, status, err := client.CompareCommits(context.Background(), "testorg", "repo", "old", "head", "main")
+	require.NoError(t, err)
+	assert.Equal(t, "diverged", status)
 }
 
 func TestCompareCommits_404IsCompareUnavailable(t *testing.T) {
@@ -983,7 +1002,7 @@ func TestCompareCommits_404IsCompareUnavailable(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(mockTokenPool(t, srv.URL), testLogger())
-	_, err := client.CompareCommits(context.Background(), "testorg", "repo", "gone", "head", "main")
+	_, _, err := client.CompareCommits(context.Background(), "testorg", "repo", "gone", "head", "main")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrCompareUnavailable)
 }
@@ -995,7 +1014,7 @@ func TestCompareCommits_OverCeilingIsCompareUnavailable(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(mockTokenPool(t, srv.URL), testLogger())
-	_, err := client.CompareCommits(context.Background(), "testorg", "repo", "old", "head", "main")
+	_, _, err := client.CompareCommits(context.Background(), "testorg", "repo", "old", "head", "main")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrCompareUnavailable)
 }

@@ -351,6 +351,27 @@ type SyncCursor struct {
 	UpdatedAt time.Time
 }
 
+// A HistoryRewrite records a detected force-push / history rewrite on a
+// protected branch: between two syncs the head moved from PriorSHA to
+// NewSHA in a way that is NOT a fast-forward (GitHub compare status
+// "behind" or "diverged"), so PriorSHA is no longer an ancestor of the
+// current head. Commits uniquely on the old history were orphaned —
+// potential laundering of unreviewed code or evidence removal.
+//
+// SLSA Source Track prohibits this (a branch must only advance to
+// descendant revisions). Detectable only by comparing the current head
+// against the RETAINED prior head (SyncCursor.LastSHA) — a single
+// snapshot cannot see it. See sync.classifyHeadMove and tla/History.tla.
+type HistoryRewrite struct {
+	Org           string
+	Repo          string
+	Branch        string
+	PriorSHA      string
+	NewSHA        string
+	CompareStatus string // "behind" | "diverged"
+	DetectedAt    time.Time
+}
+
 // A RepoInfo is a GitHub repository discovered during sync.
 // Provides the metadata needed to scope sync and audit operations.
 //

@@ -56,58 +56,72 @@ VARIABLES
     authorId,      \* cid -> AnyId          observable, FORGEABLE (email->id)
     committerId,   \* cid -> AnyId          observable; trusted only if verified
     verified,      \* cid -> BOOLEAN        observable (verification.verified)
+    webflow,       \* cid -> BOOLEAN        observable (committer login = web-flow)
     realSigner,    \* cid -> Bot | Atk      ground truth
     empty,         \* cid -> BOOLEAN        observable (GitHub diff stats)
     merged
 
-vars == <<nextId, authorId, committerId, verified, realSigner, empty, merged>>
+vars == <<nextId, authorId, committerId, verified, webflow, realSigner, empty, merged>>
 
 Init ==
     /\ nextId = 1
     /\ authorId = <<>>
     /\ committerId = <<>>
     /\ verified = <<>>
+    /\ webflow = <<>>
     /\ realSigner = <<>>
     /\ empty = <<>>
     /\ merged = FALSE
 
-Add(aid, cid, v, rs, e) ==
+Add(aid, cid, v, wf, rs, e) ==
     /\ ~merged
     /\ nextId <= MaxCommits
     /\ authorId' = authorId @@ (nextId :> aid)
     /\ committerId' = committerId @@ (nextId :> cid)
     /\ verified' = verified @@ (nextId :> v)
+    /\ webflow' = webflow @@ (nextId :> wf)
     /\ realSigner' = realSigner @@ (nextId :> rs)
     /\ empty' = empty @@ (nextId :> e)
     /\ nextId' = nextId + 1
     /\ UNCHANGED merged
 
-\* Attacker push (realSigner = Atk). Two capabilities:
+\* Attacker push (realSigner = Atk). Three capabilities:
 \*  - UNSIGNED (verified=FALSE): forge ANY authorId and ANY committerId,
 \*    including the exempt id (noreply-email trick). This is the attack.
-\*  - SIGNED with the attacker's OWN key (verified=TRUE): the signature
-\*    binds committerId to the attacker (AtkId) -- NEVER the exempt id,
-\*    which needs the bot's key. The author field is still forgeable
-\*    (cherry-pick / --author), so authorId may still claim the exempt id.
+\*  - SIGNED with the attacker's OWN key (verified=TRUE, ~webflow): the
+\*    signature binds committerId to the attacker (AtkId) -- NEVER the
+\*    exempt id, which needs the bot's key. The author field is still
+\*    forgeable (cherry-pick / --author), so authorId may claim any id.
+\*  - WEB-FLOW (verified=TRUE, webflow): GitHub signed it from the
+\*    attacker's authenticated session, so GitHub sets BOTH ids to the
+\*    attacker (AtkId). The attacker cannot mint a web-flow commit
+\*    authored by the bot -- only GitHub holds the web-flow key.
 AtkPush ==
     \/ /\ \E aid \in AnyId, cid \in AnyId, e \in {TRUE, FALSE} :
-              Add(aid, cid, FALSE, Atk, e)
+              Add(aid, cid, FALSE, FALSE, Atk, e)
        /\ UNCHANGED merged
     \/ /\ \E aid \in AnyId, e \in {TRUE, FALSE} :
-              Add(aid, AtkId, TRUE, Atk, e)
+              Add(aid, AtkId, TRUE, FALSE, Atk, e)
+       /\ UNCHANGED merged
+    \/ /\ \E e \in {TRUE, FALSE} :
+              Add(AtkId, AtkId, TRUE, TRUE, Atk, e)
        /\ UNCHANGED merged
 
-\* Honest bot push: it signs, so verified with committerId = exempt id.
-\* The author id is the bot's too.
+\* Honest bot push. Either the bot signs with its own key (committerId =
+\* exempt id), or it commits via GitHub's web/API and GitHub signs it
+\* (webflow, committer is web-flow rather than the bot, but GitHub set the
+\* author to the bot from its authenticated session).
 BotPush ==
-    /\ \E e \in {TRUE, FALSE} : Add(ExemptId, ExemptId, TRUE, Bot, e)
-    /\ UNCHANGED merged
+    \/ /\ \E e \in {TRUE, FALSE} : Add(ExemptId, ExemptId, TRUE, FALSE, Bot, e)
+       /\ UNCHANGED merged
+    \/ /\ \E e \in {TRUE, FALSE} : Add(ExemptId, NoId, TRUE, TRUE, Bot, e)
+       /\ UNCHANGED merged
 
 Merge ==
     /\ ~merged
     /\ nextId > 1
     /\ merged' = TRUE
-    /\ UNCHANGED <<nextId, authorId, committerId, verified, realSigner, empty>>
+    /\ UNCHANGED <<nextId, authorId, committerId, verified, webflow, realSigner, empty>>
 
 Next == AtkPush \/ BotPush \/ Merge
 
@@ -116,14 +130,19 @@ Spec == Init /\ [][Next]_vars
 --------------------------------------------------------------------------
 (* Auditor -- S1 over observable data. *)
 
-\* Sound anchor: a verified signature binding the committer to an exempt id.
+\* Sound anchor 1: a verified signature binding the COMMITTER to an exempt
+\* id (the exempt account's own key).
 SignerExempt(c) == verified[c] /\ committerId[c] \in ExemptIds
-\* Forgeable hint: the author field claims an exempt id.
+\* Sound anchor 2: a verified GitHub web-flow commit whose AUTHOR is the
+\* exempt account -- GitHub set the author from an authenticated action and
+\* only GitHub holds the web-flow key, so it cannot be forged.
+WebFlowExempt(c) == verified[c] /\ webflow[c] /\ authorId[c] \in ExemptIds
+\* Forgeable hint: the author field claims an exempt id (no signature).
 AuthorExempt(c) == authorId[c] \in ExemptIds
 
 Exempt(c) ==
-    CASE Variant = "signer"   -> SignerExempt(c)
-      [] Variant = "optional" -> SignerExempt(c) \/ AuthorExempt(c)
+    CASE Variant = "signer"   -> SignerExempt(c) \/ WebFlowExempt(c)
+      [] Variant = "optional" -> SignerExempt(c) \/ WebFlowExempt(c) \/ AuthorExempt(c)
       [] Variant = "author"   -> AuthorExempt(c)
 
 \* Non-exempt contributor voids the waiver, UNLESS the commit is verifiably
