@@ -1245,9 +1245,13 @@ the `table` output, a `Provenance` sheet in the XLSX, and a top-level
   possibly-different report-time config. When the two fingerprints differ
   the manifest flags **config drift**: re-audit before relying on it.
 - **Were the results tampered with?** `results_digest` is a SHA-256 over
-  the canonical, ordered verdict rows in scope. Recompute it over the same
-  DB; a mismatch means `audit_results` was altered. (All report queries
-  carry an explicit `ORDER BY`, so the digest is reproducible.)
+  the canonical, ordered verdict rows in scope. (All report queries carry
+  an explicit `ORDER BY`, so the digest is reproducible.) An auditor
+  recomputes it independently with **`gh-audit verify --manifest
+  report.json --db audit.db`** (passing the same scope flags): it rebuilds
+  the digest from the DB and confirms it matches the report's claimed
+  digest — exit 0 on match, non-zero on mismatch. A mismatch means the
+  report's verdicts were altered after generation (or the DB changed).
 - **What was covered?** repo list, commit count, and date range.
 - **What must NOT be taken at face value?** the coverage caveats — a
   consolidated, honest disclosure of every residual assumption:
@@ -1265,7 +1269,8 @@ caveats.
 cmd/
   root.go                    Cobra root + flag wiring
   sync.go                    `sync` — fetch + enrich + audit (the main loop)
-  report.go                  `report` — table / csv / json / xlsx output
+  report.go                  `report` — table / csv / json / xlsx output (+ provenance manifest)
+  verify.go                  `verify` — recompute a JSON report's tamper-evident results digest against the DB
   config.go                  `config validate` / `config show` — validate config file, print resolved config
   reaudit.go                 `re-evaluate-commits` (alias `re-audit`) — re-evaluate audit_results from DB (no API, single pass)
   backfill.go                `backfill-missing-prs` — recover PR attribution for "no associated pull request" rows via time-windowed merge_commit_sha lookup

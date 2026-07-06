@@ -37,6 +37,7 @@ func NewRootCmd() *cobra.Command {
 
 	rootCmd.AddCommand(newSyncCmd())
 	rootCmd.AddCommand(newReportCmd())
+	rootCmd.AddCommand(newVerifyCmd())
 	rootCmd.AddCommand(newReAuditCmd())
 	rootCmd.AddCommand(newBackfillCmd())
 	rootCmd.AddCommand(newAnnotateCommitsCmd())

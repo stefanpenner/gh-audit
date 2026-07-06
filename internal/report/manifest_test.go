@@ -70,6 +70,31 @@ func TestBuildManifest(t *testing.T) {
 	assert.NotEqual(t, m.ResultsDigest, m3.ResultsDigest, "tampering with a verdict changes the digest")
 }
 
+func TestVerifyResultsDigest(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+	insertCommit(t, db, "org1", "repo1", "c1", "dev", now, 1, 0)
+	insertAuditResultFull(t, db, "org1", "repo1", "c1", auditResultOpts{
+		hasPR: true, hasApproval: true, isCompliant: true, prNumber: 1, reasons: []string{"compliant"}})
+
+	r := NewWithBranches(db, []string{"master"})
+	m, err := r.BuildManifest(ctx, ReportOpts{}, "fp", now)
+	require.NoError(t, err)
+
+	ok, actual, err := r.VerifyResultsDigest(ctx, ReportOpts{}, m.ResultsDigest)
+	require.NoError(t, err)
+	assert.True(t, ok, "digest recomputed from the same DB matches the manifest")
+	assert.Equal(t, m.ResultsDigest, actual)
+
+	_, err = db.Exec(`UPDATE audit_results SET is_compliant = false WHERE sha = 'c1'`)
+	require.NoError(t, err)
+	ok, actual, err = r.VerifyResultsDigest(ctx, ReportOpts{}, m.ResultsDigest)
+	require.NoError(t, err)
+	assert.False(t, ok, "a tampered verdict fails verification")
+	assert.NotEqual(t, m.ResultsDigest, actual)
+}
+
 func TestBuildManifest_NoDriftWhenFingerprintsMatch(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
