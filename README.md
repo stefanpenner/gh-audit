@@ -13,7 +13,10 @@ writes to GitHub.
 
 This README is the user manual: how to install, run, and configure the tool.
 For how it makes its decisions and why those decisions are trustworthy, see
-**[Architecture.md](Architecture.md)**.
+**[Architecture.md](Architecture.md)**. If you are an **external auditor**
+using gh-audit as evidence, start with **[AUDITING.md](AUDITING.md)** — the
+sync → report → verify procedure, how to read the provenance manifest and
+coverage caveats, and the framework mapping (SLSA / NIST SSDF / SOC 2).
 
 ## What it checks
 
@@ -67,7 +70,8 @@ The token is auto-detected: `GH_TOKEN`, then `GITHUB_TOKEN`, then
 | Command | What it does |
 |---|---|
 | `sync` | Fetch from GitHub, enrich, and audit. The main loop. |
-| `report` | Print or export the results. See [Reports](#reports). |
+| `report` | Print or export the results, led by a provenance manifest. See [Reports](#reports). |
+| `verify` | Recompute a JSON report's tamper-evident digest against the DB. See [AUDITING.md](AUDITING.md). |
 | `re-evaluate-commits` | Re-audit from the local database. No API calls. |
 | `config validate` | Check the config file is valid. |
 | `config show` | Print the fully resolved config. |
