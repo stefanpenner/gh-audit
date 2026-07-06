@@ -372,6 +372,20 @@ type HistoryRewrite struct {
 	DetectedAt    time.Time
 }
 
+// An AuditRun is a provenance record stamped at the end of each sync: it
+// ties a set of verdicts to the exact build of gh-audit and the exact
+// audit config (fingerprint) that produced them. The provenance manifest
+// reads the latest run so an external auditor can attribute a report and
+// detect when it was generated under a different config than the verdicts
+// were computed under. See config.AuditFingerprint and version.Info.
+type AuditRun struct {
+	FinishedAt        time.Time
+	ToolVersion       string
+	ConfigFingerprint string
+	CommitsSynced     int
+	CommitsAudited    int
+}
+
 // A RepoInfo is a GitHub repository discovered during sync.
 // Provides the metadata needed to scope sync and audit operations.
 //

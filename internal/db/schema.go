@@ -118,6 +118,18 @@ const (
 		PRIMARY KEY (org, repo, commit_sha, check_run_id)
 	)`
 
+	// audit_runs is the provenance log: one row per completed sync,
+	// stamping the tool build and the audit-config fingerprint that
+	// produced that run's verdicts. The manifest reads the latest row.
+	createAuditRuns = `CREATE TABLE IF NOT EXISTS audit_runs (
+		finished_at        TIMESTAMP NOT NULL,
+		tool_version       TEXT,
+		config_fingerprint TEXT,
+		commits_synced     INTEGER,
+		commits_audited    INTEGER,
+		PRIMARY KEY (finished_at)
+	)`
+
 	createCommitBranches = `CREATE TABLE IF NOT EXISTS commit_branches (
 		org    TEXT NOT NULL,
 		repo   TEXT NOT NULL,
@@ -234,6 +246,7 @@ var allTables = []string{
 	createCommitPRs,
 	createCommitBranches,
 	createHistoryRewrites,
+	createAuditRuns,
 	createPullRequests,
 	createReviews,
 	createCheckRuns,

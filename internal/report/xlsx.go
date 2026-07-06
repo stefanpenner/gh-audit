@@ -14,6 +14,7 @@ import (
 // builder code. Order here is the order they appear in the workbook.
 const (
 	SheetREADME         = "README"
+	SheetProvenance     = "Provenance"
 	SheetActionQueue    = "Action Queue"
 	SheetSummary        = "Summary"
 	SheetByRule         = "By Rule"
@@ -36,7 +37,63 @@ type xlsxBuilder struct {
 }
 
 // GenerateXLSX creates the 3-layer audit workbook: Action → Overview → Trace.
-func (r *Reporter) GenerateXLSX(ctx context.Context, opts ReportOpts, outputPath string) error {
+// writeProvenance renders the audit provenance manifest as a key/value
+// sheet: attribution, integrity digest, and the coverage caveats an
+// external auditor must weigh before relying on the verdicts.
+func (b *xlsxBuilder) writeProvenance(m *AuditManifest) error {
+	sheet := SheetProvenance
+	f := b.f
+	row := 1
+	put := func(k, v string) {
+		f.SetCellValue(sheet, cellName(1, row), k)
+		f.SetCellValue(sheet, cellName(2, row), v)
+		row++
+	}
+	section := func(title string) {
+		cell := cellName(1, row)
+		f.SetCellValue(sheet, cell, title)
+		f.SetCellStyle(sheet, cell, cell, b.headerBlue)
+		row++
+	}
+
+	section("Attribution")
+	put("Tool version", orNA(m.ToolVersion))
+	put("Config fingerprint", orNA(m.ConfigFingerprint))
+	put("Report config fingerprint", m.ReportConfigFingerprint)
+	if m.ConfigDrift {
+		put("⚠ CONFIG DRIFT", "verdicts predate the current config — re-audit before relying on them")
+	}
+	if !m.AuditFinishedAt.IsZero() {
+		put("Audit finished", m.AuditFinishedAt.UTC().Format("2006-01-02 15:04 MST"))
+	}
+	put("Report generated", m.GeneratedAt.UTC().Format("2006-01-02 15:04 MST"))
+	row++
+
+	section("Integrity")
+	put("Results digest (SHA-256)", m.ResultsDigest)
+	put("Verify", "recompute over the same DB; a mismatch means the results were altered")
+	row++
+
+	section("Scope")
+	put("Repos", fmt.Sprintf("%d", len(m.Scope.Repos)))
+	put("Commits", fmt.Sprintf("%d", m.Scope.CommitCount))
+	if !m.Scope.EarliestCommit.IsZero() {
+		put("Commit range", m.Scope.EarliestCommit.UTC().Format("2006-01-02")+" … "+m.Scope.LatestCommit.UTC().Format("2006-01-02"))
+	}
+	row++
+
+	section("Coverage caveats (do NOT take at face value)")
+	put("Non-compliant commits", fmt.Sprintf("%d", m.Coverage.NonCompliant))
+	put("History rewrites (force-push)", fmt.Sprintf("%d", m.Coverage.HistoryRewrites))
+	put("Forgeable exemptions", fmt.Sprintf("%d", m.Coverage.ForgeableExemptions))
+	put("Unresolved author ids", fmt.Sprintf("%d", m.Coverage.UnresolvedAuthorIDs))
+
+	f.SetColWidth(sheet, "A", "A", 30)
+	f.SetColWidth(sheet, "B", "B", 80)
+	return nil
+}
+
+func (r *Reporter) GenerateXLSX(ctx context.Context, opts ReportOpts, outputPath string, manifest *AuditManifest) error {
 	summary, err := r.GetSummary(ctx, opts)
 	if err != nil {
 		return fmt.Errorf("getting summary: %w", err)
@@ -67,7 +124,11 @@ func (r *Reporter) GenerateXLSX(ctx context.Context, opts ReportOpts, outputPath
 		return fmt.Errorf("README: %w", err)
 	}
 
-	for _, name := range []string{SheetActionQueue, SheetSummary, SheetByRule, SheetByAuthor, SheetDecisionMatrix, SheetWaiversLog, SheetMultiplePRs} {
+	sheets := []string{SheetActionQueue, SheetSummary, SheetByRule, SheetByAuthor, SheetDecisionMatrix, SheetWaiversLog, SheetMultiplePRs}
+	if manifest != nil {
+		sheets = append(sheets, SheetProvenance)
+	}
+	for _, name := range sheets {
 		if _, err := f.NewSheet(name); err != nil {
 			return fmt.Errorf("creating %s: %w", name, err)
 		}
@@ -93,6 +154,11 @@ func (r *Reporter) GenerateXLSX(ctx context.Context, opts ReportOpts, outputPath
 	}
 	if err := b.writeMultiplePRs(multiplePRs); err != nil {
 		return fmt.Errorf("%s: %w", SheetMultiplePRs, err)
+	}
+	if manifest != nil {
+		if err := b.writeProvenance(manifest); err != nil {
+			return fmt.Errorf("%s: %w", SheetProvenance, err)
+		}
 	}
 
 	// Open on Action Queue by default — it's the sheet auditors live in.

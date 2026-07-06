@@ -237,6 +237,20 @@ func appendRepoFilter(query string, args []any, opts ReportOpts) (string, []any)
 	return query, args
 }
 
+// appendSinceUntil appends committed_at bounds (either may be zero to
+// disable that side). Assumes the commits table is aliased `c`.
+func appendSinceUntil(query string, args []any, opts ReportOpts) (string, []any) {
+	if !opts.Since.IsZero() {
+		query += " AND c.committed_at >= ?"
+		args = append(args, opts.Since)
+	}
+	if !opts.Until.IsZero() {
+		query += " AND c.committed_at < ?"
+		args = append(args, opts.Until)
+	}
+	return query, args
+}
+
 // GetSummary returns per-repo compliance summary rows.
 func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRow, error) {
 	query := `
@@ -453,9 +467,15 @@ func (r *Reporter) GetDetails(ctx context.Context, opts ReportOpts) ([]DetailRow
 	return result, rows.Err()
 }
 
-// FormatTable writes an ASCII table of summary and details.
-func (r *Reporter) FormatTable(w io.Writer, summary []SummaryRow, details []DetailRow) error {
+// FormatTable writes an ASCII table of summary and details, led by the
+// provenance manifest header so a piped/plain-text report is still
+// attributable and tamper-evident.
+func (r *Reporter) FormatTable(w io.Writer, summary []SummaryRow, details []DetailRow, manifest *AuditManifest) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+
+	if manifest != nil {
+		writeManifestHeader(w, manifest)
+	}
 
 	// Summary section
 	fmt.Fprintln(tw, "=== SUMMARY ===")
@@ -550,14 +570,17 @@ func (r *Reporter) FormatCSV(w io.Writer, details []DetailRow) error {
 	return cw.Error()
 }
 
-// FormatJSON writes summary and details as JSON.
-func (r *Reporter) FormatJSON(w io.Writer, summary []SummaryRow, details []DetailRow) error {
+// FormatJSON writes the provenance manifest, summary, and details as JSON —
+// the machine-readable, attributable, tamper-evident audit artifact.
+func (r *Reporter) FormatJSON(w io.Writer, summary []SummaryRow, details []DetailRow, manifest *AuditManifest) error {
 	output := struct {
-		Summary []SummaryRow `json:"summary"`
-		Details []DetailRow  `json:"details"`
+		Manifest *AuditManifest `json:"manifest,omitempty"`
+		Summary  []SummaryRow   `json:"summary"`
+		Details  []DetailRow    `json:"details"`
 	}{
-		Summary: summary,
-		Details: details,
+		Manifest: manifest,
+		Summary:  summary,
+		Details:  details,
 	}
 	if output.Summary == nil {
 		output.Summary = []SummaryRow{}

@@ -4,6 +4,7 @@ go_library(
     name = "report",
     srcs = [
         "report.go",
+        "manifest.go",
         "rules.go",
         "xlsx.go",
     ],
@@ -22,6 +23,7 @@ go_test(
         "fuzz_test.go",
         "report_bench_test.go",
         "report_test.go",
+        "manifest_test.go",
         "rules_test.go",
         "xlsx_test.go",
     ],
