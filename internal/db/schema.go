@@ -126,6 +126,21 @@ const (
 		PRIMARY KEY (org, repo, sha, branch)
 	)`
 
+	// history_rewrites records detected force-push / non-fast-forward moves
+	// on a protected branch (SLSA prohibits these). Keyed by the (prior,new)
+	// head pair so re-detecting the same rewrite is idempotent. See
+	// model.HistoryRewrite and sync.classifyHeadMove.
+	createHistoryRewrites = `CREATE TABLE IF NOT EXISTS history_rewrites (
+		org            TEXT NOT NULL,
+		repo           TEXT NOT NULL,
+		branch         TEXT NOT NULL,
+		prior_sha      TEXT NOT NULL,
+		new_sha        TEXT NOT NULL,
+		compare_status TEXT,
+		detected_at    TIMESTAMP DEFAULT current_timestamp,
+		PRIMARY KEY (org, repo, branch, prior_sha, new_sha)
+	)`
+
 	// org_repos_cache memoises the result of GitHub's
 	// /orgs/{org}/repos enumeration. fetched_at is the same on every
 	// row in a given org because cache replacement is atomic per-org
@@ -218,6 +233,7 @@ var allTables = []string{
 	createCoAuthors,
 	createCommitPRs,
 	createCommitBranches,
+	createHistoryRewrites,
 	createPullRequests,
 	createReviews,
 	createCheckRuns,

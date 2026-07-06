@@ -28,6 +28,7 @@ type mockSource struct {
 	// untouched (the pipeline falls back).
 	branchHeads    map[string]string         // key → tip SHA
 	compareCommits map[string][]model.Commit // "key base...head" → commits
+	compareStatus  string                    // compare status ("ahead" default); "diverged"/"behind" = force-push
 	compareErr     error
 
 	listCalls    atomic.Int32
@@ -41,16 +42,20 @@ func (m *mockSource) GetBranchHead(_ context.Context, org, repo, branch string) 
 	return "", errors.New("mock: no branch head configured")
 }
 
-func (m *mockSource) CompareCommits(_ context.Context, org, repo, base, head, branch string) ([]model.Commit, error) {
+func (m *mockSource) CompareCommits(_ context.Context, org, repo, base, head, branch string) ([]model.Commit, string, error) {
 	m.compareCalls.Add(1)
 	if m.compareErr != nil {
-		return nil, m.compareErr
+		return nil, "", m.compareErr
+	}
+	status := m.compareStatus
+	if status == "" {
+		status = "ahead"
 	}
 	key := org + "/" + repo + "/" + branch + " " + base + "..." + head
 	if commits, ok := m.compareCommits[key]; ok {
-		return commits, nil
+		return commits, status, nil
 	}
-	return nil, errors.New("mock: no compare result configured for " + key)
+	return nil, "", errors.New("mock: no compare result configured for " + key)
 }
 
 func (m *mockSource) ListOrgRepos(_ context.Context, org string) ([]model.RepoInfo, error) {
@@ -124,17 +129,25 @@ func (m *mockEnricher) EnrichCommits(_ context.Context, org, repo string, shas [
 }
 
 type mockStore struct {
-	mu             sync.Mutex
-	cursors        map[string]*model.SyncCursor
-	commits        []model.Commit
-	commitBranches map[string][]string
-	prs            []model.PullRequest
-	reviews        []model.Review
-	checkRuns      []model.CheckRun
-	auditResults   []model.AuditResult
-	unaudited      map[string][]model.Commit
-	commitPRs      map[string][]int
-	err            error
+	mu              sync.Mutex
+	cursors         map[string]*model.SyncCursor
+	commits         []model.Commit
+	commitBranches  map[string][]string
+	prs             []model.PullRequest
+	reviews         []model.Review
+	checkRuns       []model.CheckRun
+	auditResults    []model.AuditResult
+	unaudited       map[string][]model.Commit
+	commitPRs       map[string][]int
+	historyRewrites []model.HistoryRewrite
+	err             error
+}
+
+func (m *mockStore) RecordHistoryRewrite(_ context.Context, r model.HistoryRewrite) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.historyRewrites = append(m.historyRewrites, r)
+	return nil
 }
 
 func newMockStore() *mockStore {

@@ -283,19 +283,45 @@ func idExempt(id int64, exemptAuthors []model.ExemptAuthor) bool {
 	return false
 }
 
+// webFlowCommitter is the committer login GitHub stamps on commits it
+// creates and signs itself (web/API merges, squashes, edits). Kept in
+// sync with github.ClassifyMerge.
+const webFlowCommitter = "web-flow"
+
+// verifiedExemptSigner reports whether a VERIFIED signature attests that
+// an exempt account is responsible for the commit — the sound, unforgeable
+// anchor for §1. Two signers cannot be impersonated:
+//
+//   - the exempt account's own key — a valid signature binds the
+//     COMMITTER to that account (commit.CommitterID).
+//   - GitHub's web-flow key — for a verified commit whose committer is
+//     web-flow, GitHub created it from an authenticated action and set the
+//     AUTHOR id from that session, so commit.AuthorID is GitHub-attested.
+//     Only GitHub holds the web-flow key, so an attacker cannot forge a
+//     verified web-flow commit authored by the bot.
+//
+// Both reduce to "a signature we trust vouches for an exempt identity".
+func verifiedExemptSigner(commit model.Commit, exemptAuthors []model.ExemptAuthor) bool {
+	if !commit.IsVerified {
+		return false
+	}
+	if idExempt(commit.CommitterID, exemptAuthors) {
+		return true
+	}
+	if strings.EqualFold(commit.CommitterLogin, webFlowCommitter) && idExempt(commit.AuthorID, exemptAuthors) {
+		return true
+	}
+	return false
+}
+
 // exemptStatus decides whether a commit is exempt under §1, and whether
 // that decision rests on a FORGEABLE node.
 //
-// A commit carries two account ids, both resolved by GitHub from
-// pushed-byte emails the committer controls:
-//
-//   - CommitterID — trustworthy ONLY when IsVerified: a valid signature
-//     cryptographically binds the committer to the signing account.
-//   - AuthorID    — never cryptographically bound. It is a hint the
-//     committer typed. `git commit --author=...` sets it to anyone.
-//
-// So there is exactly one non-forgeable path (verified signer on the
-// exempt list) and one forgeable path (author id claims the exempt
+// A commit's AuthorID is a hint the committer typed (`git commit
+// --author=…` sets it to anyone); it is trustworthy only when a verified
+// signature attests it (see verifiedExemptSigner). So there is one sound
+// path (a trusted signature vouching for an exempt identity) and one
+// forgeable path (an unsigned commit whose author id claims the exempt
 // account). Signing is progressive enhancement:
 //
 //	requireSigning=false (default): the forgeable path is allowed but
@@ -304,9 +330,9 @@ func idExempt(id int64, exemptAuthors []model.ExemptAuthor) bool {
 //	  unsigned commit claiming the bot is NOT exempt (fails closed).
 //
 // Returns (exempt, forgeable). forgeable is only ever true when exempt
-// is true and the match came from the author-id hint.
+// is true and the match came from the unsigned author-id hint.
 func exemptStatus(commit model.Commit, exemptAuthors []model.ExemptAuthor, requireSigning bool) (exempt, forgeable bool) {
-	if commit.IsVerified && idExempt(commit.CommitterID, exemptAuthors) {
+	if verifiedExemptSigner(commit, exemptAuthors) {
 		return true, false
 	}
 	if !requireSigning && idExempt(commit.AuthorID, exemptAuthors) {

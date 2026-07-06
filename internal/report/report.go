@@ -54,20 +54,25 @@ type SummaryRow struct {
 	// ForgeableExemptCount is the subset of exempt waivers that rest on the
 	// forgeable author-id hint (signing_policy: optional). A WEAK signal:
 	// these would fail under signing_policy: required. Always ≤ ExemptCount.
-	ForgeableExemptCount  int     `json:"forgeable_exempt_count"`
-	EmptyCount            int     `json:"empty_count"`
-	SelfApprovedCount     int     `json:"self_approved_count"`
-	StaleApprovalCount    int     `json:"stale_approval_count"`
-	PostMergeConcernCount int     `json:"post_merge_concern_count"`
-	CleanRevertCount      int     `json:"clean_revert_count"`
-	CleanMergeCount       int     `json:"clean_merge_count"`
-	MultiplePRCount       int     `json:"multiple_pr_count"`
-	ActionQueueCount      int     `json:"action_queue_count"`
-	WaivedCount           int     `json:"waived_count"`
-	R3NoPRCount           int     `json:"r3_no_pr_count"`
-	R4NoFinalCount        int     `json:"r4_no_final_count"`
-	R6OwnerFailCount      int     `json:"r6_owner_fail_count"`
-	CompliancePct         float64 `json:"compliance_pct"`
+	ForgeableExemptCount  int `json:"forgeable_exempt_count"`
+	EmptyCount            int `json:"empty_count"`
+	SelfApprovedCount     int `json:"self_approved_count"`
+	StaleApprovalCount    int `json:"stale_approval_count"`
+	PostMergeConcernCount int `json:"post_merge_concern_count"`
+	CleanRevertCount      int `json:"clean_revert_count"`
+	CleanMergeCount       int `json:"clean_merge_count"`
+	MultiplePRCount       int `json:"multiple_pr_count"`
+	ActionQueueCount      int `json:"action_queue_count"`
+	WaivedCount           int `json:"waived_count"`
+	R3NoPRCount           int `json:"r3_no_pr_count"`
+	R4NoFinalCount        int `json:"r4_no_final_count"`
+	R6OwnerFailCount      int `json:"r6_owner_fail_count"`
+	// HistoryRewriteCount is the number of force-push / non-fast-forward
+	// moves detected on any branch of this repo (SLSA prohibits them). A
+	// non-zero value is a serious integrity signal — prior audited history
+	// was rewritten. See sync.classifyHeadMove, tla/History.tla.
+	HistoryRewriteCount int     `json:"history_rewrite_count"`
+	CompliancePct       float64 `json:"compliance_pct"`
 }
 
 // ByAuthorRow is a per-author rollup used by the "By Author" sheet.
@@ -277,7 +282,11 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 			-- By Rule, and Decision Matrix agree.
 			COUNT(*) FILTER (WHERE a.has_pr = true
 			                   AND a.has_final_approval = false) AS r4_no_final_count,
-			COUNT(*) FILTER (WHERE a.owner_approval_check IN ('failure', 'missing')) AS r6_owner_fail_count
+			COUNT(*) FILTER (WHERE a.owner_approval_check IN ('failure', 'missing')) AS r6_owner_fail_count,
+			-- Force-push / history-rewrite events detected on any branch of
+			-- this repo (SLSA prohibits non-fast-forward moves). A per-repo
+			-- count from a separate table, correlated by org/repo.
+			(SELECT COUNT(*) FROM history_rewrites h WHERE h.org = a.org AND h.repo = a.repo) AS history_rewrite_count
 		FROM audit_results a
 		JOIN commits c ON a.org = c.org AND a.repo = c.repo AND a.sha = c.sha
 		WHERE 1=1
@@ -309,7 +318,8 @@ func (r *Reporter) GetSummary(ctx context.Context, opts ReportOpts) ([]SummaryRo
 		if err := rows.Scan(&s.Org, &s.Repo, &s.TotalCommits,
 			&s.CompliantCount, &s.NonCompliantCount, &s.BotCount, &s.ExemptCount, &s.ForgeableExemptCount, &s.EmptyCount,
 			&s.SelfApprovedCount, &s.StaleApprovalCount, &s.PostMergeConcernCount, &s.CleanRevertCount, &s.CleanMergeCount, &s.MultiplePRCount,
-			&s.ActionQueueCount, &s.WaivedCount, &s.R3NoPRCount, &s.R4NoFinalCount, &s.R6OwnerFailCount); err != nil {
+			&s.ActionQueueCount, &s.WaivedCount, &s.R3NoPRCount, &s.R4NoFinalCount, &s.R6OwnerFailCount,
+			&s.HistoryRewriteCount); err != nil {
 			return nil, fmt.Errorf("scan summary: %w", err)
 		}
 		if s.TotalCommits > 0 {
@@ -449,12 +459,13 @@ func (r *Reporter) FormatTable(w io.Writer, summary []SummaryRow, details []Deta
 
 	// Summary section
 	fmt.Fprintln(tw, "=== SUMMARY ===")
-	fmt.Fprintln(tw, "Org\tRepo\tTotal\tCompliant\tNon-Compliant\tCompliance %\tBots\tExempt\tWeak Exempt\tEmpty\tSelf-Approved\tStale Approvals\tPost-Merge Concerns\tClean Reverts\tClean Merges\tMultiple PRs")
+	fmt.Fprintln(tw, "Org\tRepo\tTotal\tCompliant\tNon-Compliant\tCompliance %\tBots\tExempt\tWeak Exempt\tEmpty\tSelf-Approved\tStale Approvals\tPost-Merge Concerns\tClean Reverts\tClean Merges\tMultiple PRs\tHistory Rewrites")
 	for _, s := range summary {
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%.1f%%\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%.1f%%\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
 			s.Org, s.Repo, s.TotalCommits, s.CompliantCount, s.NonCompliantCount,
 			s.CompliancePct, s.BotCount, s.ExemptCount, s.ForgeableExemptCount, s.EmptyCount, s.SelfApprovedCount,
-			s.StaleApprovalCount, s.PostMergeConcernCount, s.CleanRevertCount, s.CleanMergeCount, s.MultiplePRCount)
+			s.StaleApprovalCount, s.PostMergeConcernCount, s.CleanRevertCount, s.CleanMergeCount, s.MultiplePRCount,
+			s.HistoryRewriteCount)
 	}
 	fmt.Fprintln(tw)
 

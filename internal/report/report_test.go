@@ -62,6 +62,17 @@ CREATE TABLE IF NOT EXISTS commit_branches (
 	PRIMARY KEY (org, repo, sha, branch)
 );
 
+CREATE TABLE IF NOT EXISTS history_rewrites (
+	org            TEXT NOT NULL,
+	repo           TEXT NOT NULL,
+	branch         TEXT NOT NULL,
+	prior_sha      TEXT NOT NULL,
+	new_sha        TEXT NOT NULL,
+	compare_status TEXT,
+	detected_at    TIMESTAMP DEFAULT current_timestamp,
+	PRIMARY KEY (org, repo, branch, prior_sha, new_sha)
+);
+
 CREATE TABLE IF NOT EXISTS pull_requests (
 	org              TEXT NOT NULL,
 	repo             TEXT NOT NULL,
@@ -338,6 +349,24 @@ func TestGetSummary_ForgeableExemptCount(t *testing.T) {
 	require.Len(t, summary, 1)
 	assert.Equal(t, 2, summary[0].ExemptCount, "both are exempt")
 	assert.Equal(t, 1, summary[0].ForgeableExemptCount, "only the forged one is weak")
+}
+
+// A recorded force-push shows up as HistoryRewriteCount on the repo summary.
+func TestGetSummary_HistoryRewriteCount(t *testing.T) {
+	db := setupTestDB(t)
+	now := time.Now()
+	insertCommit(t, db, "org1", "repo1", "c1", "dev", now, 1, 0)
+	insertAuditResultFull(t, db, "org1", "repo1", "c1", auditResultOpts{
+		hasPR: true, hasApproval: true, isCompliant: true, prNumber: 1,
+		approvers: []string{"rev"}, reasons: []string{"compliant"}})
+	_, err := db.Exec(`INSERT INTO history_rewrites (org, repo, branch, prior_sha, new_sha, compare_status)
+		VALUES ('org1','repo1','main','old','new','diverged')`)
+	require.NoError(t, err)
+
+	summary, err := New(db).GetSummary(context.Background(), ReportOpts{})
+	require.NoError(t, err)
+	require.Len(t, summary, 1)
+	assert.Equal(t, 1, summary[0].HistoryRewriteCount, "the recorded rewrite is counted")
 }
 
 func TestGetSummaryRespectsSinceUntil(t *testing.T) {

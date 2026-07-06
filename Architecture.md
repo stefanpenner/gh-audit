@@ -99,6 +99,8 @@ gh-audit never writes, so it cannot perturb its own evidence.
 | `reviewer.id`, PR author id | `/pulls/{n}/reviews`, `/pulls/{n}` → `*.id` | **No** | Bound to the account that performed an authenticated action; `TrustedID` rejects 0/ghost | §4, §5 |
 | commit `author_id` | `GET /commits/{sha}` → `author.id` | **Yes (unsigned)** | Resolved from a client-set git-author email — a noreply address forges any id on an unsigned commit. Only a hint; §1 gates it behind `signing_policy` | §1 (forgeable path) |
 | commit `committer.id` + `verification.verified` | `GET /commits/{sha}` | **No** | A valid signature binds the committer to the signing account — the one non-forgeable identity a commit carries | §1 (sound path) |
+| commit `author.id` on a verified `web-flow` commit | `GET /commits/{sha}` | **No** | GitHub created & signed the commit from an authenticated action and set the author id from that session; only GitHub holds the web-flow key | §1 (sound path) |
+| branch head reachability (`sync_cursors.last_sha` vs current head) | GitHub compare `base…head` | **No** | Content-addressed ancestry — a forged parent changes the commit's SHA | history-rewrite detection |
 | `review.state`, `commit_id`, `submitted_at` | `/pulls/{n}/reviews` | No | GitHub-recorded; tied to a head SHA the client can't choose | §4 |
 | `dismissed_at`, `dismissed_state` | `/issues/{n}/events` | No | GitHub-recorded timeline event | §4 |
 | commit **parent SHAs** | commit object | No | Content-addressed — a forged parent changes the commit's own SHA | §4 graph carve-out |
@@ -190,6 +192,7 @@ implies truly authorized/safe — over a bounded state space:
 | §6 checks | `Checks.tla` | stale green run masking a red re-run |
 | §7 landing | `Verdict.tla` | sibling-branch review credited for a protected-branch landing |
 | §8 revert | `Revert.tla` | forged revert message (retired message-only AutoRevert) |
+| history rewrite | `History.tla` | a snapshot-only audit misses a force-push that laundered commits away |
 
 Each retired/naive rule is kept as a red config so TLC rediscovers its
 attack — the machine-checked record of why each shipped rule is shaped
@@ -201,11 +204,12 @@ path, surfaced as **Weak Exempt** in the report). Bait configs
 (`*_bait.cfg`) prove every green verdict is non-vacuous: a compliant
 state must be reachable. Run `./tla/run.sh`; CI runs it on every PR.
 
-The spec↔code link for §6 and §1 is machine-checked without a JVM:
-`internal/sync/checks_spec_test.go` and `exempt_spec_test.go` replay
-each spec's full bounded state space against the real
-`evaluateRequiredChecks` / `exemptStatus` (the latter across both
-signing policies).
+The spec↔code link for §6, §1, and history-rewrite detection is
+machine-checked without a JVM: `internal/sync/checks_spec_test.go`,
+`exempt_spec_test.go`, and `history_spec_test.go` replay each spec's full
+bounded state space against the real `evaluateRequiredChecks` /
+`exemptStatus` / `classifyHeadMove` (Exempt across both signing policies
+and the own-key + web-flow sound paths).
 
 The specs prove the rules we thought of. The `formal-gap-hunt` skill
 hunts for the rest — real GitHub behaviour or orderings the specs cannot
@@ -250,11 +254,23 @@ signature**, which binds the **committer** to the signing account
 (`commit.committer.id` when `IsVerified`). (GitHub does expose a committer
 account id — it just isn't trustworthy without the signature.)
 
-So §1 has two paths, selected by `audit_rules.signing_policy`
-(`exemptStatus` in `audit.go`):
+So §1 has a **sound** anchor and a **forgeable** fallback, selected by
+`audit_rules.signing_policy` (`exemptStatus` in `audit.go`). The sound
+anchor is "a signature we trust vouches for an exempt identity", which has
+two forms (`verifiedExemptSigner`):
 
-- **Verified signer (sound).** `IsVerified && committer.id ∈ exempt` → exempt.
-  A real signature proves the committer is the exempt account. Always allowed.
+- **Own-key signer.** `IsVerified && committer.id ∈ exempt` → a real
+  signature proves the committer is the exempt account.
+- **GitHub web-flow.** `IsVerified && committer login == "web-flow" &&
+  author.id ∈ exempt` → the commit was created and signed by GitHub from an
+  authenticated action (web/API merge, squash, edit), so GitHub set the
+  author id from that session. Only GitHub holds the web-flow key, so an
+  attacker cannot mint a verified web-flow commit authored by the bot. This
+  lets a bot that commits via the API be soundly exempt even under
+  `required`.
+
+Both are always allowed. The fallback:
+
 - **Author-id hint (forgeable).** `author_id ∈ exempt` on an unsigned/unverified
   commit → exempt **only under `signing_policy: optional`** (the default), and
   the verdict is tagged `trust:forgeable-exemption` (`ExemptionForgeable`) so a
@@ -678,6 +694,22 @@ disagree.
 
 `sync` and `re-audit` honour the same setting, so verdicts never disagree.
 
+**Known limitation — keyless (gitsign/Sigstore) signatures.** gh-audit's
+sound anchor is GitHub's `verification.verified`. GitHub does **not** mark
+gitsign/Sigstore-signed commits as Verified: the Sigstore CA is not in
+GitHub's trust root, and the short-lived Fulcio certificate looks expired
+under standard X.509. So a repository that signs with gitsign will have its
+commits treated as **unsigned** here — under `signing_policy: required`
+their exemptions fail closed (safe but a false negative), and they cannot
+take the sound signer path. Verifying a keyless signature needs
+Rekor-aware, out-of-band verification (`gitsign verify`), which gh-audit
+does not do. Teams using keyless signing should keep `signing_policy:
+optional` (the default) and lean on PR-review provenance, or supply an
+external attestation. Field practice is itself split — signing is widely
+adopted but signatures are often *not verified* at consumption — so a
+"signed" history is only as strong as the enforcement that produced it
+(and any ruleset can be bypassed by a configured allow-list).
+
 ### 8. Clean-revert waiver (standalone)
 
 If the verdict so far is **non-compliant**, one last check runs. It runs even on
@@ -726,6 +758,39 @@ No PR satisfied all checks:
       ▼
 Write to audit_results table → surface in report
 ```
+
+### History-rewrite (force-push) detection
+
+The rules above audit the commits gh-audit can *see*. A malicious insider
+with push access can `git push --force` to **rewrite** a protected
+branch's history — orphaning commits that were once there, laundering away
+unreviewed code or removing evidence — and leave a clean-looking tree that
+every per-commit rule passes. SLSA Source Track prohibits this: a branch
+must only ever advance to a **descendant** revision.
+
+A single snapshot cannot detect a rewrite; you need the auditor's own
+memory of a prior head plus content-addressed ancestry (a forged parent
+changes the commit's own SHA, so reachability is non-forgeable). gh-audit
+already retains the prior head in `sync_cursors.last_sha`. On each
+incremental sync it compares the retained prior head against the new head
+via GitHub's compare API (`base=prior … head=current`); the `status` is
+the reachability:
+
+| compare status | meaning | verdict |
+|---|---|---|
+| `identical` / `ahead` | prior is an ancestor of the new head | fast-forward — safe |
+| `behind` / `diverged` | prior is NOT an ancestor | **history rewritten** |
+
+A rewrite is logged (WARN) and recorded in the `history_rewrites` table
+(the orphaned commits may be gone by the next sync, so the evidence is
+captured when seen). The report surfaces a per-repo **History Rewrites**
+count — a non-zero value means previously-audited history was rewritten
+and the audit of that branch can no longer be trusted at face value.
+
+`classifyHeadMove` (`internal/sync/history.go`) is the pure decision;
+`tla/History.tla` proves it sound (a snapshot-only rule misses the
+laundering) and `internal/sync/history_spec_test.go` is the JVM-free
+bridge.
 
 ## Data flow
 
@@ -896,6 +961,7 @@ DuckDB, 10 tables:
 | `commits` | (org, repo, sha) | Git commits from GitHub. `files_changed` + `detail_fetched_at` record verified commit detail: NULL `detail_fetched_at` means "never fetched", letting verified-zero stats survive as facts. Stat-less re-ingestion (cursor-overlap re-lists) preserves verified detail via a staging-table pre-merge UPDATE. |
 | `co_authors` | (org, repo, sha, email) | Co-authors parsed from "Co-authored-by:" trailers |
 | `commit_branches` | (org, repo, sha, branch) | Which branches a commit appears on |
+| `history_rewrites` | (org, repo, branch, prior_sha, new_sha) | Detected force-push / non-fast-forward moves (prior head no longer an ancestor of the new head). Evidence captured at sync time — the orphaned commits may be gone by the next sync. |
 | `commit_prs` | (org, repo, sha, pr_number) | Commit → PR associations |
 | `pull_requests` | (org, repo, number) | GitHub pull requests |
 | `reviews` | (org, repo, pr_number, review_id) | PR reviews with per-reviewer state |

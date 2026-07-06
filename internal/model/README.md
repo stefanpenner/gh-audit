@@ -25,6 +25,16 @@ classDiagram
         UpdatedAt time.Time
     }
 
+    class HistoryRewrite {
+        Org string
+        Repo string
+        Branch string
+        PriorSHA string
+        NewSHA string
+        CompareStatus string
+        DetectedAt time.Time
+    }
+
     class CoAuthor {
         Login string
         Email string

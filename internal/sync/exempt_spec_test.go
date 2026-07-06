@@ -35,30 +35,38 @@ func TestExemptSpecBridge(t *testing.T) {
 
 	type state struct {
 		authorID, committerID int64
-		verified              bool
+		verified, webflow     bool
 	}
 	var states []state
 	for _, a := range ids {
 		for _, c := range ids {
 			for _, v := range []bool{true, false} {
-				states = append(states, state{a, c, v})
+				for _, wf := range []bool{true, false} {
+					states = append(states, state{a, c, v, wf})
+				}
 			}
 		}
 	}
-	require.Len(t, states, 3*3*2)
+	require.Len(t, states, 3*3*2*2)
 
 	// The spec predicates (Exempt.tla), transcribed.
 	signerExempt := func(s state) bool { return s.verified && s.committerID == exemptID }
+	webFlowExempt := func(s state) bool { return s.verified && s.webflow && s.authorID == exemptID }
+	soundExempt := func(s state) bool { return signerExempt(s) || webFlowExempt(s) }
 	authorExempt := func(s state) bool { return s.authorID == exemptID }
 
 	commitOf := func(s state) model.Commit {
-		return model.Commit{AuthorID: s.authorID, CommitterID: s.committerID, IsVerified: s.verified}
+		login := ""
+		if s.webflow {
+			login = "web-flow"
+		}
+		return model.Commit{AuthorID: s.authorID, CommitterID: s.committerID, IsVerified: s.verified, CommitterLogin: login}
 	}
 
 	t.Run("required policy == spec signer variant (green)", func(t *testing.T) {
 		for _, s := range states {
 			got, forgeable := exemptStatus(commitOf(s), exempt, true)
-			assert.Equal(t, signerExempt(s), got, "exempt on %+v", s)
+			assert.Equal(t, soundExempt(s), got, "exempt on %+v", s)
 			assert.False(t, forgeable, "required policy never yields a forgeable waiver: %+v", s)
 		}
 	})
@@ -66,10 +74,10 @@ func TestExemptSpecBridge(t *testing.T) {
 	t.Run("optional policy == spec optional variant (amber)", func(t *testing.T) {
 		for _, s := range states {
 			got, forgeable := exemptStatus(commitOf(s), exempt, false)
-			want := signerExempt(s) || authorExempt(s)
+			want := soundExempt(s) || authorExempt(s)
 			assert.Equal(t, want, got, "exempt on %+v", s)
-			// Forgeable exactly when waived via the author hint, not the signer.
-			assert.Equal(t, got && !signerExempt(s), forgeable, "forgeable flag on %+v", s)
+			// Forgeable exactly when waived via the author hint, not a sound signer.
+			assert.Equal(t, got && !soundExempt(s), forgeable, "forgeable flag on %+v", s)
 		}
 	})
 
@@ -77,8 +85,8 @@ func TestExemptSpecBridge(t *testing.T) {
 		for _, s := range states {
 			got, _ := exemptStatus(commitOf(s), exempt, true)
 			if got {
-				assert.True(t, s.verified && s.committerID == exemptID,
-					"required waived a non-signer state %+v — attacker-forgeable", s)
+				assert.True(t, soundExempt(s),
+					"required waived a state with no sound signer %+v — attacker-forgeable", s)
 			}
 		}
 	})

@@ -39,7 +39,7 @@ type GitHubSource interface {
 	// graph difference). Returns an error wrapping
 	// github.ErrCompareUnavailable when the range can't be served (base
 	// force-pushed away, or more commits than the compare API's ceiling).
-	CompareCommits(ctx context.Context, org, repo, base, head, branch string) ([]model.Commit, error)
+	CompareCommits(ctx context.Context, org, repo, base, head, branch string) ([]model.Commit, string, error)
 }
 
 // Enricher abstracts commit enrichment (fetching PRs, reviews, check runs).
@@ -66,6 +66,9 @@ type Store interface {
 	// the per-row variant costs a full staging-table dance per call.
 	UpsertCommitPRLinks(ctx context.Context, org, repo string, links []db.CommitPRLink) error
 	UpsertAuditResults(ctx context.Context, results []model.AuditResult) error
+	// RecordHistoryRewrite persists a detected force-push / non-fast-forward
+	// move on a protected branch (see classifyHeadMove, tla/History.tla).
+	RecordHistoryRewrite(ctx context.Context, r model.HistoryRewrite) error
 	UpdateCommitStats(ctx context.Context, org, repo, sha string, additions, deletions int) error
 	// GetUnauditedCommits returns commits in org/repo with no audit_results row.
 	// Zero-valued since/until disables that side of the bound; both zero =
@@ -1234,8 +1237,13 @@ func (p *Pipeline) fetchBranchCommits(ctx context.Context, repo model.RepoInfo, 
 		case head == cursor.LastSHA:
 			return nil, head, "graph-unchanged", nil
 		default:
-			commits, cerr := p.source.CompareCommits(ctx, repo.Org, repo.Name, cursor.LastSHA, head, branch)
+			commits, status, cerr := p.source.CompareCommits(ctx, repo.Org, repo.Name, cursor.LastSHA, head, branch)
 			if cerr == nil {
+				// The prior head was retained (cursor.LastSHA); if it is no
+				// longer an ancestor of the new head the branch was
+				// force-pushed (SLSA prohibits this). Record it — the
+				// orphaned commits may be gone by the next sync.
+				p.recordIfRewritten(ctx, repo, branch, cursor.LastSHA, head, status)
 				return commits, head, "graph", nil
 			}
 			if !errors.Is(cerr, github.ErrCompareUnavailable) {
