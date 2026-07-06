@@ -26,6 +26,30 @@ jobs:
       - name: Build
         run: bazel build //...
 
+  tla:
+    name: Model-check TLA+ specs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Cache tla2tools.jar
+        uses: actions/cache@v4
+        with:
+          path: tla/.tools
+          key: tla2tools-v1
+
+      # Asserts green Sound HOLDS, red/amber Sound VIOLATED,
+      # bait Bait VIOLATED — see tla/run.sh header.
+      - name: Model check
+        run: ./tla/run.sh
+
   fixtures:
     name: Validate against stefanpenner/gh-audit-test-fixtures
     runs-on: ubuntu-latest

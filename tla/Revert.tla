@@ -88,6 +88,10 @@ TrulySafe == merged /\ reallyReverts
 
 Sound == Compliant => TrulySafe
 
+\* Bait: claims no compliant state is reachable. TLC must VIOLATE this
+\* and print a witness trace — proof Sound is not holding vacuously.
+Bait == ~Compliant
+
 TypeOK ==
     /\ pushed \in BOOLEAN /\ merged \in BOOLEAN
     /\ claimsRevert \in BOOLEAN /\ diffVerified \in BOOLEAN

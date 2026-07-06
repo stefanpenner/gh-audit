@@ -207,6 +207,10 @@ TrulyAuthorized ==
 \* says compliant, the merge was truly authorized.
 Sound == Compliant => TrulyAuthorized
 
+\* Bait: claims no compliant state is reachable. TLC must VIOLATE this
+\* and print a witness trace — proof Sound is not holding vacuously.
+Bait == ~Compliant
+
 TypeOK ==
     /\ clock \in 0..MaxTime
     /\ nextId \in 2..(MaxCommits + 1)

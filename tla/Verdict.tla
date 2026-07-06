@@ -95,6 +95,10 @@ TrulyAuthorized == merged /\ (\E p \in PRs : approved[p] /\ realBase[p] = Audite
 
 Sound == Compliant => TrulyAuthorized
 
+\* Bait: claims no compliant state is reachable. TLC must VIOLATE this
+\* and print a witness trace — proof Sound is not holding vacuously.
+Bait == ~Compliant
+
 TypeOK ==
     /\ setup \in BOOLEAN /\ merged \in BOOLEAN
     /\ approved \in [PRs -> BOOLEAN]

@@ -64,6 +64,10 @@ Compliant == merged /\ Waive
 TrulySafe == merged /\ reallyEmpty
 Sound == Compliant => TrulySafe
 
+\* Bait: claims no compliant state is reachable. TLC must VIOLATE this
+\* and print a witness trace — proof Sound is not holding vacuously.
+Bait == ~Compliant
+
 TypeOK ==
     /\ pushed \in BOOLEAN /\ merged \in BOOLEAN /\ reallyEmpty \in BOOLEAN
     /\ addLines \in 0..MaxCount /\ delLines \in 0..MaxCount

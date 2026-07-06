@@ -69,6 +69,10 @@ TrulySafe == merged /\ Idx # {} /\ LatestConcl = "success"
 
 Sound == Compliant => TrulySafe
 
+\* Bait: claims no compliant state is reachable. TLC must VIOLATE this
+\* and print a witness trace — proof Sound is not holding vacuously.
+Bait == ~Compliant
+
 TypeOK ==
     /\ merged \in BOOLEAN
     /\ Len(runs) \in 0..MaxRuns
