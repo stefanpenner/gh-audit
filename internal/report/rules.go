@@ -21,7 +21,18 @@ const (
 	OutcomeNA      RuleOutcome = "n/a"
 	OutcomeMissing RuleOutcome = "missing"
 	OutcomeWaived  RuleOutcome = "waived"
+	// OutcomeWaivedWeak is a §1 exemption that fired on the forgeable
+	// author-id hint (signing_policy: optional) rather than a verified
+	// signer — it would NOT survive signing_policy: required. Compliant,
+	// but the waiver rests on a forgeable node; surfaced so a team can
+	// decide to lock signing down. Carried by the trust:forgeable-exemption
+	// annotation (see sync.exemptStatus).
+	OutcomeWaivedWeak RuleOutcome = "waived-weak"
 )
+
+// forgeableExemptTag marks a §1 waiver that rests on the forgeable
+// author-id hint. Kept in sync with internal/sync/audit.go.
+const forgeableExemptTag = "trust:forgeable-exemption"
 
 // A Severity ranks an Action Queue row so auditors can sort by urgency.
 type Severity string
@@ -75,7 +86,14 @@ func DeriveRuleOutcomes(d DetailRow) RuleOutcomes {
 	// commits) and the content was audited normally. The waiver only
 	// happened when the stored verdict IS the exemption.
 	if d.IsExemptAuthor && d.IsCompliant && d.Reasons == "exempt: configured author" {
-		o.R1Exempt = OutcomeWaived
+		// A waiver that rests on the forgeable author-id hint (optional
+		// signing policy) is surfaced as WEAK — it would fail under
+		// signing_policy: required.
+		if strings.Contains(d.Annotations, forgeableExemptTag) {
+			o.R1Exempt = OutcomeWaivedWeak
+		} else {
+			o.R1Exempt = OutcomeWaived
+		}
 	} else {
 		o.R1Exempt = OutcomeSkip
 	}

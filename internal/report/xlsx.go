@@ -148,12 +148,13 @@ func newBuilder(f *excelize.File) (*xlsxBuilder, error) {
 		return s
 	}
 	outcomeStyles := map[RuleOutcome]int{
-		OutcomePass:    mk("C6EFCE", "006100"),
-		OutcomeFail:    mk("FFC7CE", "9C0006"),
-		OutcomeMissing: mk("FFE699", "7F5A00"),
-		OutcomeWaived:  mk("D9E7F9", "1F4E79"),
-		OutcomeSkip:    mk("E7E6E6", "595959"),
-		OutcomeNA:      mk("F2F2F2", "7F7F7F"),
+		OutcomePass:       mk("C6EFCE", "006100"),
+		OutcomeFail:       mk("FFC7CE", "9C0006"),
+		OutcomeMissing:    mk("FFE699", "7F5A00"),
+		OutcomeWaived:     mk("D9E7F9", "1F4E79"),
+		OutcomeWaivedWeak: mk("FFEB9C", "9C5700"), // amber: waived but forgeable
+		OutcomeSkip:       mk("E7E6E6", "595959"),
+		OutcomeNA:         mk("F2F2F2", "7F7F7F"),
 	}
 
 	return &xlsxBuilder{
@@ -202,7 +203,7 @@ func (b *xlsxBuilder) writeREADME(opts ReportOpts, summary []SummaryRow, details
 		{"• Summary — per-repo totals and compliance %. Filterable overview.", body},
 		{"• By Rule — which rules trigger most across the scanned set.", body},
 		{"• By Author — per-author rollup to spot patterns.", body},
-		{"• Decision Matrix — every commit × every rule (pass/fail/skip/n-a/missing/waived). Autofilter on any rule column to drill in.", body},
+		{"• Decision Matrix — every commit × every rule (pass/fail/skip/n-a/missing/waived/waived-weak). Autofilter on any rule column to drill in.", body},
 		{"• Waivers Log — compliant commits waived by R1/R2/R8 or tagged clean-merge/bot. Evidence of what the tool did NOT flag and why.", body},
 		{"• Multiple PRs — commits associated with more than one PR.", body},
 		{"", 0},
@@ -225,6 +226,7 @@ func (b *xlsxBuilder) writeREADME(opts ReportOpts, summary []SummaryRow, details
 		{"n/a — rule could not evaluate (e.g. R4/R5 when there's no PR)", body},
 		{"missing — required status check was never reported", body},
 		{"waived — rule waived the verdict (R1 exempt author, R2 empty, R8 clean revert)", body},
+		{"waived-weak — R1 exemption fired on the forgeable author-id hint (signing_policy: optional). Compliant, but would FAIL under signing_policy: required — the waiver rests on a forgeable node. See the Weak Exempt column.", body},
 		{"", 0},
 		{"Full rule definitions: Architecture.md § What gh-audit detects.", body},
 	}
@@ -396,7 +398,7 @@ func (b *xlsxBuilder) writeSummary(summary []SummaryRow, opts ReportOpts) error 
 		"Action Queue", "Waived",
 		"R3 NoPR", "R4 NoFinal", "R6 OwnerFail",
 		"Self-Approved", "Stale", "Post-Merge", "Clean Reverts", "Clean Merges",
-		"Bots", "Exempt", "Empty", "Multiple PRs",
+		"Bots", "Exempt", "Weak Exempt", "Empty", "Multiple PRs",
 	}
 
 	subtitleStyle, _ := f.NewStyle(&excelize.Style{
@@ -435,7 +437,7 @@ func (b *xlsxBuilder) writeSummary(summary []SummaryRow, opts ReportOpts) error 
 			s.R3NoPRCount, s.R4NoFinalCount, s.R6OwnerFailCount,
 			s.SelfApprovedCount, s.StaleApprovalCount, s.PostMergeConcernCount,
 			s.CleanRevertCount, s.CleanMergeCount,
-			s.BotCount, s.ExemptCount, s.EmptyCount, s.MultiplePRCount,
+			s.BotCount, s.ExemptCount, s.ForgeableExemptCount, s.EmptyCount, s.MultiplePRCount,
 		}
 		for c, v := range vals {
 			f.SetCellValue(sheet, cellName(c+1, row), v)

@@ -184,7 +184,7 @@ implies truly authorized/safe — over a bounded state space:
 
 | Rule | Spec | Attack the red config rediscovers |
 |---|---|---|
-| §1 exempt | `Exempt.tla` | forged git-author email (retired `verified_emails` path) |
+| §1 exempt | `Exempt.tla` | forged author id on an unsigned commit (retired author-id-only rule); `Exempt_amber.cfg` = the shipped `signing_policy: optional` tradeoff |
 | §2 empty | `EmptyCommit.tla` | rename-only commit laundered by a lines-only check |
 | §4/§5 approval | `Approval.tla` | backdated `GIT_COMMITTER_DATE` (retired timestamp carve-out) |
 | §6 checks | `Checks.tla` | stale green run masking a red re-run |
@@ -193,16 +193,19 @@ implies truly authorized/safe — over a bounded state space:
 
 Each retired/naive rule is kept as a red config so TLC rediscovers its
 attack — the machine-checked record of why each shipped rule is shaped
-the way it is. `Verdict_amber.cfg` additionally runs the *shipped*
-fail-open-on-unknown-base rule and surfaces its one residual assumption
-(an unknown base must never be attacker-suppressible) as a documented
-tradeoff. Bait configs (`*_bait.cfg`) prove every green verdict is
-non-vacuous: a compliant state must be reachable. Run `./tla/run.sh`;
-CI runs it on every PR.
+the way it is. Two `*_amber.cfg` configs run a *shipped* rule whose `Sound` TLC
+violates on purpose, surfacing its residual assumption as a documented
+tradeoff: `Verdict_amber` (fail-open on an unknown base) and
+`Exempt_amber` (`signing_policy: optional` — the forgeable author-id
+path, surfaced as **Weak Exempt** in the report). Bait configs
+(`*_bait.cfg`) prove every green verdict is non-vacuous: a compliant
+state must be reachable. Run `./tla/run.sh`; CI runs it on every PR.
 
-The spec↔code link for §6 is machine-checked without a JVM:
-`internal/sync/checks_spec_test.go` replays the spec's full bounded
-state space against the real `evaluateRequiredChecks`.
+The spec↔code link for §6 and §1 is machine-checked without a JVM:
+`internal/sync/checks_spec_test.go` and `exempt_spec_test.go` replay
+each spec's full bounded state space against the real
+`evaluateRequiredChecks` / `exemptStatus` (the latter across both
+signing policies).
 
 The specs prove the rules we thought of. The `formal-gap-hunt` skill
 hunts for the rest — real GitHub behaviour or orderings the specs cannot
