@@ -39,6 +39,7 @@ classDiagram
         AuthorID int64
         AuthorEmail string
         CommitterLogin string
+        CommitterID int64
         CoAuthors []CoAuthor
         CommittedAt time.Time
         Message string
@@ -128,6 +129,7 @@ classDiagram
         IsEmptyCommit bool
         IsBot bool
         IsExemptAuthor bool
+        ExemptionForgeable bool
         HasPR bool
         PRNumber int
         PRCount int

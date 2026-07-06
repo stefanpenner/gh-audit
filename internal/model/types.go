@@ -104,13 +104,20 @@ type Commit struct {
 	AuthorID       int64
 	AuthorEmail    string
 	CommitterLogin string
-	CoAuthors      []CoAuthor
-	CommittedAt    time.Time
-	Message        string
-	IsVerified     bool
-	ParentCount    int
-	Additions      int
-	Deletions      int
+	// CommitterID is the GitHub account id GitHub resolved from the
+	// committer email. Like AuthorID it is derived from pushed bytes and
+	// is only trustworthy when IsVerified is true: a valid signature
+	// binds the committer to the signing key's account. §1 anchors the
+	// exempt waiver on (IsVerified && CommitterID) — the sole
+	// non-forgeable identity a commit can carry (see exemptStatus).
+	CommitterID int64
+	CoAuthors   []CoAuthor
+	CommittedAt time.Time
+	Message     string
+	IsVerified  bool
+	ParentCount int
+	Additions   int
+	Deletions   int
 	// FilesChanged is the number of files the commit touches, from the
 	// commit-detail endpoint. Load-bearing for the §2 empty-commit waiver:
 	// pure renames and mode-only changes report 0/0 line stats but a
@@ -246,17 +253,24 @@ type CheckRun struct {
 //	Review ──┘
 //	CheckRun ──┘
 type AuditResult struct {
-	Org              string
-	Repo             string
-	SHA              string
-	IsEmptyCommit    bool
-	IsBot            bool // author name ends with [bot] — informational only
-	IsExemptAuthor   bool // author is on the configured exemption list
-	HasPR            bool
-	PRNumber         int
-	PRCount          int
-	HasFinalApproval bool
-	HasStaleApproval bool // approval exists but on a pre-force-push commit
+	Org            string
+	Repo           string
+	SHA            string
+	IsEmptyCommit  bool
+	IsBot          bool // author name ends with [bot] — informational only
+	IsExemptAuthor bool // author is on the configured exemption list
+	// ExemptionForgeable is true when the §1 waiver fired only via the
+	// forgeable author-id hint (unsigned or unverified commit) rather
+	// than a verified signer. Informational — the commit is compliant
+	// under the default optional signing policy, but this flag marks
+	// that the waiver would NOT survive signing:required. See
+	// sync.exemptStatus.
+	ExemptionForgeable bool
+	HasPR              bool
+	PRNumber           int
+	PRCount            int
+	HasFinalApproval   bool
+	HasStaleApproval   bool // approval exists but on a pre-force-push commit
 	// HasPostMergeConcern is true when a review event challenges the
 	// merge-time verdict after the fact: a CHANGES_REQUESTED or DISMISSED
 	// review submitted after the merge, a resolved post-merge dismissal of

@@ -12,7 +12,7 @@ import (
 )
 
 var commitColumns = []string{
-	"org", "repo", "sha", "author_login", "author_id", "author_email", "committer_login",
+	"org", "repo", "sha", "author_login", "author_id", "author_email", "committer_login", "committer_id",
 	"committed_at", "message", "parent_count", "parent_shas", "additions", "deletions",
 	"files_changed", "detail_fetched_at", "is_verified", "href",
 }
@@ -28,7 +28,7 @@ func commitRow(c model.Commit) []driver.Value {
 		detailFetchedAt = time.Now().UTC()
 	}
 	return []driver.Value{
-		c.Org, c.Repo, c.SHA, c.AuthorLogin, c.AuthorID, c.AuthorEmail, c.CommitterLogin,
+		c.Org, c.Repo, c.SHA, c.AuthorLogin, c.AuthorID, c.AuthorEmail, c.CommitterLogin, c.CommitterID,
 		c.CommittedAt, c.Message, c.ParentCount, strings.Join(c.ParentSHAs, ","),
 		c.Additions, c.Deletions,
 		filesChanged, detailFetchedAt, c.IsVerified, c.Href,
@@ -37,7 +37,7 @@ func commitRow(c model.Commit) []driver.Value {
 
 // commitSelectColumns is the canonical SELECT list matching scanCommits'
 // scan order. detail_fetched_at surfaces as the StatsVerified boolean.
-const commitSelectColumns = `org, repo, sha, author_login, author_id, author_email, committer_login,
+const commitSelectColumns = `org, repo, sha, author_login, author_id, author_email, committer_login, committer_id,
 	committed_at, message, parent_count, COALESCE(parent_shas, ''), additions, deletions,
 	COALESCE(files_changed, 0), detail_fetched_at IS NOT NULL, is_verified, href`
 
@@ -112,7 +112,7 @@ func (d *DB) UpsertCommitBranches(ctx context.Context, org, repo string, shas []
 // the full historical backlog, matching the original behaviour).
 func (d *DB) GetUnauditedCommits(ctx context.Context, org, repo string, since, until time.Time) ([]model.Commit, error) {
 	q := `
-		SELECT c.org, c.repo, c.sha, c.author_login, c.author_id, c.author_email, c.committer_login,
+		SELECT c.org, c.repo, c.sha, c.author_login, c.author_id, c.author_email, c.committer_login, c.committer_id,
 		       c.committed_at, c.message, c.parent_count, COALESCE(c.parent_shas, ''), c.additions, c.deletions,
 		       COALESCE(c.files_changed, 0), c.detail_fetched_at IS NOT NULL, c.is_verified, c.href
 		FROM commits c
@@ -344,10 +344,10 @@ func scanCommits(rows interface {
 	var result []model.Commit
 	for rows.Next() {
 		var c model.Commit
-		var authorID sql.NullInt64
+		var authorID, committerID sql.NullInt64
 		var authorLogin, authorEmail, committerLogin, message, parentSHAs, href sql.NullString
 		var parentCount, additions, deletions, filesChanged sql.NullInt32
-		if err := rows.Scan(&c.Org, &c.Repo, &c.SHA, &authorLogin, &authorID, &authorEmail, &committerLogin,
+		if err := rows.Scan(&c.Org, &c.Repo, &c.SHA, &authorLogin, &authorID, &authorEmail, &committerLogin, &committerID,
 			&c.CommittedAt, &message, &parentCount, &parentSHAs, &additions, &deletions,
 			&filesChanged, &c.StatsVerified, &c.IsVerified, &href); err != nil {
 			return nil, fmt.Errorf("scan commit: %w", err)
@@ -366,6 +366,9 @@ func scanCommits(rows interface {
 		c.FilesChanged = int(filesChanged.Int32)
 		if authorID.Valid {
 			c.AuthorID = authorID.Int64
+		}
+		if committerID.Valid {
+			c.CommitterID = committerID.Int64
 		}
 		result = append(result, c)
 	}

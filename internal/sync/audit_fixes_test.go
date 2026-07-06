@@ -338,20 +338,20 @@ func TestDismissedReview_SupersededOrUnmergedStaysQuiet(t *testing.T) {
 	})
 }
 
-// A vetted service account whose GitHub user was DELETED authors commits
-// with AuthorID == ghost. The ghost id carries no identity, so the §1
-// match must fall through to the operator-curated verified_emails list —
-// the account's exemption survives account deletion.
+// idExempt is the id-matching core of the §1 exemption. Only a trusted
+// numeric id matches: an unresolved id (0) and the shared ghost id
+// (every deleted account) identify no one, so they never match. There
+// is no forgeable email fallback.
 func TestExemptCommit_IDOnly(t *testing.T) {
 	exempt := []model.ExemptAuthor{{Login: "svc", ID: 4242}}
 
-	assert.True(t, isExemptCommit(4242, exempt),
+	assert.True(t, idExempt(4242, exempt),
 		"a trusted id match is the only way to be exempt")
-	assert.False(t, isExemptCommit(0, exempt),
+	assert.False(t, idExempt(0, exempt),
 		"an unresolved id (0) can never be exempt — no forgeable email fallback")
-	assert.False(t, isExemptCommit(model.GhostUserID, exempt),
+	assert.False(t, idExempt(model.GhostUserID, exempt),
 		"the shared ghost id identifies no one and is never exempt")
-	assert.False(t, isExemptCommit(9999, exempt),
+	assert.False(t, idExempt(9999, exempt),
 		"a non-matching trusted id is not exempt")
 }
 

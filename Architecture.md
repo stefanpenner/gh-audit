@@ -51,10 +51,13 @@ These two are different people far more often than they look:
 - **Direct push** — author and committer are usually the same local user.
 
 So "who wrote this" (author) and "who landed it" (committer/merger) are separate
-questions. gh-audit answers the first with `author.id`, never with the
-committer. GitHub exposes **no committer id** on the commit object — committer is
-a login string only — which is exactly why committer login and `Co-authored-by`
-trailers are excluded from compliance entirely (see §5).
+questions. For review/approval identity (§4/§5) gh-audit answers with `author.id`
+and reviewer ids from authenticated actions. For the §1 exempt waiver the
+trustworthy anchor is instead the **verified committer** (`committer.id` gated on
+`IsVerified`): a valid signature is the only thing binding a commit's identity to
+an account, whereas `author.id` is resolved from a client-set email and is
+forgeable (see §1). Committer *login* and `Co-authored-by` trailers remain
+excluded from compliance entirely (mutable, unauthenticated — see §5).
 
 ## Trust model
 
@@ -93,7 +96,9 @@ gh-audit never writes, so it cannot perturb its own evidence.
 
 | Signal | Source (endpoint) | Forgeable alone? | What makes it trustworthy | Feeds |
 |---|---|:---:|---|---|
-| `author_id`, `reviewer.id`, PR/branch author ids | `GET /commits/{sha}`, `/pulls/{n}/reviews`, `/pulls/{n}/commits` → `*.id` | **No** | GitHub binds id to a verified account; `TrustedID` rejects 0/ghost | §1, §4, §5 |
+| `reviewer.id`, PR author id | `/pulls/{n}/reviews`, `/pulls/{n}` → `*.id` | **No** | Bound to the account that performed an authenticated action; `TrustedID` rejects 0/ghost | §4, §5 |
+| commit `author_id` | `GET /commits/{sha}` → `author.id` | **Yes (unsigned)** | Resolved from a client-set git-author email — a noreply address forges any id on an unsigned commit. Only a hint; §1 gates it behind `signing_policy` | §1 (forgeable path) |
+| commit `committer.id` + `verification.verified` | `GET /commits/{sha}` | **No** | A valid signature binds the committer to the signing account — the one non-forgeable identity a commit carries | §1 (sound path) |
 | `review.state`, `commit_id`, `submitted_at` | `/pulls/{n}/reviews` | No | GitHub-recorded; tied to a head SHA the client can't choose | §4 |
 | `dismissed_at`, `dismissed_state` | `/issues/{n}/events` | No | GitHub-recorded timeline event | §4 |
 | commit **parent SHAs** | commit object | No | Content-addressed — a forged parent changes the commit's own SHA | §4 graph carve-out |
@@ -231,13 +236,34 @@ For every commit on a protected branch, gh-audit runs a decision tree in order.
 If the commit author is on the exempt list, the commit is **compliant** at
 once. No further rules run.
 
-The match is **id-only** (`commit.author_id` vs `ExemptAuthor.id`). GitHub sets
-this id from a verified account. It is immutable, never reused, and not
-forgeable by a client. There is no email or login path: a git-author email is
-client-set and GitHub leaves `author_id == 0` when it can't bind it, so matching
-it would let any pusher forge an exemption. An unresolved id (0) and the shared
-ghost id never match. A trusted id is exempt even on a direct push — no PR
-needed, because the identity itself is proven.
+The match is **id-only** (against `ExemptAuthor.id`), but *which* id it anchors
+on is the whole game, because **`author_id` is a hint the committer controls**.
+GitHub resolves `commit.author_id` from the git-author email — and a noreply
+email `<id>+name@users.noreply.github.com` resolves to `<id>` even on an
+**unsigned** commit (`verification.verified == false`). So `git commit
+--author=…` lets any pusher stamp any account's id onto the author field. The
+only identity a commit can carry that a client *cannot* forge is a **verified
+signature**, which binds the **committer** to the signing account
+(`commit.committer.id` when `IsVerified`). (GitHub does expose a committer
+account id — it just isn't trustworthy without the signature.)
+
+So §1 has two paths, selected by `audit_rules.signing_policy`
+(`exemptStatus` in `audit.go`):
+
+- **Verified signer (sound).** `IsVerified && committer.id ∈ exempt` → exempt.
+  A real signature proves the committer is the exempt account. Always allowed.
+- **Author-id hint (forgeable).** `author_id ∈ exempt` on an unsigned/unverified
+  commit → exempt **only under `signing_policy: optional`** (the default), and
+  the verdict is tagged `trust:forgeable-exemption` (`ExemptionForgeable`) so a
+  team can see which waivers rest on a forgeable node. Under `signing_policy:
+  required` this path is closed — an unsigned commit claiming the bot is **not**
+  exempt (fails closed). Teams that enforce commit signing opt into `required`
+  for a provably-sound §1.
+
+Signing is progressive enhancement: `optional` never breaks a team whose bot
+doesn't sign (the waiver still fires, just flagged); `required` is the lock-down.
+An unresolved id (0) and the shared ghost id never match on either path. A
+verified-signer match is exempt even on a direct push — the identity is proven.
 
 **Squash backstop.** A bot can squash human code into one commit. So the
 exemption holds only when every PR-branch commit is also exempt by id
@@ -269,9 +295,10 @@ GET /repos/{o}/{r}/commits/{sha}
       │
       ▼
 EvaluateCommit (audit.go)
-      isExemptCommit(id):
-        author_id is trusted AND matches an exempt.id? → exempt (even on a direct push)
-        else (incl. id==0 or ghost)                    → not exempt, continue to rule 2
+      exemptStatus(commit, signing_policy):
+        IsVerified AND committer.id matches an exempt.id?  → exempt, sound
+        author_id matches AND signing_policy==optional?    → exempt, forgeable-flagged
+        else (incl. id==0/ghost, or required+unsigned)     → not exempt, continue to rule 2
       │
       ▼ (when exempt)
       hasNonExemptPRContributors():
@@ -635,6 +662,18 @@ merged. Some flows (e.g. reviewed `feat → dev` with automated `dev → main`
 promotion) legitimately want this — the code *was* reviewed, just not at the
 `main` landing. `sync` and `re-audit` honour the same setting, so the two never
 disagree.
+
+### Signing policy (§1)
+
+`audit_rules.signing_policy` selects how §1 anchors an exemption (see §1 above):
+
+- `optional` (default) — progressive enhancement. A verified signer on the
+  exempt list is the sound path; an unsigned commit that merely *claims* an
+  exempt author is still waived but tagged `trust:forgeable-exemption`.
+- `required` — fail the forgeable author path closed: only a verified signer is
+  exempt. For teams that enforce commit signing and want a provably-sound §1.
+
+`sync` and `re-audit` honour the same setting, so verdicts never disagree.
 
 ### 8. Clean-revert waiver (standalone)
 

@@ -218,6 +218,10 @@ func (c *Client) convertRepoCommit(org, repo, branch string, rc *gogithub.Reposi
 	c.resolveAuthor(&commit, rc)
 	if rc.GetCommitter() != nil {
 		commit.CommitterLogin = rc.GetCommitter().GetLogin()
+		// CommitterID is trustworthy only under IsVerified — §1 gates on
+		// both (see sync.exemptStatus). Always ingest it so a verified
+		// commit can anchor the exempt waiver on the signer.
+		commit.CommitterID = rc.GetCommitter().GetID()
 	}
 	if rc.GetCommit() != nil {
 		commit.Message = rc.GetCommit().GetMessage()

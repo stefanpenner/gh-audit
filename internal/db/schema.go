@@ -35,6 +35,7 @@ const (
 		author_id        BIGINT,
 		author_email     TEXT,
 		committer_login  TEXT,
+		committer_id     BIGINT,
 		committed_at     TIMESTAMP,
 		message          TEXT,
 		parent_count     INTEGER,
@@ -207,6 +208,7 @@ var addColumnMigrations = []string{
 	`ALTER TABLE reviews ADD COLUMN dismissed_at TIMESTAMP`,
 	`ALTER TABLE reviews ADD COLUMN dismissed_state TEXT`,
 	`ALTER TABLE commits ADD COLUMN parent_shas TEXT`,
+	`ALTER TABLE commits ADD COLUMN committer_id BIGINT`,
 }
 
 // allTables is the ordered list of DDL statements to run during migration.

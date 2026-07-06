@@ -104,13 +104,50 @@ type StatsFetcher func(trigger StatsTrigger, org, repo, sha string) (additions, 
 // longer vouch for a protected-branch landing. When empty (nil) the verdict is
 // CONTENT-SCOPED (legacy behaviour): any associated merged PR's approval counts,
 // regardless of where it merged. See Architecture.md §7 "Scope of the verdict".
-func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor, requiredChecks []RequiredCheck, fetchStats StatsFetcher, auditedBranches ...string) model.AuditResult {
+// evalConfig holds the optional knobs threaded into EvaluateCommit via
+// functional options — the audit-rule settings that not every caller
+// needs to set. Zero value is the shipped default: content-scope
+// branches unset (landing scope decided by the caller) and signing
+// OPTIONAL (§1 forgeable-author fallback allowed but flagged).
+type evalConfig struct {
+	auditedBranches []string
+	requireSigning  bool
+}
+
+// An EvalOption tunes an EvaluateCommit call. Introduced when the
+// trailing `auditedBranches ...string` extension point had to also carry
+// the §1 signing policy; new audit knobs become options with no
+// call-site churn.
+type EvalOption func(*evalConfig)
+
+// WithAuditedBranches scopes §7 to the given audited branches (landing
+// scope). Empty/unset leaves §7 content-scoped.
+func WithAuditedBranches(branches ...string) EvalOption {
+	return func(c *evalConfig) { c.auditedBranches = branches }
+}
+
+// RequireSigning selects the §1 signing policy. false (default) is
+// progressive-enhancement: a verified signer on the exempt list is the
+// sound path, and an unsigned commit that merely claims exempt
+// authorship is still waived but flagged forgeable. true fails that
+// forgeable path closed — only a verified signer can be exempt.
+func RequireSigning(v bool) EvalOption {
+	return func(c *evalConfig) { c.requireSigning = v }
+}
+
+func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor, requiredChecks []RequiredCheck, fetchStats StatsFetcher, opts ...EvalOption) model.AuditResult {
+	var ec evalConfig
+	for _, opt := range opts {
+		opt(&ec)
+	}
+	auditedBranches := ec.auditedBranches
+
 	// Informational fields shared by every return path (revert/merge
 	// signals, annotations, IsBot). Populated once, before any rule runs.
 	result := initAuditResult(commit, enrichment)
 
 	// §1 — Exempt author.
-	if applyExemptAuthorRule(&result, commit, enrichment, exemptAuthors, fetchStats) {
+	if applyExemptAuthorRule(&result, commit, enrichment, exemptAuthors, fetchStats, ec.requireSigning) {
 		return result
 	}
 
@@ -146,7 +183,7 @@ func EvaluateCommit(commit model.Commit, enrichment model.EnrichmentResult, exem
 	// finalizeNonCompliant can report its reasons.
 	var best prVerdict
 	for i := range enrichment.PRs {
-		v := evaluatePR(commit, enrichment, &enrichment.PRs[i], requiredChecks, fetchStats, exemptAuthors, auditedBranches)
+		v := evaluatePR(commit, enrichment, &enrichment.PRs[i], requiredChecks, fetchStats, exemptAuthors, auditedBranches, ec.requireSigning)
 		if v.approvalOnFinal && v.ownerApprovalOK && v.delivers {
 			return finalizeCompliantPR(result, commit, enrichment, v)
 		}
@@ -201,45 +238,89 @@ func initAuditResult(commit model.Commit, enrichment model.EnrichmentResult) mod
 // still marked so reviewers can see the match — and the function returns
 // false so downstream rules audit the human code.
 //
-// Matching is on the unforgeable numeric account id only (see
-// isExemptCommit) — there is no email fallback, so a trusted id is exempt
-// even on a direct push.
-func applyExemptAuthorRule(result *model.AuditResult, commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor, fetchStats StatsFetcher) bool {
-	if !isExemptCommit(commit.AuthorID, exemptAuthors) {
+// Matching anchors on the verified signer where possible and falls back
+// to the forgeable author-id hint only when signing is optional (see
+// exemptStatus). A forgeable-path waiver sets ExemptionForgeable so the
+// report can show it would not survive signing:required.
+func applyExemptAuthorRule(result *model.AuditResult, commit model.Commit, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor, fetchStats StatsFetcher, requireSigning bool) bool {
+	exempt, forgeable := exemptStatus(commit, exemptAuthors, requireSigning)
+	if !exempt {
 		return false
 	}
 	result.IsExemptAuthor = true
-	if hasNonExemptPRContributors(commit.Org, commit.Repo, enrichment, exemptAuthors, fetchStats) {
+	if hasNonExemptPRContributors(commit.Org, commit.Repo, enrichment, exemptAuthors, fetchStats, requireSigning) {
 		return false
 	}
 	result.IsCompliant = true
+	// Waiver stands under the default optional policy, but record whether
+	// it rests on the forgeable author-id hint so the report can flag it —
+	// the verdict reason itself stays stable. The annotation rides the
+	// existing informational tag column; a team can filter on it to see
+	// which exemptions would NOT survive signing:required.
+	result.ExemptionForgeable = forgeable
+	if forgeable {
+		result.Annotations = append(result.Annotations, "trust:forgeable-exemption")
+	}
 	result.Reasons = []string{"exempt: configured author"}
 	result.MergeStrategy = classifyMergeStrategy(commit, false)
 	return true
 }
 
-// isExemptCommit decides whether a commit's authorship matches the
-// exempt list. Matching is ID-ONLY: the immutable numeric GitHub
-// account id (commit.AuthorID vs ExemptAuthor.ID). GitHub sets this id
-// from a verified account — it is never reused, never moved by renames,
-// and not forgeable client-side.
-//
-// There is deliberately no email fallback. A git-author email is set by
-// the pushing client and GitHub does not bind it to an account when it
-// can't verify it (AuthorID stays 0), so matching it would let any
-// pusher forge an exemption by setting their email to a curated value.
-// An unresolved id (0) and the shared ghost id (every deleted account)
-// therefore never match — they identify no one.
-func isExemptCommit(authorID int64, exemptAuthors []model.ExemptAuthor) bool {
-	if !model.TrustedID(authorID) {
+// idExempt reports whether a numeric account id is on the exempt list.
+// Matching is ID-ONLY: the immutable numeric GitHub account id. An
+// unresolved id (0) and the shared ghost id (every deleted account)
+// never match — they identify no one. This says nothing about whether
+// the id can be TRUSTED for this commit; that is exemptStatus's job.
+func idExempt(id int64, exemptAuthors []model.ExemptAuthor) bool {
+	if !model.TrustedID(id) {
 		return false
 	}
 	for _, e := range exemptAuthors {
-		if e.ID != 0 && e.ID == authorID {
+		if e.ID != 0 && e.ID == id {
 			return true
 		}
 	}
 	return false
+}
+
+// exemptStatus decides whether a commit is exempt under §1, and whether
+// that decision rests on a FORGEABLE node.
+//
+// A commit carries two account ids, both resolved by GitHub from
+// pushed-byte emails the committer controls:
+//
+//   - CommitterID — trustworthy ONLY when IsVerified: a valid signature
+//     cryptographically binds the committer to the signing account.
+//   - AuthorID    — never cryptographically bound. It is a hint the
+//     committer typed. `git commit --author=...` sets it to anyone.
+//
+// So there is exactly one non-forgeable path (verified signer on the
+// exempt list) and one forgeable path (author id claims the exempt
+// account). Signing is progressive enhancement:
+//
+//	requireSigning=false (default): the forgeable path is allowed but
+//	  the returned forgeable flag is set, so the verdict can be marked.
+//	requireSigning=true: only the verified-signer path can exempt; an
+//	  unsigned commit claiming the bot is NOT exempt (fails closed).
+//
+// Returns (exempt, forgeable). forgeable is only ever true when exempt
+// is true and the match came from the author-id hint.
+func exemptStatus(commit model.Commit, exemptAuthors []model.ExemptAuthor, requireSigning bool) (exempt, forgeable bool) {
+	if commit.IsVerified && idExempt(commit.CommitterID, exemptAuthors) {
+		return true, false
+	}
+	if !requireSigning && idExempt(commit.AuthorID, exemptAuthors) {
+		return true, true
+	}
+	return false, false
+}
+
+// isExemptCommit is the boolean view of exemptStatus for callers that
+// only need to know whether a commit counts as exempt-authored under
+// the signing policy (contributor-set and approval-refresh checks).
+func isExemptCommit(commit model.Commit, exemptAuthors []model.ExemptAuthor, requireSigning bool) bool {
+	exempt, _ := exemptStatus(commit, exemptAuthors, requireSigning)
+	return exempt
 }
 
 // applyEmptyCommitFallback implements Architecture.md §2. It flips `result`
@@ -360,7 +441,7 @@ type prVerdict struct {
 //	Phase 3: emit §4 / §5 reasons. selfApproved and staleApproval are
 //	         independent flaws and can both appear for the same PR.
 //	Phase 4: evaluate §6 required status checks and append any failure.
-func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *model.PullRequest, requiredChecks []RequiredCheck, fetchStats StatsFetcher, exemptAuthors []model.ExemptAuthor, auditedBranches []string) prVerdict {
+func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *model.PullRequest, requiredChecks []RequiredCheck, fetchStats StatsFetcher, exemptAuthors []model.ExemptAuthor, auditedBranches []string, requireSigning bool) prVerdict {
 	v := prVerdict{pr: pr}
 	v.delivers = prDelivers(pr, auditedBranches)
 	v.prBranchCommits = filterNonEmptyContributors(commit.Org, commit.Repo, enrichment.PRBranchCommits[pr.Number], fetchStats)
@@ -403,7 +484,7 @@ func evaluatePR(commit model.Commit, enrichment model.EnrichmentResult, pr *mode
 			// human-authored bytes the reviewer didn't see — the
 			// approval's intent still covers the merged content.
 			// Promote the review to approvalOnFinal so §4 doesn't fire.
-			if isApprovalRefreshable(review, enrichment.PRBranchCommits[pr.Number], pr.HeadSHA, pr.MergeCommitSHA, exemptAuthors) {
+			if isApprovalRefreshable(review, enrichment.PRBranchCommits[pr.Number], pr.HeadSHA, pr.MergeCommitSHA, exemptAuthors, requireSigning) {
 				v.approvalOnFinal = true
 				v.approvers = append(v.approvers, review.ReviewerLogin)
 				continue
@@ -829,13 +910,13 @@ func truncateSHA(sha string) string {
 // PR-branch commits come from /pulls/{n}/commits; an unresolved AuthorID
 // (0, when GitHub can't bind the git-author email to an account) is never
 // exempt, so such a contributor always counts — fail closed.
-func hasNonExemptPRContributors(org, repo string, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor, fetchStats StatsFetcher) bool {
+func hasNonExemptPRContributors(org, repo string, enrichment model.EnrichmentResult, exemptAuthors []model.ExemptAuthor, fetchStats StatsFetcher, requireSigning bool) bool {
 	if len(enrichment.PRBranchCommits) == 0 {
 		return false
 	}
 	for _, commits := range enrichment.PRBranchCommits {
 		for _, c := range commits {
-			if isExemptCommit(c.AuthorID, exemptAuthors) {
+			if isExemptCommit(c, exemptAuthors, requireSigning) {
 				continue
 			}
 			adds, dels, files := c.Additions, c.Deletions, c.FilesChanged
@@ -930,7 +1011,7 @@ func filterNonEmptyContributors(org, repo string, commits []model.Commit, fetchS
 // We skip that SHA before applying the exempt check; otherwise a
 // human-authored squash-merge commit (the normal case for a
 // human-authored PR) would always void the carve-out.
-func isApprovalRefreshable(approval model.Review, prBranchCommits []model.Commit, headSHA, mergeCommitSHA string, exemptAuthors []model.ExemptAuthor) bool {
+func isApprovalRefreshable(approval model.Review, prBranchCommits []model.Commit, headSHA, mergeCommitSHA string, exemptAuthors []model.ExemptAuthor, requireSigning bool) bool {
 	if len(prBranchCommits) == 0 {
 		return false
 	}
@@ -953,7 +1034,7 @@ func isApprovalRefreshable(approval model.Review, prBranchCommits []model.Commit
 		if mergeCommitSHA != "" && c.SHA == mergeCommitSHA {
 			continue
 		}
-		if !isExemptCommit(c.AuthorID, exemptAuthors) {
+		if !isExemptCommit(c, exemptAuthors, requireSigning) {
 			return false
 		}
 	}
