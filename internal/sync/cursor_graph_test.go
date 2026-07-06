@@ -66,6 +66,26 @@ func TestGraphCursor_IngestsBackdatedCommit(t *testing.T) {
 	assert.Equal(t, lastDate, cur.LastDate, "date watermark must not regress to the backdated commit")
 }
 
+// A completed sync stamps an audit_runs provenance row carrying the build
+// and config fingerprint that produced the verdicts.
+func TestGraphCursor_StampsAuditRunProvenance(t *testing.T) {
+	lastDate := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	source, store, enricher, cfg := graphTestFixtures("samehead", lastDate)
+	source.branchHeads["o/r/main"] = "samehead"
+	cfg.ToolVersion = "v-test"
+	cfg.ConfigFingerprint = "fp-abc123"
+
+	p := NewPipeline(source, enricher, store, cfg, slog.Default())
+	require.NoError(t, p.Run(context.Background()))
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	require.Len(t, store.auditRuns, 1, "a successful sync stamps exactly one run")
+	assert.Equal(t, "v-test", store.auditRuns[0].ToolVersion)
+	assert.Equal(t, "fp-abc123", store.auditRuns[0].ConfigFingerprint)
+	assert.False(t, store.auditRuns[0].FinishedAt.IsZero(), "finished_at is stamped")
+}
+
 // A force-push that GitHub compare reports as "diverged" (the prior head
 // is no longer an ancestor of the new head) must be recorded as a history
 // rewrite, while a normal fast-forward ("ahead") must not.

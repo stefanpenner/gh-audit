@@ -140,6 +140,7 @@ type mockStore struct {
 	unaudited       map[string][]model.Commit
 	commitPRs       map[string][]int
 	historyRewrites []model.HistoryRewrite
+	auditRuns       []model.AuditRun
 	err             error
 }
 
@@ -147,6 +148,13 @@ func (m *mockStore) RecordHistoryRewrite(_ context.Context, r model.HistoryRewri
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.historyRewrites = append(m.historyRewrites, r)
+	return nil
+}
+
+func (m *mockStore) RecordAuditRun(_ context.Context, r model.AuditRun) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.auditRuns = append(m.auditRuns, r)
 	return nil
 }
 

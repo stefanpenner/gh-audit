@@ -2,7 +2,8 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "config",
-    srcs = ["config.go"],
+    srcs = ["config.go",
+        "fingerprint.go"],
     importpath = "github.com/stefanpenner/gh-audit/internal/config",
     visibility = ["//:__subpackages__"],
     deps = [
@@ -13,7 +14,8 @@ go_library(
 
 go_test(
     name = "config_test",
-    srcs = ["config_test.go"],
+    srcs = ["config_test.go",
+        "fingerprint_test.go"],
     embed = [":config"],
     deps = [
         "@com_github_stretchr_testify//assert",

@@ -73,6 +73,15 @@ CREATE TABLE IF NOT EXISTS history_rewrites (
 	PRIMARY KEY (org, repo, branch, prior_sha, new_sha)
 );
 
+CREATE TABLE IF NOT EXISTS audit_runs (
+	finished_at        TIMESTAMP NOT NULL,
+	tool_version       TEXT,
+	config_fingerprint TEXT,
+	commits_synced     INTEGER,
+	commits_audited    INTEGER,
+	PRIMARY KEY (finished_at)
+);
+
 CREATE TABLE IF NOT EXISTS pull_requests (
 	org              TEXT NOT NULL,
 	repo             TEXT NOT NULL,
@@ -176,6 +185,17 @@ func insertCommit(t *testing.T, db *sql.DB, org, repo, sha, author string, commi
 		org, repo, sha, author, committedAt, "commit "+sha, 1, additions, deletions,
 		fmt.Sprintf("https://github.com/%s/%s/commit/%s", org, repo, sha))
 	require.NoError(t, err, "insert commit")
+}
+
+// insertCommitWithAuthorID inserts a commit with an explicit resolved
+// author id (0 = GitHub could not bind the git-author email to an account).
+func insertCommitWithAuthorID(t *testing.T, db *sql.DB, org, repo, sha, author string, committedAt time.Time, authorID int64) {
+	t.Helper()
+	_, err := db.Exec(`INSERT INTO commits (org, repo, sha, author_login, author_id, committed_at, message, parent_count, additions, deletions, href)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		org, repo, sha, author, authorID, committedAt, "commit "+sha, 1, 1, 0,
+		fmt.Sprintf("https://github.com/%s/%s/commit/%s", org, repo, sha))
+	require.NoError(t, err, "insert commit with author id")
 }
 
 type auditResultOpts struct {
@@ -502,7 +522,7 @@ func TestFormatTable(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	err := r.FormatTable(&buf, summary, details)
+	err := r.FormatTable(&buf, summary, details, nil)
 	require.NoError(t, err, "FormatTable")
 
 	output := buf.String()
@@ -542,7 +562,7 @@ func TestFormatJSON(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	err := r.FormatJSON(&buf, summary, details)
+	err := r.FormatJSON(&buf, summary, details, nil)
 	require.NoError(t, err, "FormatJSON")
 
 	var result map[string]json.RawMessage
@@ -563,7 +583,7 @@ func TestGenerateXLSXCreatesFile(t *testing.T) {
 	r := New(db)
 
 	tmpFile := t.TempDir() + "/test-report.xlsx"
-	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
+	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile, nil)
 	require.NoError(t, err, "GenerateXLSX")
 
 	info, err := os.Stat(tmpFile)
@@ -590,7 +610,7 @@ func TestGenerateXLSXLargeDataset(t *testing.T) {
 	r := New(db)
 
 	tmpFile := t.TempDir() + "/test-large-report.xlsx"
-	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
+	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile, nil)
 	require.NoError(t, err, "GenerateXLSX with 1000 rows")
 
 	info, err := os.Stat(tmpFile)
@@ -614,7 +634,7 @@ func TestGenerateXLSXHasExpectedSheets(t *testing.T) {
 	r := New(db)
 
 	tmpFile := t.TempDir() + "/test-five-sheets.xlsx"
-	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
+	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile, nil)
 	require.NoError(t, err, "GenerateXLSX")
 
 	xf, err := excelize.OpenFile(tmpFile)
@@ -645,7 +665,7 @@ func TestSelfApprovedAppearsInActionQueue(t *testing.T) {
 	r := New(db)
 
 	tmpFile := t.TempDir() + "/test-self-approved.xlsx"
-	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
+	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile, nil)
 	require.NoError(t, err, "GenerateXLSX")
 
 	xf, err := excelize.OpenFile(tmpFile)
@@ -691,7 +711,7 @@ func TestHyperlinksOnNonStreamingSheets(t *testing.T) {
 	r := New(db)
 
 	tmpFile := t.TempDir() + "/test-hyperlinks.xlsx"
-	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
+	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile, nil)
 	require.NoError(t, err, "GenerateXLSX")
 
 	xf, err := excelize.OpenFile(tmpFile)
@@ -717,7 +737,7 @@ func TestEmptyActionQueueSheetStillCreated(t *testing.T) {
 	r := New(db)
 
 	tmpFile := t.TempDir() + "/test-empty-aq.xlsx"
-	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
+	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile, nil)
 	require.NoError(t, err, "GenerateXLSX")
 
 	xf, err := excelize.OpenFile(tmpFile)
@@ -868,7 +888,7 @@ func TestStaleApprovalSurfacesInDecisionMatrix(t *testing.T) {
 	r := New(db)
 
 	tmpFile := t.TempDir() + "/test-stale.xlsx"
-	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile)
+	err := r.GenerateXLSX(context.Background(), ReportOpts{}, tmpFile, nil)
 	require.NoError(t, err, "GenerateXLSX")
 
 	xf, err := excelize.OpenFile(tmpFile)

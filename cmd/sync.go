@@ -17,6 +17,7 @@ import (
 	"github.com/stefanpenner/gh-audit/internal/db"
 	ghclient "github.com/stefanpenner/gh-audit/internal/github"
 	"github.com/stefanpenner/gh-audit/internal/sync"
+	"github.com/stefanpenner/gh-audit/internal/version"
 )
 
 func newSyncCmd() *cobra.Command {
@@ -406,6 +407,8 @@ func buildSyncConfig(cfg *config.Config, orgs, repos []string, since, until stri
 		ExemptAuthors:          cfg.Exemptions.Authors,
 		ReviewScope:            cfg.AuditRules.ReviewScope,
 		RequireSigning:         cfg.AuditRules.SigningRequired(),
+		ToolVersion:            version.Info(),
+		ConfigFingerprint:      cfg.AuditFingerprint(),
 	}
 
 	for _, rc := range cfg.AuditRules.RequiredChecks {

@@ -962,6 +962,7 @@ DuckDB, 10 tables:
 | `co_authors` | (org, repo, sha, email) | Co-authors parsed from "Co-authored-by:" trailers |
 | `commit_branches` | (org, repo, sha, branch) | Which branches a commit appears on |
 | `history_rewrites` | (org, repo, branch, prior_sha, new_sha) | Detected force-push / non-fast-forward moves (prior head no longer an ancestor of the new head). Evidence captured at sync time — the orphaned commits may be gone by the next sync. |
+| `audit_runs` | (finished_at) | Provenance log: one row per completed sync stamping the tool build (`version.Info`) and audit-config fingerprint (`config.AuditFingerprint`) that produced that run's verdicts. Read by the report manifest. |
 | `commit_prs` | (org, repo, sha, pr_number) | Commit → PR associations |
 | `pull_requests` | (org, repo, number) | GitHub pull requests |
 | `reviews` | (org, repo, pr_number, review_id) | PR reviews with per-reviewer state |
@@ -1216,12 +1217,47 @@ The `report` command queries `audit_results` joined with `commits` and
    compliant — the log is evidence of what the tool did NOT flag and why, so
    non-compliant commits never appear here.
 8. **Multiple PRs** — one row per commit-PR pair for commits with `pr_count > 1`.
+9. **Provenance** — the audit manifest: attribution (tool build + config
+   fingerprint), the tamper-evident results digest, scope, and coverage
+   caveats. See "Provenance manifest" below.
 
 Decision Matrix outcomes are derived by `DeriveRuleOutcomes`
 (`internal/report/rules.go`) from the stored `audit_results` booleans — no extra
 SQL. The derivation mirrors the audit order in `internal/sync/audit.go` (R1 → R2
 → R3 → R4 → R5 → R6 → R7 → R8); any change to the audit logic must be reflected
 there.
+
+### Provenance manifest — making a report audit-grade
+
+An external auditor cannot rely on a report they cannot **attribute** or
+**verify**. Every report therefore carries an `AuditManifest`
+(`internal/report/manifest.go`), surfaced three ways: a leading header in
+the `table` output, a `Provenance` sheet in the XLSX, and a top-level
+`manifest` object in the JSON. It answers four questions:
+
+- **Who produced these verdicts?** `tool_version` (the build id from
+  `version.Info` — an ldflags value or the VCS revision `go build`
+  embeds) and `config_fingerprint` (`config.AuditFingerprint`, a stable
+  SHA-256 over the audit-defining settings: signing policy, review scope,
+  audited branches, required checks, and exempt account **ids**). Both are
+  stamped into `audit_runs` at the end of each sync, so the manifest
+  reflects the config that *actually* computed the verdicts — not a
+  possibly-different report-time config. When the two fingerprints differ
+  the manifest flags **config drift**: re-audit before relying on it.
+- **Were the results tampered with?** `results_digest` is a SHA-256 over
+  the canonical, ordered verdict rows in scope. Recompute it over the same
+  DB; a mismatch means `audit_results` was altered. (All report queries
+  carry an explicit `ORDER BY`, so the digest is reproducible.)
+- **What was covered?** repo list, commit count, and date range.
+- **What must NOT be taken at face value?** the coverage caveats — a
+  consolidated, honest disclosure of every residual assumption:
+  non-compliant count, detected **history rewrites**, **forgeable
+  exemptions** (§1 waivers on the unsigned author-id hint), and
+  **unresolved author ids** (id 0, where identity rules fall through).
+
+The manifest degrades gracefully: a DB predating provenance stamping
+shows "unknown" attribution but still computes the digest, scope, and
+caveats.
 
 ## Package structure
 

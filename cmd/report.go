@@ -74,6 +74,13 @@ func newReportCmd() *cobra.Command {
 
 			r := report.NewWithBranches(dbConn.DB, cfg.AuditRules.AuditBranches)
 
+			// The provenance manifest attributes this report to a build +
+			// audit config and carries a tamper-evident results digest.
+			manifest, err := r.BuildManifest(cmd.Context(), opts, cfg.AuditFingerprint(), time.Now().UTC())
+			if err != nil {
+				return err
+			}
+
 			switch format {
 			case "xlsx":
 				if output == "" {
@@ -86,7 +93,7 @@ func newReportCmd() *cobra.Command {
 				if onlyFailures {
 					return fmt.Errorf("--only-failures is not supported with --format xlsx: the workbook's summary sheets would disagree with its filtered detail sheets (use table/csv/json, or filter in Excel)")
 				}
-				return r.GenerateXLSX(cmd.Context(), opts, output)
+				return r.GenerateXLSX(cmd.Context(), opts, output, manifest)
 
 			case "table", "":
 				summary, err := r.GetSummary(cmd.Context(), opts)
@@ -107,7 +114,7 @@ func newReportCmd() *cobra.Command {
 					defer f.Close()
 					w = f
 				}
-				return r.FormatTable(w, summary, details)
+				return r.FormatTable(w, summary, details, manifest)
 
 			case "csv":
 				details, err := r.GetDetails(cmd.Context(), opts)
@@ -143,7 +150,7 @@ func newReportCmd() *cobra.Command {
 					defer f.Close()
 					w = f
 				}
-				return r.FormatJSON(w, summary, details)
+				return r.FormatJSON(w, summary, details, manifest)
 
 			default:
 				return fmt.Errorf("unsupported format: %s (use table, csv, json, or xlsx)", format)

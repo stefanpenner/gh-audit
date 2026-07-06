@@ -69,6 +69,9 @@ type Store interface {
 	// RecordHistoryRewrite persists a detected force-push / non-fast-forward
 	// move on a protected branch (see classifyHeadMove, tla/History.tla).
 	RecordHistoryRewrite(ctx context.Context, r model.HistoryRewrite) error
+	// RecordAuditRun stamps the provenance of a completed sync (build +
+	// config fingerprint) — read back by the report manifest.
+	RecordAuditRun(ctx context.Context, r model.AuditRun) error
 	UpdateCommitStats(ctx context.Context, org, repo, sha string, additions, deletions int) error
 	// GetUnauditedCommits returns commits in org/repo with no audit_results row.
 	// Zero-valued since/until disables that side of the bound; both zero =
@@ -118,6 +121,11 @@ type SyncConfig struct {
 	// but flagged forgeable (AuditResult.ExemptionForgeable). true fails
 	// that forgeable path closed — only a verified signer is exempt.
 	RequireSigning bool
+	// ToolVersion and ConfigFingerprint stamp the provenance record
+	// (audit_runs) written at the end of a successful sync, tying the
+	// verdicts to the build and audit config that produced them.
+	ToolVersion       string
+	ConfigFingerprint string
 }
 
 // LandingScoped reports whether §7 should run landing-scoped (the default).
@@ -709,7 +717,25 @@ func (p *Pipeline) Run(ctx context.Context) error {
 
 	err := g.Wait()
 	close(telemDone)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Stamp provenance for the completed sweep: build + audit-config
+	// fingerprint that produced these verdicts, read back by the report
+	// manifest. Only on success — a failed sweep must not leave a clean
+	// provenance record. A stamp failure is logged, never fatal.
+	run := model.AuditRun{
+		FinishedAt:        time.Now(),
+		ToolVersion:       p.config.ToolVersion,
+		ConfigFingerprint: p.config.ConfigFingerprint,
+		CommitsSynced:     int(p.commitsSynced.Load()),
+		CommitsAudited:    int(p.commitsAudited.Load()),
+	}
+	if rerr := p.store.RecordAuditRun(ctx, run); rerr != nil {
+		p.logger.Warn("failed to stamp audit-run provenance", "error", rerr)
+	}
+	return nil
 }
 
 func (p *Pipeline) syncRepo(ctx context.Context, repo model.RepoInfo, orgCfg OrgConfig, writer *DBWriter) error {

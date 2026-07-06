@@ -84,7 +84,7 @@ func BenchmarkGenerateXLSX_10kRows(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		out := filepath.Join(dir, fmt.Sprintf("bench-%d.xlsx", i))
-		if err := r.GenerateXLSX(context.Background(), ReportOpts{}, out); err != nil {
+		if err := r.GenerateXLSX(context.Background(), ReportOpts{}, out, nil); err != nil {
 			b.Fatal(err)
 		}
 	}

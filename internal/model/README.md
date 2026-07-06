@@ -35,6 +35,14 @@ classDiagram
         DetectedAt time.Time
     }
 
+    class AuditRun {
+        FinishedAt time.Time
+        ToolVersion string
+        ConfigFingerprint string
+        CommitsSynced int
+        CommitsAudited int
+    }
+
     class CoAuthor {
         Login string
         Email string
